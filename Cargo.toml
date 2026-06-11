@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/rgb-aluvm",
+    "crates/rgb-api",
+    "crates/rgb-api/cli",
+    "crates/rgb-api/psbt",
+    "crates/rgb-coloring",
+    "crates/rgb-consensus",
+    "crates/rgb-ops",
+    "crates/rgb-ops/invoice",
+    "crates/rgb-schemas",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.11.1-rc.10"
+authors = ["BiHelix"]
+homepage = "https://bihelix.net"
+repository = "https://github.com/bihelix-io/rgb-service"
+keywords = ["bitcoin", "rgb", "smart-contracts", "assets"]
+categories = ["cryptography::cryptocurrencies"]
+rust-version = "1.85.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+amplify = "=4.8.1"
+baid64 = "=0.4.1"
+bitcoin = { version = "0.32.7", features = ["serde"] }
+bp-wallet = { version = "0.11.1-alpha.2" }
+chrono = "0.4.38"
+fjall = "3.1.4"
+indexmap = "2.4.0"
+log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
+nonasync = { version = "=0.1.3", features = ["log"] }
+rgb-ascii-armor = "1.0.1"
+rgb-strict-encoding = "1.0.1"
+rgb-strict-types = "1.0.1"
+serde_crate = { package = "serde", version = "1", features = ["derive"] }
+serde_yaml = "0.9.19"
+
+rgb-aluvm = { version = "0.11.1-rc.3", path = "crates/rgb-aluvm" }
+rgb-api = { version = "0.11.1-rc.10", path = "crates/rgb-api" }
+rgb-consensus = { version = "0.11.1-rc.10", path = "crates/rgb-consensus", features = ["stl"] }
+rgb-invoicing = { version = "0.11.1-rc.10", path = "crates/rgb-ops/invoice" }
+rgb-ops = { version = "0.11.1-rc.10", path = "crates/rgb-ops" }
+rgb-psbt-utils = { version = "0.11.1-rc.10", path = "crates/rgb-api/psbt" }

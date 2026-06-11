@@ -1,0 +1,65 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  default:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo check --workspace
+  no-default:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo check --workspace --no-default-features
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [ fs, serde ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Check ${{matrix.feature}} (no default features)
+        run: cargo check --workspace --no-default-features --features=${{matrix.feature}}
+      - name: Check ${{matrix.feature}} (with default features)
+        run: cargo check --workspace --features=${{matrix.feature}}
+  platforms:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-latest, macos-14, macos-latest, windows-2022, windows-latest ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Platform ${{matrix.os}}
+        run: cargo check --workspace --all-features # we skip test targets here to be sure that the main library can be built
+  toolchains:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [ nightly, beta, stable, 1.85.0 ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{matrix.toolchain}}
+      - name: Toolchain ${{matrix.toolchain}}
+        run: cargo +${{matrix.toolchain}} check --workspace --all-targets --all-features

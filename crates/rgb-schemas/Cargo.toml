@@ -1,0 +1,52 @@
+[package]
+name = "rgb-schemas"
+version = "0.11.1-rc.10"
+description = "Collection of the official RGB smart contract schemata"
+keywords = ["bitcoin", "lightning", "rgb", "smart-contracts", "lnp-bp"]
+categories = ["cryptography::cryptocurrencies"]
+authors = ["Zoe Faltibà <zoefaltiba@gmail.com>"]
+homepage = "https://rgb.info"
+repository = "https://github.com/rgb-protocol/rgb-schemas"
+rust-version = "1.85.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+
+[[bin]]
+name = "rgb-schemas"
+required-features = ["fs"]
+
+[lib]
+name = "schemata"
+
+[dependencies]
+amplify = "=4.8.1"
+rgb-strict-types = "~1.0.1"
+rgb-aluvm = { version = "0.11.1-rc.3", path = "../rgb-aluvm" }
+rgb-ops = { version = "0.11.1-rc.10", path = "../rgb-ops", features = ["fs"] }
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+serde_json = "1.0"
+
+[dev-dependencies]
+rgb-ops = { version = "0.11.1-rc.10", path = "../rgb-ops", features = [
+    "fs",
+    "serde",
+] }
+serde = "1.0"
+serde_json = "1.0"
+serde_yaml = "0.9.33"
+sha2 = "0.10.8"
+
+[features]
+default = []
+all = [
+    "log",
+    "fs",
+]
+log = [
+    "rgb-aluvm/log",
+]
+fs = [
+    "rgb-ops/fs",
+]

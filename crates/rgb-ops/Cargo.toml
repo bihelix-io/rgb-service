@@ -1,0 +1,83 @@
+[package]
+name = "rgb-ops"
+version = { workspace = true }
+description = "RGB ops library for working with smart contracts on Bitcoin & Lightning"
+keywords = { workspace = true }
+categories = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+readme = "README.md"
+
+[lib]
+name = "rgbstd"
+crate-type = ["cdylib", "rlib"] # We need this for WASM
+
+[dependencies]
+amplify = { workspace = true }
+nonasync = { workspace = true }
+rgb-ascii-armor = { workspace = true }
+baid64 = { workspace = true }
+electrum-client = { workspace = true, optional = true }
+esplora-client = { workspace = true, optional = true }
+rgb-strict-encoding = { workspace = true }
+rgb-strict-types = { workspace = true }
+rgb-consensus = { workspace = true }
+rgb-invoicing = { version = "0.11.1-rc.10", path = "invoice" }
+rgb-aluvm = { version = "0.11.1-rc.3", path = "../rgb-aluvm" }
+base85 = "=2.0.0"
+chrono = "0.4.38"
+fjall = { workspace = true, optional = true }
+indexmap = { workspace = true }
+serde_crate = { workspace = true, optional = true }
+rand = "0.9.1"
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+all = [
+    "esplora_blocking",
+    "electrum_blocking",
+    "mempool_blocking",
+    "fs",
+    "serde",
+]
+esplora_blocking = [
+    "esplora-client",
+    "esplora-client/blocking",
+    "esplora-client/blocking-https",
+]
+electrum_blocking = [
+    "electrum-client",
+]
+mempool_blocking = [
+    "esplora_blocking",
+]
+serde = [
+    "serde_crate",
+    "serde_json",
+    "chrono/serde",
+    "amplify/serde",
+    "rgb-strict-encoding/serde",
+    "rgb-strict-types/serde",
+    "rgb-consensus/serde",
+    "rgb-invoicing/serde"
+]
+fs = []
+fjall = ["dep:fjall"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+rand = { version = "0.9.1", optional = true }
+getrandom = { version = "0.3", features = [
+    "wasm_js",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[package.metadata.docs.rs]
+features = ["all"]

@@ -1,0 +1,101 @@
+[package]
+name = "rgb-api"
+version.workspace = true
+description = "RGB smart contracts wallet runtime"
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rgb"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amplify = { workspace = true }
+nonasync = { workspace = true }
+baid64 = { workspace = true }
+rgb-strict-types = { workspace = true }
+bdk_wallet = { version = "=2.0.0", default-features = false, optional = true, features = [
+    "file_store",
+    "keys-bip39",
+    "std",
+] }
+bp-wallet = { workspace = true, optional = true }
+rgb-ops = { workspace = true }
+rgb-psbt-utils = { workspace = true }
+rgb-aluvm = { workspace = true, features = [
+    "log",
+] }
+indexmap = { workspace = true }
+chrono = { workspace = true }
+serde_crate = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+serde_json = "1.0.149"
+serde-hjson = "1.1.0"
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+rand = { version = "0.9.1", optional = true }
+getrandom = { version = "0.3", features = [
+    "wasm_js",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[features]
+default = []
+all = [
+    "bdk",
+    "bp-wallet",
+    "cli",
+    "electrum_blocking",
+    "esplora_blocking",
+    "fs",
+    "log",
+    "mempool_blocking",
+    "serde",
+]
+bp = [
+    "bp-wallet",
+    "rgb-psbt-utils/bp",
+]
+bdk = [
+    "bdk_wallet",
+]
+fs = [
+    "bp-wallet/fs",
+    "rgb-ops/fs",
+    "serde",
+]
+cli = [
+    "bp",
+    "bp-wallet/cli",
+    "fs",
+    "serde_yaml",
+]
+esplora_blocking = [
+    "rgb-ops/esplora_blocking",
+]
+electrum_blocking = [
+    "rgb-ops/electrum_blocking",
+]
+mempool_blocking = [
+    "rgb-ops/mempool_blocking",
+]
+serde = [
+    "serde_crate",
+    "rgb-psbt-utils/serde",
+]
+
+[package.metadata.docs.rs]
+features = ["all"]
