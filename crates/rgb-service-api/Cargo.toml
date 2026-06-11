@@ -1,0 +1,24 @@
+[package]
+name = "rgb-service-api"
+version.workspace = true
+description = "BiHelix RGB service API traits, DTOs, authorization, and Axum routes"
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+axum = ["dep:axum"]
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true, optional = true }
+serde = { package = "serde", version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
