@@ -12,6 +12,7 @@ This repository contains the RGB contract and asset libraries extracted from
 - `rgb-coloring`
 - `rgb-consensus`
 - `rgb-ops`
+- `rgb-service-local`
 - `rgb-schemas`
 
 Internal RGB workspace crates are kept where required:

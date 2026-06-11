@@ -21,8 +21,8 @@ amplify = { workspace = true }
 nonasync = { workspace = true }
 rgb-ascii-armor = { workspace = true }
 baid64 = { workspace = true }
-electrum-client = { workspace = true, optional = true }
-esplora-client = { workspace = true, optional = true }
+electrum-client = { version = "0.24.0", optional = true }
+esplora-client = { version = "0.12.1", default-features = false, optional = true }
 rgb-strict-encoding = { workspace = true }
 rgb-strict-types = { workspace = true }
 rgb-consensus = { workspace = true }

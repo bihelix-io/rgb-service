@@ -1,0 +1,29 @@
+[package]
+name = "rgb-service-local"
+version.workspace = true
+description = "BiHelix local RGB asset service implementation"
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[dependencies]
+amplify = { workspace = true }
+anyhow = { workspace = true }
+bitcoin = { workspace = true }
+fjall = { workspace = true }
+psrgbt = { package = "rgb-psbt-utils", workspace = true }
+rgb-schemata = { package = "rgb-schemas", workspace = true }
+rgbstd = { package = "rgb-ops", workspace = true, features = [
+    "esplora_blocking",
+    "fjall",
+    "serde",
+] }
+serde = { package = "serde", version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+strict_types = { package = "rgb-strict-types", version = "~1.0.1", features = ["serde"] }
