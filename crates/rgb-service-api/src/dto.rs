@@ -240,6 +240,32 @@ pub struct RecoverRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RunRgbTestRequest {
+    pub account_id: AccountId,
+    pub scenario: RgbTestScenario,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RgbTestScenario {
+    FullRgb20Lifecycle,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RunRgbTestResponse {
+    pub scenario: RgbTestScenario,
+    pub passed: bool,
+    pub steps: Vec<RgbTestStep>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RgbTestStep {
+    pub name: String,
+    pub passed: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecoveryReport {
     pub scanned: usize,
     pub recovered: usize,
@@ -304,6 +330,7 @@ account_scoped!(
     ImportConsignmentRequest,
     ListPendingRequest,
     RecoverRequest,
+    RunRgbTestRequest,
 );
 
 impl AssetSpendAuthorized for PrepareTransferRequest {

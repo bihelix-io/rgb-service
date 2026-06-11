@@ -17,9 +17,10 @@ amplify = { workspace = true }
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
 fjall = { workspace = true }
-psrgbt = { package = "rgb-psbt-utils", workspace = true }
-rgb-schemata = { package = "rgb-schemas", workspace = true }
-rgbstd = { package = "rgb-ops", workspace = true, features = [
+nonasync = { workspace = true }
+psrgbt = { workspace = true }
+rgb-schemata = { workspace = true }
+rgbstd = { workspace = true, features = [
     "esplora_blocking",
     "fjall",
     "serde",

@@ -10,13 +10,16 @@ use std::{
 
 use amplify::confinement::{Confined, U32 as U32MAX};
 use anyhow::{Context, Result, anyhow};
-use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
-use fjall::{KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase};
+use bitcoin::{Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
+use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
+use nonasync::persistence::CloneNoPersistence;
 use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rgb_schemata::NonInflatableAsset;
 use rgbstd::{
-    ContractId, GenesisSeal, Identity, Opout, OutputSeal, Transition, Txid as RgbTxid,
-    containers::{BuilderSeal, Consignment, ConsignmentExt, Fascia, Transfer, ValidTransfer},
+    ContractId, GenesisSeal, Identity, Operation, Opout, OutputSeal, Transition, Txid as RgbTxid,
+    containers::{
+        BuilderSeal, Consignment, ConsignmentExt, Fascia, FileContent, Transfer, ValidTransfer,
+    },
     contract::{AllocatedState, ContractBuilder, IssuerWrapper},
     indexers::{AnyResolver, esplora_blocking::esplora_client},
     persistence::{StashReadProvider, Stock, fjall::FjallBinStore},
@@ -25,7 +28,7 @@ use rgbstd::{
     validation::{
         ResolveWitness, ValidationConfig, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
-    vm::{WitnessOrd, WitnessPos},
+    vm::WitnessOrd,
 };
 use serde::{Deserialize, Serialize};
 use strict_types::{StrictDeserialize, StrictSerialize};

@@ -66,4 +66,9 @@ pub trait RgbServiceApi: Send + Sync + 'static {
     ) -> Result<ListPendingResponse>;
 
     async fn recover(&self, req: Authorized<RecoverRequest>) -> Result<RecoveryReport>;
+
+    async fn run_rgb_test(
+        &self,
+        req: Authorized<RunRgbTestRequest>,
+    ) -> Result<RunRgbTestResponse>;
 }

@@ -50,6 +50,9 @@ rgb-aluvm = { version = "0.11.1-rc.3", path = "crates/rgb-aluvm" }
 rgb-api = { version = "0.11.1-rc.10", path = "crates/rgb-api" }
 rgb-consensus = { version = "0.11.1-rc.10", path = "crates/rgb-consensus", features = ["stl"] }
 rgb-invoicing = { version = "0.11.1-rc.10", path = "crates/rgb-ops/invoice" }
+psrgbt = { package = "rgb-psbt-utils", version = "0.11.1-rc.10", path = "crates/rgb-api/psbt" }
 rgb-ops = { version = "0.11.1-rc.10", path = "crates/rgb-ops" }
 rgb-psbt-utils = { version = "0.11.1-rc.10", path = "crates/rgb-api/psbt" }
+rgb-schemata = { package = "rgb-schemas", version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
 rgb-schemas = { version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
+rgbstd = { package = "rgb-ops", version = "0.11.1-rc.10", path = "crates/rgb-ops" }

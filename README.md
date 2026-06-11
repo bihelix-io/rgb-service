@@ -32,7 +32,10 @@ Internal RGB workspace crates are kept where required:
 - transfer prepare/commit/cancel
 - consignment validate/import
 - pending operation and recovery workflows
+- admin-triggered RGB test workflows
 
 HTTP support is available behind the `axum` feature. Mutating endpoints accept
 signed requests. Operations that move or lock RGB value require an additional
 asset spend authorization, intended to be signed by the user wallet or signer.
+The `/v1/test/rgb` endpoint is intended for privileged integration testing and
+requires a signed request with the test permission.

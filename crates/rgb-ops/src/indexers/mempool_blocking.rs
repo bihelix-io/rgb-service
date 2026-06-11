@@ -70,6 +70,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[ignore = "requires public mempool.space network access"]
     fn test_mempool_client_mainnet_tx() {
         let builder = Builder::new("https://mempool.space/api");
         let client = super::MemPoolClient::new(builder);
@@ -82,6 +83,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "requires public mempool.space network access"]
     fn test_mempool_client_testnet_tx() {
         let builder = Builder::new("https://mempool.space/testnet/api");
         let client = super::MemPoolClient::new(builder);
@@ -95,6 +97,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "requires public mempool.space network access"]
     fn test_mempool_client_testnet4_tx() {
         let builder = Builder::new("https://mempool.space/testnet4/api");
         let client = super::MemPoolClient::new(builder);
@@ -107,6 +110,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "requires public mempool.space network access"]
     fn test_mempool_client_testnet4_tx_detail() {
         let builder = Builder::new("https://mempool.space/testnet4/api");
         let client = super::MemPoolClient::new(builder);

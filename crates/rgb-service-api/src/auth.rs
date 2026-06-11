@@ -17,6 +17,7 @@ pub enum Permission {
     ImportConsignment,
     ManagePending,
     Recover,
+    RunTest,
     L2Reserve,
     L2Settle,
     Admin,

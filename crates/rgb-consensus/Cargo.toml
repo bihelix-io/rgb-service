@@ -54,9 +54,15 @@ rgb-strict-types = { version = "~1.0.1", features = [
 ] }
 
 [features]
-default = []
+default = [
+    "rand",
+]
 all = [
+    "rand",
     "serde",
+]
+rand = [
+    "dep:rand",
 ]
 stl = [
     "rgb-aluvm/stl",

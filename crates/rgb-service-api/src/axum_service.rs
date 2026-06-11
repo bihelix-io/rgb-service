@@ -7,11 +7,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 
 use crate::{
     auth::{
-        AccountScoped, AssetSpendAuthorized, AuthSubject, AuthVerifier, Authorized, Permission,
+        AccountScoped, AssetSpendAuthorized, AuthVerifier, Authorized, Permission,
         SignedRequest,
     },
     dto::*,
@@ -41,6 +41,7 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/consignments/import", post(import_consignment))
         .route("/v1/pending/list", post(list_pending))
         .route("/v1/recover", post(recover))
+        .route("/v1/test/rgb", post(run_rgb_test))
         .with_state(state)
 }
 
@@ -197,6 +198,14 @@ async fn recover(
 ) -> Result<Json<RecoveryReport>, HttpError> {
     let req = authorize(&state, Permission::Recover, req).await?;
     Ok(Json(state.service.recover(req).await?))
+}
+
+async fn run_rgb_test(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<RunRgbTestRequest>>,
+) -> Result<Json<RunRgbTestResponse>, HttpError> {
+    let req = authorize(&state, Permission::RunTest, req).await?;
+    Ok(Json(state.service.run_rgb_test(req).await?))
 }
 
 pub struct HttpError(RgbServiceError);
