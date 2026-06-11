@@ -8,16 +8,14 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use rgb_service_api::{
-    AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier, Authorized, BalanceBreakdownRequest,
-    BalanceBreakdownResponse, BalanceRequest, CancelTransferRequest, CancelTransferResponse,
-    CommitTransferRequest, CommitTransferResponse, CreateInvoiceRequest, CreateInvoiceResponse,
-    ImportConsignmentRequest, ImportConsignmentResponse, ImportContractRequest,
-    ImportContractResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
+    AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier, Authorized,
+    BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest, CancelTransferRequest,
+    CancelTransferResponse, CommitTransferRequest, CommitTransferResponse, CreateInvoiceRequest,
+    CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
     ListAssetsResponse, ListPendingRequest, ListPendingResponse, Permission, PrepareTransferRequest,
     PrepareTransferResponse, RecoverRequest, RecoveryReport, RequestSignature, RgbBalance,
     RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep, RunRgbTestRequest,
-    RunRgbTestResponse, SignatureScheme, SignedRequest, ValidateConsignmentRequest,
-    ValidationReport, axum_service::router,
+    RunRgbTestResponse, SignatureScheme, SignedRequest, axum_service::router,
 };
 use tower::ServiceExt;
 
@@ -57,13 +55,6 @@ impl RgbServiceApi for TestRgbService {
         _req: Authorized<IssueAssetRequest>,
     ) -> rgb_service_api::Result<IssueAssetResponse> {
         Err(unimplemented_call("issue_asset"))
-    }
-
-    async fn import_contract(
-        &self,
-        _req: Authorized<ImportContractRequest>,
-    ) -> rgb_service_api::Result<ImportContractResponse> {
-        Err(unimplemented_call("import_contract"))
     }
 
     async fn list_assets(
@@ -115,20 +106,6 @@ impl RgbServiceApi for TestRgbService {
         Err(unimplemented_call("cancel_transfer"))
     }
 
-    async fn validate_consignment(
-        &self,
-        _req: Authorized<ValidateConsignmentRequest>,
-    ) -> rgb_service_api::Result<ValidationReport> {
-        Err(unimplemented_call("validate_consignment"))
-    }
-
-    async fn import_consignment(
-        &self,
-        _req: Authorized<ImportConsignmentRequest>,
-    ) -> rgb_service_api::Result<ImportConsignmentResponse> {
-        Err(unimplemented_call("import_consignment"))
-    }
-
     async fn list_pending(
         &self,
         _req: Authorized<ListPendingRequest>,
@@ -154,8 +131,7 @@ impl RgbServiceApi for TestRgbService {
                 step("issue_rgb20"),
                 step("create_invoice"),
                 step("prepare_transfer"),
-                step("validate_consignment"),
-                step("import_consignment"),
+                step("commit_transfer"),
                 step("recover_pending"),
             ],
         })
@@ -185,7 +161,7 @@ async fn rgb_test_route_returns_full_lifecycle_report() {
     let report: RunRgbTestResponse = serde_json::from_slice(&body).unwrap();
     assert!(report.passed);
     assert_eq!(report.scenario, RgbTestScenario::FullRgb20Lifecycle);
-    assert_eq!(report.steps.len(), 6);
+    assert_eq!(report.steps.len(), 5);
 }
 
 fn account(value: &str) -> AccountId {

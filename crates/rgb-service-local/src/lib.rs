@@ -33,6 +33,8 @@ use rgbstd::{
 use serde::{Deserialize, Serialize};
 use strict_types::{StrictDeserialize, StrictSerialize};
 
+pub use rgbstd;
+
 const RGB_STOCK_PARTITION: &str = "rgb_stock";
 const RGB_PENDING_OPS_PARTITION: &str = "rgb_pending_ops";
 
@@ -1201,6 +1203,14 @@ fn encode_fascia(fascia: &Fascia) -> Result<Vec<u8>> {
 fn decode_fascia(bytes: &[u8]) -> Result<Fascia> {
     let confined = Confined::try_from(bytes.to_vec()).context("confine RGB fascia bytes")?;
     Fascia::from_strict_serialized::<U32MAX>(confined).context("decode RGB fascia")
+}
+
+pub fn encode_fascia_bytes(fascia: &Fascia) -> Result<Vec<u8>> {
+    encode_fascia(fascia)
+}
+
+pub fn decode_fascia_bytes(bytes: &[u8]) -> Result<Fascia> {
+    decode_fascia(bytes)
 }
 
 fn staged_rgb_stock_dir(stock_dir: &Path, txid: Txid) -> PathBuf {

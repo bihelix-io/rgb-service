@@ -30,20 +30,10 @@ pub struct IssueAssetResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ImportContractRequest {
-    pub account_id: AccountId,
-    pub contract: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ImportContractResponse {
-    pub contract_id: ContractId,
-    pub asset_id: Option<AssetId>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListAssetsRequest {
     pub account_id: AccountId,
+    #[serde(default)]
+    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,6 +55,8 @@ pub struct BalanceRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
     pub scope: BalanceScope,
+    #[serde(default)]
+    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -96,6 +88,8 @@ pub struct RgbBalance {
 pub struct BalanceBreakdownRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
+    #[serde(default)]
+    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -112,6 +106,13 @@ pub struct RgbAllocation {
     pub amount: u64,
     pub layer: AssetLayer,
     pub status: AllocationStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TrackedUtxo {
+    pub outpoint: Outpoint,
+    pub address: Option<String>,
+    pub confirmed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -156,6 +157,9 @@ pub struct PrepareTransferRequest {
     pub amount: u64,
     pub recipient: String,
     pub fee_rate_sat_vb: Option<u64>,
+    pub unsigned_anchor_psbt: Option<String>,
+    pub change_vout: Option<u32>,
+    pub recipient_vout: Option<u32>,
     pub asset_authorization: AssetSpendAuthorization,
 }
 
@@ -164,7 +168,6 @@ pub struct PrepareTransferResponse {
     pub transfer_id: TransferId,
     pub operation_id: OperationId,
     pub anchor_psbt: Option<String>,
-    pub consignment: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -193,33 +196,6 @@ pub struct CancelTransferRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CancelTransferResponse {
     pub transfer_id: TransferId,
-    pub status: OperationStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ValidateConsignmentRequest {
-    pub account_id: AccountId,
-    pub consignment: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ValidationReport {
-    pub valid: bool,
-    pub asset_id: Option<AssetId>,
-    pub amount: Option<u64>,
-    pub anchor_txid: Option<Txid>,
-    pub message: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ImportConsignmentRequest {
-    pub account_id: AccountId,
-    pub consignment: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ImportConsignmentResponse {
-    pub operation_id: OperationId,
     pub status: OperationStatus,
 }
 
@@ -318,7 +294,6 @@ macro_rules! account_scoped {
 
 account_scoped!(
     IssueAssetRequest,
-    ImportContractRequest,
     ListAssetsRequest,
     BalanceRequest,
     BalanceBreakdownRequest,
@@ -326,8 +301,6 @@ account_scoped!(
     PrepareTransferRequest,
     CommitTransferRequest,
     CancelTransferRequest,
-    ValidateConsignmentRequest,
-    ImportConsignmentRequest,
     ListPendingRequest,
     RecoverRequest,
     RunRgbTestRequest,

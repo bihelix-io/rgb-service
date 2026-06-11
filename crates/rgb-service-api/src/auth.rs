@@ -8,13 +8,10 @@ use crate::error::Result;
 pub enum Permission {
     ReadAssets,
     IssueAsset,
-    ImportContract,
     CreateInvoice,
     PrepareTransfer,
     CommitTransfer,
     CancelTransfer,
-    ValidateConsignment,
-    ImportConsignment,
     ManagePending,
     Recover,
     RunTest,

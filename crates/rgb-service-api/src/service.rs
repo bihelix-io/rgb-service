@@ -13,11 +13,6 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         req: Authorized<IssueAssetRequest>,
     ) -> Result<IssueAssetResponse>;
 
-    async fn import_contract(
-        &self,
-        req: Authorized<ImportContractRequest>,
-    ) -> Result<ImportContractResponse>;
-
     async fn list_assets(
         &self,
         req: Authorized<ListAssetsRequest>,
@@ -49,16 +44,6 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         &self,
         req: Authorized<CancelTransferRequest>,
     ) -> Result<CancelTransferResponse>;
-
-    async fn validate_consignment(
-        &self,
-        req: Authorized<ValidateConsignmentRequest>,
-    ) -> Result<ValidationReport>;
-
-    async fn import_consignment(
-        &self,
-        req: Authorized<ImportConsignmentRequest>,
-    ) -> Result<ImportConsignmentResponse>;
 
     async fn list_pending(
         &self,

@@ -29,7 +29,6 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
     let state = ApiState { service, auth };
     Router::new()
         .route("/v1/assets/issue", post(issue_asset))
-        .route("/v1/contracts/import", post(import_contract))
         .route("/v1/assets/list", post(list_assets))
         .route("/v1/balance", post(balance))
         .route("/v1/balance/breakdown", post(balance_breakdown))
@@ -37,8 +36,6 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/transfers/prepare", post(prepare_transfer))
         .route("/v1/transfers/commit", post(commit_transfer))
         .route("/v1/transfers/cancel", post(cancel_transfer))
-        .route("/v1/consignments/validate", post(validate_consignment))
-        .route("/v1/consignments/import", post(import_consignment))
         .route("/v1/pending/list", post(list_pending))
         .route("/v1/recover", post(recover))
         .route("/v1/test/rgb", post(run_rgb_test))
@@ -104,14 +101,6 @@ async fn issue_asset(
     Ok(Json(state.service.issue_asset(req).await?))
 }
 
-async fn import_contract(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<ImportContractRequest>>,
-) -> Result<Json<ImportContractResponse>, HttpError> {
-    let req = authorize(&state, Permission::ImportContract, req).await?;
-    Ok(Json(state.service.import_contract(req).await?))
-}
-
 async fn list_assets(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<ListAssetsRequest>>,
@@ -166,22 +155,6 @@ async fn cancel_transfer(
 ) -> Result<Json<CancelTransferResponse>, HttpError> {
     let req = authorize(&state, Permission::CancelTransfer, req).await?;
     Ok(Json(state.service.cancel_transfer(req).await?))
-}
-
-async fn validate_consignment(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<ValidateConsignmentRequest>>,
-) -> Result<Json<ValidationReport>, HttpError> {
-    let req = authorize(&state, Permission::ValidateConsignment, req).await?;
-    Ok(Json(state.service.validate_consignment(req).await?))
-}
-
-async fn import_consignment(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<ImportConsignmentRequest>>,
-) -> Result<Json<ImportConsignmentResponse>, HttpError> {
-    let req = authorize(&state, Permission::ImportConsignment, req).await?;
-    Ok(Json(state.service.import_consignment(req).await?))
 }
 
 async fn list_pending(

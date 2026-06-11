@@ -9,6 +9,7 @@ members = [
     "crates/rgb-ops",
     "crates/rgb-ops/invoice",
     "crates/rgb-service-api",
+    "crates/rgb-service-daemon",
     "crates/rgb-service-local",
     "crates/rgb-schemas",
 ]
@@ -29,7 +30,7 @@ license = "Apache-2.0"
 amplify = "=4.8.1"
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 baid64 = "=0.4.1"
 bitcoin = { version = "0.32.7", features = ["serde"] }
 bp-wallet = { version = "0.11.1-alpha.2" }
@@ -45,6 +46,8 @@ serde_crate = { package = "serde", version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.19"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+toml = "0.8"
 
 rgb-aluvm = { version = "0.11.1-rc.3", path = "crates/rgb-aluvm" }
 rgb-api = { version = "0.11.1-rc.10", path = "crates/rgb-api" }
@@ -54,5 +57,6 @@ psrgbt = { package = "rgb-psbt-utils", version = "0.11.1-rc.10", path = "crates/
 rgb-ops = { version = "0.11.1-rc.10", path = "crates/rgb-ops" }
 rgb-psbt-utils = { version = "0.11.1-rc.10", path = "crates/rgb-api/psbt" }
 rgb-schemata = { package = "rgb-schemas", version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
+rgb-service-api = { version = "0.11.1-rc.10", path = "crates/rgb-service-api" }
 rgb-schemas = { version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
 rgbstd = { package = "rgb-ops", version = "0.11.1-rc.10", path = "crates/rgb-ops" }

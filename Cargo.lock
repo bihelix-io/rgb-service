@@ -340,6 +340,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
+ "hyper 1.10.1",
  "hyper-util",
  "itoa",
  "matchit",
@@ -1949,10 +1950,15 @@ version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
 dependencies = [
+ "atomic-waker",
  "bytes",
+ "futures-channel",
+ "futures-core",
  "http 1.4.2",
  "http-body 1.0.1",
+ "httparse",
  "httpdate",
+ "itoa",
  "pin-project-lite",
  "smallvec",
  "tokio",
@@ -3140,6 +3146,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgb-service-daemon"
+version = "0.11.1-rc.10"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bitcoin",
+ "fjall",
+ "rgb-service-api",
+ "rgb-service-local",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "rgb-service-local"
 version = "0.11.1-rc.10"
 dependencies = [
@@ -3638,6 +3660,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "single_use_seals"
 version = "0.11.1-alpha.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3950,6 +3982,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.4",
  "tokio-macros",
  "windows-sys 0.61.2",
