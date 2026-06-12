@@ -8,6 +8,16 @@ use crate::{
 
 #[async_trait]
 pub trait RgbServiceApi: Send + Sync + 'static {
+    async fn register_iroh_node(
+        &self,
+        req: Authorized<RegisterIrohNodeRequest>,
+    ) -> Result<RegisterIrohNodeResponse>;
+
+    async fn lookup_iroh_node(
+        &self,
+        req: Authorized<LookupIrohNodeRequest>,
+    ) -> Result<LookupIrohNodeResponse>;
+
     async fn issue_asset(
         &self,
         req: Authorized<IssueAssetRequest>,
@@ -39,6 +49,16 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         &self,
         req: Authorized<CommitTransferRequest>,
     ) -> Result<CommitTransferResponse>;
+
+    async fn send_consignment(
+        &self,
+        req: Authorized<SendConsignmentRequest>,
+    ) -> Result<SendConsignmentResponse>;
+
+    async fn receive_consignment(
+        &self,
+        req: Authorized<ReceiveConsignmentRequest>,
+    ) -> Result<ReceiveConsignmentResponse>;
 
     async fn cancel_transfer(
         &self,

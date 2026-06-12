@@ -3,3 +3,9 @@ bind = "127.0.0.1:8787"
 network = "regtest"
 data_dir = "/tmp/bihelix-rgb-service"
 esplora_url = "http://127.0.0.1:3002"
+
+[rna]
+new_profile_grant = 10000
+issue_fee = 1000
+transfer_fee = 100
+query_fee = 1

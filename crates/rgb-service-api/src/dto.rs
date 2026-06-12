@@ -7,10 +7,46 @@ pub type AssetId = String;
 pub type ContractId = String;
 pub type OperationId = String;
 pub type TransferId = String;
+pub type ConsignmentId = String;
 pub type InvoiceId = String;
 pub type ReservationId = String;
 pub type Txid = String;
 pub type Outpoint = String;
+pub type BtcAddress = String;
+pub type IrohNodeId = String;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RegisterIrohNodeRequest {
+    pub account_id: AccountId,
+    pub btc_address: BtcAddress,
+    pub iroh_node_id: IrohNodeId,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RegisterIrohNodeResponse {
+    pub binding: IrohNodeBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LookupIrohNodeRequest {
+    pub account_id: AccountId,
+    pub btc_address: BtcAddress,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LookupIrohNodeResponse {
+    pub binding: Option<IrohNodeBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IrohNodeBinding {
+    pub account_id: AccountId,
+    pub btc_address: BtcAddress,
+    pub iroh_node_id: IrohNodeId,
+    pub label: Option<String>,
+    pub updated_at_ms: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IssueAssetRequest {
@@ -187,6 +223,73 @@ pub struct CommitTransferResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SendConsignmentRequest {
+    pub account_id: AccountId,
+    pub transfer_id: TransferId,
+    pub asset_id: AssetId,
+    pub txid: Txid,
+    pub recipient_vout: Option<u32>,
+    pub transport: ConsignmentTransport,
+    pub asset_authorization: AssetSpendAuthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SendConsignmentResponse {
+    pub transfer_id: TransferId,
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+    pub delivery: ConsignmentDelivery,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsignmentTransport {
+    Inline,
+    ServiceInbox { account_id: AccountId },
+    Iroh {
+        node_id: String,
+        topic: Option<String>,
+        timeout_ms: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsignmentDelivery {
+    Inline { consignment_hex: String },
+    ServiceInbox { account_id: AccountId },
+    Iroh {
+        node_id: String,
+        delivery_id: ConsignmentId,
+        status: ConsignmentDeliveryStatus,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsignmentDeliveryStatus {
+    Pending,
+    Sent,
+    Delivered,
+    Accepted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReceiveConsignmentRequest {
+    pub account_id: AccountId,
+    pub txid: Txid,
+    pub consignment_hex: String,
+    pub source_transfer_id: Option<TransferId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReceiveConsignmentResponse {
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CancelTransferRequest {
     pub account_id: AccountId,
     pub transfer_id: TransferId,
@@ -293,6 +396,8 @@ macro_rules! account_scoped {
 }
 
 account_scoped!(
+    RegisterIrohNodeRequest,
+    LookupIrohNodeRequest,
     IssueAssetRequest,
     ListAssetsRequest,
     BalanceRequest,
@@ -300,6 +405,8 @@ account_scoped!(
     CreateInvoiceRequest,
     PrepareTransferRequest,
     CommitTransferRequest,
+    SendConsignmentRequest,
+    ReceiveConsignmentRequest,
     CancelTransferRequest,
     ListPendingRequest,
     RecoverRequest,
@@ -313,6 +420,12 @@ impl AssetSpendAuthorized for PrepareTransferRequest {
 }
 
 impl AssetSpendAuthorized for CommitTransferRequest {
+    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
+        Some(&self.asset_authorization)
+    }
+}
+
+impl AssetSpendAuthorized for SendConsignmentRequest {
     fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
         Some(&self.asset_authorization)
     }

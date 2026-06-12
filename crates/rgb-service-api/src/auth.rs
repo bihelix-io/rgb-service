@@ -6,11 +6,15 @@ use crate::error::Result;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
+    RegisterIrohNode,
+    LookupIrohNode,
     ReadAssets,
     IssueAsset,
     CreateInvoice,
     PrepareTransfer,
     CommitTransfer,
+    SendConsignment,
+    ReceiveConsignment,
     CancelTransfer,
     ManagePending,
     Recover,

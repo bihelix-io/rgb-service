@@ -28,6 +28,8 @@ pub struct ApiState {
 pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> Router {
     let state = ApiState { service, auth };
     Router::new()
+        .route("/v1/iroh-nodes/register", post(register_iroh_node))
+        .route("/v1/iroh-nodes/lookup", post(lookup_iroh_node))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
         .route("/v1/balance", post(balance))
@@ -35,6 +37,8 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/invoices/create", post(create_invoice))
         .route("/v1/transfers/prepare", post(prepare_transfer))
         .route("/v1/transfers/commit", post(commit_transfer))
+        .route("/v1/consignments/send", post(send_consignment))
+        .route("/v1/consignments/receive", post(receive_consignment))
         .route("/v1/transfers/cancel", post(cancel_transfer))
         .route("/v1/pending/list", post(list_pending))
         .route("/v1/recover", post(recover))
@@ -93,6 +97,22 @@ where
     Ok(authorized)
 }
 
+async fn register_iroh_node(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<RegisterIrohNodeRequest>>,
+) -> Result<Json<RegisterIrohNodeResponse>, HttpError> {
+    let req = authorize(&state, Permission::RegisterIrohNode, req).await?;
+    Ok(Json(state.service.register_iroh_node(req).await?))
+}
+
+async fn lookup_iroh_node(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LookupIrohNodeRequest>>,
+) -> Result<Json<LookupIrohNodeResponse>, HttpError> {
+    let req = authorize(&state, Permission::LookupIrohNode, req).await?;
+    Ok(Json(state.service.lookup_iroh_node(req).await?))
+}
+
 async fn issue_asset(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<IssueAssetRequest>>,
@@ -147,6 +167,22 @@ async fn commit_transfer(
 ) -> Result<Json<CommitTransferResponse>, HttpError> {
     let req = authorize_asset_spend(&state, Permission::CommitTransfer, req).await?;
     Ok(Json(state.service.commit_transfer(req).await?))
+}
+
+async fn send_consignment(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<SendConsignmentRequest>>,
+) -> Result<Json<SendConsignmentResponse>, HttpError> {
+    let req = authorize_asset_spend(&state, Permission::SendConsignment, req).await?;
+    Ok(Json(state.service.send_consignment(req).await?))
+}
+
+async fn receive_consignment(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<ReceiveConsignmentRequest>>,
+) -> Result<Json<ReceiveConsignmentResponse>, HttpError> {
+    let req = authorize(&state, Permission::ReceiveConsignment, req).await?;
+    Ok(Json(state.service.receive_consignment(req).await?))
 }
 
 async fn cancel_transfer(

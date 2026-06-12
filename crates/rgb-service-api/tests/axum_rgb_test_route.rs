@@ -13,8 +13,11 @@ use rgb_service_api::{
     CancelTransferResponse, CommitTransferRequest, CommitTransferResponse, CreateInvoiceRequest,
     CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
     ListAssetsResponse, ListPendingRequest, ListPendingResponse, Permission, PrepareTransferRequest,
-    PrepareTransferResponse, RecoverRequest, RecoveryReport, RequestSignature, RgbBalance,
-    RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep, RunRgbTestRequest,
+    PrepareTransferResponse, ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest,
+    RecoveryReport, RegisterIrohNodeRequest, RegisterIrohNodeResponse, LookupIrohNodeRequest,
+    LookupIrohNodeResponse, RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError,
+    RgbTestScenario, RgbTestStep, RunRgbTestRequest, SendConsignmentRequest,
+    SendConsignmentResponse,
     RunRgbTestResponse, SignatureScheme, SignedRequest, axum_service::router,
 };
 use tower::ServiceExt;
@@ -50,6 +53,20 @@ struct TestRgbService;
 
 #[async_trait]
 impl RgbServiceApi for TestRgbService {
+    async fn register_iroh_node(
+        &self,
+        _req: Authorized<RegisterIrohNodeRequest>,
+    ) -> rgb_service_api::Result<RegisterIrohNodeResponse> {
+        Err(unimplemented_call("register_iroh_node"))
+    }
+
+    async fn lookup_iroh_node(
+        &self,
+        _req: Authorized<LookupIrohNodeRequest>,
+    ) -> rgb_service_api::Result<LookupIrohNodeResponse> {
+        Err(unimplemented_call("lookup_iroh_node"))
+    }
+
     async fn issue_asset(
         &self,
         _req: Authorized<IssueAssetRequest>,
@@ -99,6 +116,20 @@ impl RgbServiceApi for TestRgbService {
         Err(unimplemented_call("commit_transfer"))
     }
 
+    async fn send_consignment(
+        &self,
+        _req: Authorized<SendConsignmentRequest>,
+    ) -> rgb_service_api::Result<SendConsignmentResponse> {
+        Err(unimplemented_call("send_consignment"))
+    }
+
+    async fn receive_consignment(
+        &self,
+        _req: Authorized<ReceiveConsignmentRequest>,
+    ) -> rgb_service_api::Result<ReceiveConsignmentResponse> {
+        Err(unimplemented_call("receive_consignment"))
+    }
+
     async fn cancel_transfer(
         &self,
         _req: Authorized<CancelTransferRequest>,
@@ -132,6 +163,8 @@ impl RgbServiceApi for TestRgbService {
                 step("create_invoice"),
                 step("prepare_transfer"),
                 step("commit_transfer"),
+                step("send_consignment"),
+                step("receive_consignment"),
                 step("recover_pending"),
             ],
         })
@@ -161,7 +194,7 @@ async fn rgb_test_route_returns_full_lifecycle_report() {
     let report: RunRgbTestResponse = serde_json::from_slice(&body).unwrap();
     assert!(report.passed);
     assert_eq!(report.scenario, RgbTestScenario::FullRgb20Lifecycle);
-    assert_eq!(report.steps.len(), 5);
+    assert_eq!(report.steps.len(), 7);
 }
 
 fn account(value: &str) -> AccountId {

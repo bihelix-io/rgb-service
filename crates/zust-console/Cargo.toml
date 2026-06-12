@@ -1,0 +1,24 @@
+[package]
+name = "zust-console"
+version.workspace = true
+description = "Zust console for driving BiHelix RGB service flows"
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "zust-console"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+dynamic = { package = "zust-dynamic", version = "0.9.12" }
+root = { package = "zust-root", version = "0.9.6" }
+serde_json = { workspace = true }
+vm = { package = "zust-vm", version = "0.9.66" }

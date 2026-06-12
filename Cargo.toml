@@ -11,6 +11,7 @@ members = [
     "crates/rgb-service-api",
     "crates/rgb-service-daemon",
     "crates/rgb-service-local",
+    "crates/zust-console",
     "crates/rgb-schemas",
 ]
 resolver = "2"
@@ -35,8 +36,10 @@ baid64 = "=0.4.1"
 bitcoin = { version = "0.32.7", features = ["serde"] }
 bp-wallet = { version = "0.11.1-alpha.2" }
 chrono = "0.4.38"
+dynamic = { package = "zust-dynamic", version = "0.9.12" }
 fjall = "3.1.4"
 indexmap = "2.4.0"
+iroh = "1.0.0-rc.0"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 nonasync = { version = "=0.1.3", features = ["log"] }
 rgb-ascii-armor = "1.0.1"
@@ -48,6 +51,7 @@ serde_yaml = "0.9.19"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 toml = "0.8"
+vm = { package = "zust-vm", version = "0.9.66" }
 
 rgb-aluvm = { version = "0.11.1-rc.3", path = "crates/rgb-aluvm" }
 rgb-api = { version = "0.11.1-rc.10", path = "crates/rgb-api" }
@@ -60,3 +64,4 @@ rgb-schemata = { package = "rgb-schemas", version = "0.11.1-rc.10", path = "crat
 rgb-service-api = { version = "0.11.1-rc.10", path = "crates/rgb-service-api" }
 rgb-schemas = { version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
 rgbstd = { package = "rgb-ops", version = "0.11.1-rc.10", path = "crates/rgb-ops" }
+root = { package = "zust-root", version = "0.9.6" }
