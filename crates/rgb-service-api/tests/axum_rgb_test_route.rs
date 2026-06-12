@@ -12,12 +12,14 @@ use rgb_service_api::{
     Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
     CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
     CreateInvoiceRequest, CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse,
-    ListAssetsRequest, ListAssetsResponse, ListPendingRequest, ListPendingResponse, Permission,
-    PrepareTransferRequest, PrepareTransferResponse, ReceiveConsignmentRequest,
-    ReceiveConsignmentResponse, RecoverRequest, RecoveryReport, RequestSignature, RgbBalance,
-    RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep, RunRgbTestRequest,
-    RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse, SignatureScheme,
-    SignedRequest,
+    ListAssetsRequest, ListAssetsResponse, ListPendingRequest, ListPendingResponse,
+    LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse, LnClosingComposeRequest,
+    LnCommitmentComposeRequest, LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest,
+    LnRecoveryReport, Permission, PrepareTransferRequest, PrepareTransferResponse,
+    ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest, RecoveryReport,
+    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep,
+    RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse,
+    SendConsignmentRequest, SendConsignmentResponse, SignatureScheme, SignedRequest,
 };
 use tower::ServiceExt;
 
@@ -52,6 +54,13 @@ struct TestRgbService;
 
 #[async_trait]
 impl RgbServiceApi for TestRgbService {
+    async fn rna_balance(
+        &self,
+        _req: Authorized<RnaBalanceRequest>,
+    ) -> rgb_service_api::Result<RnaBalanceResponse> {
+        Err(unimplemented_call("rna_balance"))
+    }
+
     async fn issue_asset(
         &self,
         _req: Authorized<IssueAssetRequest>,
@@ -134,6 +143,41 @@ impl RgbServiceApi for TestRgbService {
         _req: Authorized<RecoverRequest>,
     ) -> rgb_service_api::Result<RecoveryReport> {
         Err(unimplemented_call("recover"))
+    }
+
+    async fn prepare_ln_channel_open(
+        &self,
+        _req: Authorized<LnChannelOpenPrepareRequest>,
+    ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
+        Err(unimplemented_call("prepare_ln_channel_open"))
+    }
+
+    async fn compose_ln_commitment(
+        &self,
+        _req: Authorized<LnCommitmentComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        Err(unimplemented_call("compose_ln_commitment"))
+    }
+
+    async fn compose_ln_closing(
+        &self,
+        _req: Authorized<LnClosingComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        Err(unimplemented_call("compose_ln_closing"))
+    }
+
+    async fn compose_ln_onchain_claim(
+        &self,
+        _req: Authorized<LnOnchainClaimComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        Err(unimplemented_call("compose_ln_onchain_claim"))
+    }
+
+    async fn recover_ln(
+        &self,
+        _req: Authorized<LnRecoverRequest>,
+    ) -> rgb_service_api::Result<LnRecoveryReport> {
+        Err(unimplemented_call("recover_ln"))
     }
 
     async fn run_rgb_test(

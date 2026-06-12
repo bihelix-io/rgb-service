@@ -216,11 +216,10 @@ The public daemon does not expose raw fascia download or arbitrary raw consignme
 /v1/consignments/receive
 ```
 
-`/v1/consignments/send` supports:
+`/v1/consignments/send` delivers to the service inbox:
 
 ```text
-inline
-service_inbox
+transport.account_id
 ```
 
 ## Storage layout

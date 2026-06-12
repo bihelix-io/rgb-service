@@ -1,6 +1,12 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -13,11 +19,22 @@ use vm::Vm;
 const SIGNER_ALPN: &[u8] = b"bihelix/signer/1";
 const SIGNER_REQUEST_SIGNATURE_PATH: &str = "/v1/signer/request-signature";
 const SIGNER_ASSET_AUTHORIZATION_PATH: &str = "/v1/signer/asset-authorization";
+const SIGNER_ADDRESS_NEW_PATH: &str = "/v1/signer/address/new";
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNER_ATTEMPTS: usize = 3;
 const SIGNER_RETRY_DELAY: Duration = Duration::from_millis(500);
+const LN_SCAN_DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
+const LN_NODE_DEFAULT_PATH: &str = ".zust-console/ln-node.json";
+const LN_DATA_DIR_DEFAULT: &str = ".zust-console/lightning";
+const LN_LDK_DATA_DIR_DEFAULT: &str = ".zust-console/lightning/ldk";
+const LN_LISTEN_DEFAULT: &str = "0.0.0.0:9736";
+const LN_ESPLORA_DEFAULT: &str = "https://mempool.space/api";
+const LN_LOW_WATER_SATS: u64 = 100_000;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
+static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static LN_STARTED: AtomicBool = AtomicBool::new(false);
+static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn daemon_url() -> Result<String> {
     let daemon_url =
@@ -34,6 +51,12 @@ fn local_string(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.as_str().to_string())
         .filter(|value| !value.trim().is_empty())
+}
+
+fn local_dynamic(name: &str) -> Option<Dynamic> {
+    root::get(&format!("local/{name}"))
+        .ok()
+        .filter(|value| !matches!(value, Dynamic::Null))
 }
 
 pub fn register_console_modules(vm: &Vm) -> Result<()> {
@@ -218,10 +241,38 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
     let mut jit = vm.jit.write().unwrap();
     jit.add_native_module_ptr(
         "ln",
+        "spawn_scanner",
+        &[Type::Any],
+        Type::Any,
+        ln_spawn_scanner as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "start",
+        &[Type::Any],
+        Type::Any,
+        ln_start as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "scanner_status",
+        &[Type::Any],
+        Type::Any,
+        ln_scanner_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
         "status",
         &[Type::Any],
         Type::Any,
         ln_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "node_address",
+        &[Type::Any],
+        Type::Any,
+        ln_node_address as *const u8,
     )?;
     Ok(())
 }
@@ -404,11 +455,173 @@ extern "C" fn ln_status(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |_input| {
         Ok(ok(json!({
             "module": "ln",
-            "enabled": false,
-            "status": "disabled",
-            "message": "LN module is registered for Zust API compatibility; implementation is intentionally deferred"
+            "enabled": true,
+            "started": LN_STARTED.load(Ordering::SeqCst),
+            "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
+            "layers": ["l1", "l2"],
+            "mode": "hot_wallet",
+            "note": "LN node service is deferred; only the Zust API and scanner placeholder are wired"
         })))
     })
+}
+
+extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let lightning = if is_null_or_empty_object(input) {
+            local_dynamic("lightning").context(
+                "missing root value `local/lightning`; run ln::node_address and root::add first",
+            )?
+        } else {
+            input.clone()
+        };
+        let node = dynamic_to_json(&lightning);
+        let address = find_string_field(&node, &["address", "btc_address"]).unwrap_or_default();
+        let low_water_sats = value_u64(&node, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
+        let config = normalized_ln_config(ln_config_from_value(&node), low_water_sats);
+        let interval_ms = optional_u64(&lightning, "interval_ms")
+            .or_else(|| value_u64(&node, "interval_ms"))
+            .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
+        let interval = Duration::from_millis(interval_ms.max(1000));
+
+        if LN_STARTED.swap(true, Ordering::SeqCst) {
+            return Ok(ok(json!({
+                "module": "ln",
+                "started": true,
+                "already_running": true,
+                "address": address,
+                "config": config,
+                "source": "local/lightning",
+                "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
+                "scan_enabled": false
+            })));
+        }
+
+        let thread_node = node.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("zust-ln-inbound-listener".to_string())
+            .spawn(move || ln_inbound_loop(thread_node, interval))
+        {
+            LN_STARTED.store(false, Ordering::SeqCst);
+            return Err(err).context("spawn LN inbound listener thread");
+        }
+
+        Ok(ok(json!({
+            "module": "ln",
+            "started": true,
+            "already_running": false,
+            "address": address,
+            "config": config,
+            "source": "local/lightning",
+            "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
+            "scan_enabled": false,
+            "note": "LN inbound listener is running; real L1/L2 scanning is intentionally disabled"
+        })))
+    })
+}
+
+extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let btc_addr = default_account_id()?;
+        let rgb_service = local_string("rgb-service").unwrap_or_default();
+        let interval_ms = optional_u64(input, "interval_ms")
+            .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
+        let interval = Duration::from_millis(interval_ms.max(1000));
+
+        if LN_SCANNER_STARTED.swap(true, Ordering::SeqCst) {
+            return Ok(ok(json!({
+                "module": "ln",
+                "scanner_started": true,
+                "already_running": true,
+                "btc_addr": btc_addr,
+                "rgb_service": rgb_service,
+                "layers": ["l1", "l2"],
+                "scan_enabled": false
+            })));
+        }
+
+        let thread_btc_addr = btc_addr.clone();
+        let thread_rgb_service = rgb_service.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("zust-ln-chain-scanner".to_string())
+            .spawn(move || ln_scanner_loop(thread_btc_addr, thread_rgb_service, interval))
+        {
+            LN_SCANNER_STARTED.store(false, Ordering::SeqCst);
+            return Err(err).context("spawn LN chain scanner thread");
+        }
+
+        Ok(ok(json!({
+            "module": "ln",
+            "scanner_started": true,
+            "already_running": false,
+            "btc_addr": btc_addr,
+            "rgb_service": rgb_service,
+            "layers": ["l1", "l2"],
+            "accepts": ["l1_onchain_deposit", "l2_ln_deposit"],
+            "scan_enabled": false,
+            "note": "scanner thread is started, but real chain scanning is intentionally disabled"
+        })))
+    })
+}
+
+extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let path = ln_node_path(input);
+        let low_water_sats = optional_u64(input, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
+        let config = normalized_ln_config(dynamic_to_json(input), low_water_sats);
+        if path.exists() {
+            let mut stored = read_json_file(&path)
+                .with_context(|| format!("read LN node state {}", path.display()))?;
+            update_ln_node_config(&mut stored, config, low_water_sats);
+            write_private_json_file(&path, &stored)
+                .with_context(|| format!("write LN node state {}", path.display()))?;
+            return Ok(ok(redacted_ln_node_response(stored, &path, false)));
+        }
+
+        let body = json!({
+            "account_id": default_account_id()?,
+            "network": optional_string(input, "network").unwrap_or_else(|| "bitcoin".to_string()),
+            "purpose": "ln_node_hot_wallet",
+            "low_water_sats": low_water_sats,
+            "timestamp_ms": now_ms()
+        });
+        let signer_response = signer_request(SIGNER_ADDRESS_NEW_PATH, &body)?;
+        let stored = json!({
+            "version": 1,
+            "kind": "ln_node_hot_wallet",
+            "created_at_ms": now_ms(),
+            "account_id": default_account_id()?,
+            "signer_node": signer_node_id()?,
+            "low_water_sats": low_water_sats,
+            "config": config,
+            "signer_response": signer_response
+        });
+        write_private_json_file(&path, &stored)
+            .with_context(|| format!("write LN node state {}", path.display()))?;
+        Ok(ok(redacted_ln_node_response(stored, &path, true)))
+    })
+}
+
+extern "C" fn ln_scanner_status(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |_input| {
+        Ok(ok(json!({
+            "module": "ln",
+            "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
+            "layers": ["l1", "l2"],
+            "scan_enabled": false
+        })))
+    })
+}
+
+fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) {
+    loop {
+        thread::sleep(interval);
+    }
+}
+
+fn ln_inbound_loop(_node: Value, interval: Duration) {
+    loop {
+        thread::sleep(interval);
+    }
 }
 
 fn rgb_route(input: *const Dynamic, route: &str) -> *const Dynamic {
@@ -507,9 +720,15 @@ fn signed_request(input: &Dynamic, route: &str) -> Result<Dynamic> {
 }
 
 fn signed_body(input: &Dynamic) -> Result<Value> {
+    let permission = optional_string(input, "permission")
+        .or_else(|| optional_string(input, "operation"))
+        .unwrap_or_else(|| "request_signature".to_string());
     Ok(json!({
         "account_id": default_account_id()?,
+        "permission": permission,
         "payload": signed_payload(input, "")?,
+        "domain": optional_string(input, "domain").unwrap_or_else(|| "bihelix-rgb-service".to_string()),
+        "expires_at_ms": optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000),
         "timestamp_ms": now_ms()
     }))
 }
@@ -565,6 +784,14 @@ fn signer_node_id() -> Result<String> {
 }
 
 fn request_signature(path: &str, body: &Value) -> Result<Value> {
+    let response = signer_request(path, body)?;
+    response
+        .get("signature")
+        .cloned()
+        .with_context(|| format!("signer response missing `signature`: {response}"))
+}
+
+fn signer_request(path: &str, body: &Value) -> Result<Value> {
     let signer_node = signer_node_id()?;
     let path = path.to_string();
     let body = json_to_dynamic(body);
@@ -573,14 +800,24 @@ fn request_signature(path: &str, body: &Value) -> Result<Value> {
     request.push(path);
     request.push_dynamic(body);
     let bytes = dynamic_to_msgpack(&request);
-    let response =
-        root::block_on_async(move || Box::pin(iroh_call_with_retries(signer_node, bytes)))?;
+    let response = console_async_runtime()?.block_on(iroh_call_with_retries(signer_node, bytes))?;
     eprintln!("[zust-console] signer request returned");
-    let response = dynamic_to_json(&response);
-    response
-        .get("signature")
-        .cloned()
-        .with_context(|| format!("signer response missing `signature`: {response}"))
+    Ok(dynamic_to_json(&response))
+}
+
+fn console_async_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = CONSOLE_ASYNC_RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build zust-console async runtime")?;
+    let _ = CONSOLE_ASYNC_RUNTIME.set(runtime);
+    CONSOLE_ASYNC_RUNTIME
+        .get()
+        .context("zust-console async runtime was not initialized")
 }
 
 async fn iroh_call_with_retries(signer_node: String, bytes: Vec<u8>) -> Result<Dynamic> {
@@ -776,6 +1013,207 @@ fn msgpack_to_dynamic(bytes: &[u8]) -> Result<Dynamic> {
         "trailing data after Zust Dynamic msgpack payload"
     );
     Ok(dynamic)
+}
+
+fn is_null_or_empty_object(value: &Dynamic) -> bool {
+    if matches!(value, Dynamic::Null) {
+        return true;
+    }
+    matches!(dynamic_to_json(value), Value::Object(object) if object.is_empty())
+}
+
+fn ln_node_path(input: &Dynamic) -> PathBuf {
+    optional_string(input, "path")
+        .or_else(|| local_string("ln-node-file"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(LN_NODE_DEFAULT_PATH))
+}
+
+fn normalized_ln_config(input: Value, low_water_sats: u64) -> Value {
+    let mut config = match input {
+        Value::Object(mut object) => {
+            object.remove("path");
+            object.remove("signer_response");
+            object.remove("node");
+            object.remove("created");
+            object.remove("ok");
+            object
+        }
+        _ => Map::new(),
+    };
+
+    let network = config
+        .get("network")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("bitcoin")
+        .to_string();
+
+    config
+        .entry("network".to_string())
+        .or_insert_with(|| json!(network));
+    config
+        .entry("data_dir".to_string())
+        .or_insert_with(|| json!(LN_DATA_DIR_DEFAULT));
+    config
+        .entry("ldk_data_dir".to_string())
+        .or_insert_with(|| json!(LN_LDK_DATA_DIR_DEFAULT));
+    config
+        .entry("ln_backend".to_string())
+        .or_insert_with(|| json!("ln-rgb"));
+    config
+        .entry("listen".to_string())
+        .or_insert_with(|| json!(LN_LISTEN_DEFAULT));
+    config
+        .entry("peers".to_string())
+        .or_insert_with(|| json!([]));
+    config
+        .entry("trusted_peers_0conf".to_string())
+        .or_insert_with(|| json!([]));
+    config
+        .entry("accept_inbound_channels".to_string())
+        .or_insert_with(|| json!(true));
+    config
+        .entry("accept_inbound_rgb_transfers".to_string())
+        .or_insert_with(|| json!(true));
+    config
+        .entry("low_water_sats".to_string())
+        .or_insert_with(|| json!(low_water_sats));
+    config.entry("chain_source".to_string()).or_insert_with(|| {
+        json!({
+            "kind": "esplora",
+            "url": LN_ESPLORA_DEFAULT
+        })
+    });
+
+    Value::Object(config)
+}
+
+fn ln_config_from_value(value: &Value) -> Value {
+    value
+        .get("config")
+        .cloned()
+        .or_else(|| {
+            value
+                .get("node")
+                .and_then(|node| node.get("config"))
+                .cloned()
+        })
+        .unwrap_or_else(|| Value::Object(Map::new()))
+}
+
+fn update_ln_node_config(stored: &mut Value, config: Value, low_water_sats: u64) {
+    let Value::Object(object) = stored else {
+        return;
+    };
+    object.insert("low_water_sats".to_string(), json!(low_water_sats));
+    object.insert("config".to_string(), config);
+}
+
+fn read_json_file(path: &PathBuf) -> Result<Value> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_private_json_file(path: &PathBuf, value: &Value) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    restrict_private_file(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_file(path: &PathBuf) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_private_file(_path: &PathBuf) -> Result<()> {
+    Ok(())
+}
+
+fn redacted_ln_node_response(mut stored: Value, path: &PathBuf, created: bool) -> Value {
+    let address = find_string_field(&stored, &["address", "btc_address"]).unwrap_or_default();
+    redact_secret_fields(&mut stored);
+    json!({
+        "module": "ln",
+        "node_state": "created_or_loaded",
+        "created": created,
+        "address": address,
+        "path": path.display().to_string(),
+        "low_water_sats": stored.get("low_water_sats").cloned().unwrap_or(json!(LN_LOW_WATER_SATS)),
+        "config": stored.get("config").cloned().unwrap_or_else(|| normalized_ln_config(Value::Object(Map::new()), LN_LOW_WATER_SATS)),
+        "private_key_persisted": true,
+        "node": stored
+    })
+}
+
+fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(Value::String(value)) = object.get(*key) {
+                    return Some(value.clone());
+                }
+            }
+            object
+                .values()
+                .find_map(|value| find_string_field(value, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_field(value, keys)),
+        _ => None,
+    }
+}
+
+fn value_u64(value: &Value, key: &str) -> Option<u64> {
+    match value {
+        Value::Object(object) => object.get(key).and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(value) => value.parse().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn redact_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                let key = key.to_ascii_lowercase();
+                if key.contains("private")
+                    || key.contains("secret")
+                    || key.contains("mnemonic")
+                    || key.contains("seed")
+                    || key == "wif"
+                    || key.contains("xprv")
+                {
+                    *value = Value::String("<persisted>".to_string());
+                } else {
+                    redact_secret_fields(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_secret_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn now_ms() -> u64 {

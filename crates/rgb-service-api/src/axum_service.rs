@@ -214,7 +214,7 @@ async fn compose_ln_onchain_claim(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<LnOnchainClaimComposeRequest>>,
 ) -> Result<Json<LnComposeResponse>, HttpError> {
-    let req = authorize_asset_spend(&state, Permission::LnOnchainClaimCompose, req).await?;
+    let req = authorize(&state, Permission::LnOnchainClaimCompose, req).await?;
     Ok(Json(state.service.compose_ln_onchain_claim(req).await?))
 }
 

@@ -589,7 +589,6 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
   "txid": "bitcoin-txid",
   "recipient_vout": 0,
   "transport": {
-    "kind": "service_inbox",
     "account_id": "bob"
   },
   "asset_authorization": {
@@ -611,21 +610,13 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
 }
 ```
 
-`transport` 当前可选：
+`transport` 固定为 service inbox：
 
 ```json
-{ "kind": "service_inbox", "account_id": "bob" }
+{ "account_id": "bob" }
 ```
 
-```json
-{ "kind": "iroh", "node_id": "receiver-node-id", "topic": "optional-account-id", "timeout_ms": 30000 }
-```
-
-```json
-{ "kind": "inline" }
-```
-
-响应，service inbox：
+响应：
 
 ```json
 {
@@ -633,46 +624,12 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
   "operation_id": "bitcoin-txid",
   "status": "pending",
   "delivery": {
-    "kind": "service_inbox",
     "account_id": "bob"
   }
 }
 ```
 
-响应，iroh：
-
-```json
-{
-  "transfer_id": "...",
-  "operation_id": "bitcoin-txid",
-  "status": "pending",
-  "delivery": {
-    "kind": "iroh",
-    "node_id": "receiver-node-id",
-    "delivery_id": "iroh:transfer-id:bitcoin-txid",
-    "status": "pending"
-  }
-}
-```
-
-响应，inline：
-
-```json
-{
-  "transfer_id": "...",
-  "operation_id": "bitcoin-txid",
-  "status": "pending",
-  "delivery": {
-    "kind": "inline",
-    "consignment_hex": "..."
-  }
-}
-```
-
-说明：`service_inbox` 用于同一个 RGB Service 内部账户之间交付，不把 consignment 返回给调用方。
-`iroh` 用于点对点 consignment 传输。daemon 配置只需要 `[iroh].secret_key_hex`，`node_id` 由 secret key 自动派生；如果没有配置 `[iroh]`，请求 iroh transport 会直接失败，不会 fallback 到 inline。调用方只需要传接收方 `node_id`，daemon 会使用 iroh discovery/relay/address lookup 解析连接地址；如果解析不到就失败。接收端必须从 assignment `topic` 读取 account_id，topic 为空会拒收。
-`inline` 会返回编码后的 consignment，适合 SDK 或跨服务调用方自己转发；它不是任意历史 consignment 下载接口，
-只能基于当前 `transfer_id` 和已授权资产花费生成。
+说明：service inbox 用于同一个 RGB Service 内部账户之间交付，不把 consignment 返回给调用方。
 
 ### `POST /v1/consignments/receive`
 

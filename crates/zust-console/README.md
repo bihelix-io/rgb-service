@@ -2,10 +2,18 @@
 
 Zust console for driving `rgb-service` daemon flows.
 
-Startup takes one argument: the `.zs` script path.
+Startup opens a command-line REPL. Passing a `.zs` script runs it first as the
+session initializer and then drops into the REPL.
 
 ```bash
 cargo run -p zust-console -- crates/zust-console/start.zs
+```
+
+For one-shot execution:
+
+```bash
+cargo run -p zust-console -- --once crates/zust-console/start.zs
+cargo run -p zust-console -- -e 'ln::status({})'
 ```
 
 Runtime config belongs in the script through `root::add`:
@@ -27,4 +35,44 @@ Signer requests are sent to the configured signer App over iroh as Dynamic msgpa
 
 ```text
 [path, body]
+```
+
+Inside the REPL, admin/debug code is executed directly:
+
+```zs
+ln::node_address({
+  network: "bitcoin",
+  low_water_sats: 100000,
+})
+
+ln::spawn_scanner({
+  interval_ms: 30000,
+})
+```
+
+`ln::node_address` loads `.zust-console/ln-node.json` if it exists. If it does
+not exist, it asks the signer App for `/v1/signer/address/new` and persists the
+full signer response locally with file mode `0600`. Console output redacts
+private key, seed, mnemonic, WIF, and xprv fields.
+
+`start.zs` stores the returned node object in `local/lightning` and starts LN:
+
+```zs
+let lightning = ln::node_address({
+  network: "bitcoin",
+  low_water_sats: 100000,
+});
+root::add("local/lightning", lightning);
+ln::start({})
+```
+
+The scanner thread is wired for L1/L2 incoming payment handling, but real chain
+scanning is intentionally disabled for now.
+
+Useful REPL commands:
+
+```text
+:load <path>
+:reset
+:quit
 ```

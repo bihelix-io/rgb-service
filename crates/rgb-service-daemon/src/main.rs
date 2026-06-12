@@ -21,24 +21,23 @@ use rgb_service_api::{
     axum_service::router, AllocationStatus, AssetLayer, AssetSpendAuthorization, AuthSubject,
     AuthVerifier, Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
     CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
-    ConsignmentDelivery, ConsignmentTransport, CreateInvoiceRequest, CreateInvoiceResponse,
-    IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
-    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
-    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
-    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel,
-    LnRecoveredCompose, LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest,
-    PrepareTransferResponse, ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest,
-    RecoveryAction, RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance,
-    RgbFundingRef, RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest,
-    RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest,
-    SendConsignmentResponse, TrackedUtxo,
+    ConsignmentDelivery, CreateInvoiceRequest, CreateInvoiceResponse, IssueAssetRequest,
+    IssueAssetResponse, ListAssetsRequest, ListAssetsResponse, ListPendingRequest,
+    ListPendingResponse, LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse,
+    LnClosingComposeRequest, LnCommitmentComposeRequest, LnComposeResponse,
+    LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel, LnRecoveredCompose,
+    LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest, PrepareTransferResponse,
+    ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest, RecoveryAction,
+    RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance, RgbFundingRef,
+    RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse,
+    RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse,
+    TrackedUtxo,
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, decode_rgb20_transfer_consignment, encode_fascia_bytes,
-    encode_rgb20_transfer_consignment, issue_rgb20_fixed_with_chain_source,
-    list_rgb20_assets_for_utxos, prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks,
-    stage_receiver_transfer, stage_sender_fascia, ChainSource, EsploraConfig, Rgb20IssueRequest,
-    Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    issue_rgb20_fixed_with_chain_source, list_rgb20_assets_for_utxos, prepare_rgb20_psbt,
+    scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
+    ChainSource, EsploraConfig, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -219,7 +218,7 @@ struct PreparedTransferRecord {
     fascia: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LnChannelRecord {
     account_id: String,
     channel_id: String,
@@ -232,7 +231,13 @@ struct LnChannelRecord {
     created_at_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LnOutputAssignmentRecord {
+    vout: u32,
+    amount_rgb: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LnComposeRecord {
     account_id: String,
     channel_id: String,
@@ -243,6 +248,7 @@ struct LnComposeRecord {
     tx_hex: String,
     fascia: Vec<u8>,
     funding_ref: RgbFundingRef,
+    assignments: Vec<LnOutputAssignmentRecord>,
     created_at_ms: u64,
 }
 
@@ -464,6 +470,30 @@ impl LocalDaemonService {
         Ok(records)
     }
 
+    fn find_ln_output_assignment(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+        commitment_txid: &str,
+        vout: u32,
+    ) -> rgb_service_api::Result<Option<(LnComposeRecord, LnOutputAssignmentRecord)>> {
+        for record in self.list_ln_compose_records(account_id, Some(channel_id))? {
+            if record.txid != commitment_txid {
+                continue;
+            }
+            if let Some(assignment) = record
+                .assignments
+                .iter()
+                .find(|assignment| assignment.vout == vout)
+                .cloned()
+            {
+                return Ok(Some((record, assignment)));
+            }
+            return Ok(None);
+        }
+        Ok(None)
+    }
+
     fn require_nonce(authorization: &AssetSpendAuthorization) -> rgb_service_api::Result<String> {
         let nonce = authorization.signature.nonce.trim();
         if nonce.is_empty() {
@@ -547,6 +577,13 @@ impl LocalDaemonService {
             .map(|assignment| assignment.amount)
             .sum::<u64>();
         Self::validate_ln_asset_authorization(contract_id, amount, authorization)?;
+        let assignment_records = assignments
+            .iter()
+            .map(|assignment| LnOutputAssignmentRecord {
+                vout: assignment.vout,
+                amount_rgb: assignment.amount,
+            })
+            .collect::<Vec<_>>();
         let operation_id = Self::require_nonce(authorization)?;
         let tx = Self::decode_unsigned_tx(unsigned_tx_hex)?;
         let psbt = Psbt::from_unsigned_tx(tx).map_err(|err| {
@@ -571,6 +608,7 @@ impl LocalDaemonService {
             tx_hex: tx_hex.clone(),
             fascia,
             funding_ref,
+            assignments: assignment_records,
             created_at_ms: now_ms(),
         })?;
         Ok(LnComposeResponse {
@@ -980,26 +1018,15 @@ impl RgbServiceApi for LocalDaemonService {
         let consignment =
             build_rgb20_transfer_consignment(&stock_dir, fascia, contract_id, txid, recipient_vout)
                 .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let delivery = match req.payload.transport {
-            ConsignmentTransport::Inline => {
-                let bytes = encode_rgb20_transfer_consignment(&consignment)
-                    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-                ConsignmentDelivery::Inline {
-                    consignment_hex: hex_encode(&bytes),
-                }
-            }
-            ConsignmentTransport::ServiceInbox { account_id } => {
-                let receiver_stock_dir = self.account_stock_dir(&account_id);
-                stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
-                    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-                ConsignmentDelivery::ServiceInbox { account_id }
-            }
-        };
+        let account_id = req.payload.transport.account_id;
+        let receiver_stock_dir = self.account_stock_dir(&account_id);
+        stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         Ok(SendConsignmentResponse {
             transfer_id: req.payload.transfer_id,
             operation_id: txid.to_string(),
             status: OperationStatus::Pending,
-            delivery,
+            delivery: ConsignmentDelivery { account_id },
         })
     }
 
@@ -1225,30 +1252,72 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnOnchainClaimComposeRequest>,
     ) -> rgb_service_api::Result<LnComposeResponse> {
-        let contract_id = parse_contract_id(&req.payload.contract_id)?;
-        let amount = req.payload.asset_authorization.amount;
-        if amount == 0 {
-            return Err(RgbServiceError::InvalidRequest(
-                "asset authorization amount must be greater than zero for LN on-chain claim"
-                    .to_string(),
-            ));
-        }
-        let assignments = vec![Rgb20PsbtAssignment {
-            contract_id,
-            amount,
-            vout: req.payload.claim_vout,
-        }];
-        self.compose_ln_rgb_tx(
+        Txid::from_str(&req.payload.commitment_txid).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid commitment_txid: {err}"))
+        })?;
+        let tx = Self::decode_unsigned_tx(&req.payload.unsigned_tx_hex)?;
+        let claim_txid = tx.compute_txid();
+        let operation_id = format!(
+            "ln-claim:{}:{}:{}",
+            req.payload.commitment_txid, req.payload.vout, claim_txid
+        );
+        let Some((source_record, source_assignment)) = self.find_ln_output_assignment(
             &req.payload.account_id,
             &req.payload.channel_id,
-            "/v1/ln/onchain-claims/compose",
-            req.payload.funding_ref,
-            &req.payload.contract_id,
-            &req.payload.unsigned_tx_hex,
-            req.payload.change_vout,
-            assignments,
-            &req.payload.asset_authorization,
-        )
+            &req.payload.commitment_txid,
+            req.payload.vout,
+        )?
+        else {
+            return Ok(LnComposeResponse {
+                operation_id,
+                tx_hex: req.payload.unsigned_tx_hex,
+                rgb_state_ref: None,
+            });
+        };
+        if tx.output.len() != 1 {
+            return Err(RgbServiceError::InvalidRequest(
+                "LN RGB on-chain claim requires exactly one claim output".to_string(),
+            ));
+        }
+        let contract_id = parse_contract_id(&source_record.contract_id)?;
+        let assignments = vec![Rgb20PsbtAssignment {
+            contract_id,
+            amount: source_assignment.amount_rgb,
+            vout: 0,
+        }];
+        let psbt = Psbt::from_unsigned_tx(tx).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid unsigned transaction for PSBT: {err}"))
+        })?;
+        let stock_dir = self.account_stock_dir(&req.payload.account_id);
+        let prepared = prepare_rgb20_psbt(&stock_dir, psbt, 0, assignments)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let tx = prepared.psbt.unsigned_tx;
+        let txid = tx.compute_txid();
+        let tx_hex = hex_encode(&serialize(&tx));
+        let fascia = encode_fascia_bytes(&prepared.fascia)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let rgb_state_ref = format!("ln:{}:{operation_id}", req.payload.channel_id);
+        self.put_ln_compose_record(&LnComposeRecord {
+            account_id: req.payload.account_id,
+            channel_id: req.payload.channel_id,
+            operation_id: operation_id.clone(),
+            route: "/v1/ln/onchain-claims/compose".to_string(),
+            contract_id: source_record.contract_id,
+            txid: txid.to_string(),
+            tx_hex: tx_hex.clone(),
+            fascia,
+            funding_ref: source_record.funding_ref,
+            assignments: vec![LnOutputAssignmentRecord {
+                vout: 0,
+                amount_rgb: source_assignment.amount_rgb,
+            }],
+            created_at_ms: now_ms(),
+        })?;
+        Ok(LnComposeResponse {
+            operation_id,
+            tx_hex,
+            rgb_state_ref: Some(rgb_state_ref),
+        })
     }
 
     async fn recover_ln(

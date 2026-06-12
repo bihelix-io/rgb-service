@@ -1,3 +1,6 @@
 /target/
 **/*.rs.bk
 .DS_Store
+*.orig
+.cargo-ok
+crates/zust-console/.zust-console/

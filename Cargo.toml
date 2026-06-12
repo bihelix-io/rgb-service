@@ -11,6 +11,7 @@ members = [
     "crates/rgb-service-api",
     "crates/rgb-service-daemon",
     "crates/rgb-service-local",
+    "crates/ln-rgb-lightning",
     "crates/zust-console",
     "crates/rgb-schemas",
 ]

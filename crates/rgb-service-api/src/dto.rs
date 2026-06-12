@@ -223,17 +223,13 @@ pub struct SendConsignmentResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ConsignmentTransport {
-    Inline,
-    ServiceInbox { account_id: AccountId },
+pub struct ConsignmentTransport {
+    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ConsignmentDelivery {
-    Inline { consignment_hex: String },
-    ServiceInbox { account_id: AccountId },
+pub struct ConsignmentDelivery {
+    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -410,13 +406,9 @@ pub struct LnClosingComposeRequest {
 pub struct LnOnchainClaimComposeRequest {
     pub account_id: AccountId,
     pub channel_id: String,
-    pub funding_ref: RgbFundingRef,
+    pub commitment_txid: Txid,
+    pub vout: u32,
     pub unsigned_tx_hex: String,
-    pub contract_id: ContractId,
-    pub claim_purpose: LnOnchainClaimPurpose,
-    pub claim_vout: u32,
-    pub change_vout: u32,
-    pub asset_authorization: AssetSpendAuthorization,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -553,12 +545,6 @@ impl AssetSpendAuthorized for LnCommitmentComposeRequest {
 }
 
 impl AssetSpendAuthorized for LnClosingComposeRequest {
-    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
-        Some(&self.asset_authorization)
-    }
-}
-
-impl AssetSpendAuthorized for LnOnchainClaimComposeRequest {
     fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
         Some(&self.asset_authorization)
     }
