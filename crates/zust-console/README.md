@@ -58,3 +58,12 @@ profile id = BTC address
 Registering an iroh signer requires `account_id == btc_address`. Looking up another address is allowed, but the lookup is signed and charged to the caller `account_id`.
 
 RNA is an internal service credit, not an RGB asset. New profiles receive the configured grant, and resource APIs charge the configured RNA fees from the caller profile.
+
+
+RNA balance can be queried through the RGB module:
+
+```zs
+let rna = rgb::rna_balance({
+  account_id: arg.btc_addr,
+});
+```

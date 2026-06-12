@@ -18,6 +18,11 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         req: Authorized<LookupIrohNodeRequest>,
     ) -> Result<LookupIrohNodeResponse>;
 
+    async fn rna_balance(
+        &self,
+        req: Authorized<RnaBalanceRequest>,
+    ) -> Result<RnaBalanceResponse>;
+
     async fn issue_asset(
         &self,
         req: Authorized<IssueAssetRequest>,

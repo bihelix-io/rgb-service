@@ -40,6 +40,21 @@ pub struct LookupIrohNodeResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RnaBalanceRequest {
+    pub account_id: AccountId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RnaBalanceResponse {
+    pub account_id: AccountId,
+    pub rna_balance: u64,
+    pub new_profile_grant: u64,
+    pub issue_fee: u64,
+    pub transfer_fee: u64,
+    pub query_fee: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IrohNodeBinding {
     pub account_id: AccountId,
     pub btc_address: BtcAddress,
@@ -398,6 +413,7 @@ macro_rules! account_scoped {
 account_scoped!(
     RegisterIrohNodeRequest,
     LookupIrohNodeRequest,
+    RnaBalanceRequest,
     IssueAssetRequest,
     ListAssetsRequest,
     BalanceRequest,

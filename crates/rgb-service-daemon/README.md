@@ -1,14 +1,92 @@
 # rgb-service-daemon
 
-HTTP daemon for BiHelix RGB service APIs.
+`rgb-service-daemon` is the HTTP daemon for BiHelix RGB service APIs. It exposes the `rgb-service-api` Axum router and stores local service state in `fjall` under `service.data_dir`.
 
-This daemon exposes the `rgb-service-api` Axum router. It requires explicit
-configuration for service bind address, Bitcoin network, data directory, and
-Bitcoin indexer endpoint. Missing required config must fail loudly.
+The daemon is intentionally explicit: missing required configuration fails at startup. Do not rely on silent defaults for service bind address, Bitcoin network, data directory, chain backend, RNA fees, or iroh secret configuration.
 
-## 启动
+## What the daemon owns
 
-Example config: `examples/rgb-service.toml`
+The daemon owns service-side state, not user private keys.
+
+```text
+rgb-service-daemon
+  - RGB stock / account state
+  - BTC address profile state
+  - btc_addr -> iroh_node_id signer discovery
+  - internal RNA credit balance
+  - internal usage logs
+  - pending RGB transfer state
+```
+
+The daemon does not own:
+
+```text
+BTC private keys
+RGB asset signing keys
+wallet seed phrases
+frontend user sessions
+LN node state
+```
+
+## Identity model
+
+First version rule:
+
+```text
+account_id = caller BTC address
+profile id = BTC address
+```
+
+So a request like this:
+
+```json
+{
+  "account_id": "bc1pcaller...",
+  "btc_address": "bc1ptarget..."
+}
+```
+
+means:
+
+```text
+bc1pcaller... signs and pays for the request
+bc1ptarget... is the address being queried or operated on
+```
+
+Registering an iroh node is stricter:
+
+```text
+account_id must equal btc_address
+```
+
+This prevents one user from binding an iroh signer node to someone else's BTC address.
+
+## RNA credits
+
+`RNA` is an internal service credit, not an RGB asset.
+
+It exists only inside the daemon profile:
+
+```text
+profiles/{btc_addr} -> Dynamic MsgPack
+```
+
+A new profile receives the configured `new_profile_grant`.
+
+Default fee policy:
+
+```text
+new profile grant: 10000 RNA
+issue asset:       1000 RNA
+transfer prepare:   100 RNA
+query:                1 RNA
+```
+
+The daemon writes internal usage logs, but does not expose per-user transaction history in the public API.
+
+## Configuration
+
+Example regtest configuration:
 
 ```toml
 [service]
@@ -17,11 +95,74 @@ network = "regtest"
 data_dir = "/tmp/bihelix-rgb-service"
 esplora_url = "http://127.0.0.1:3002"
 
-[iroh]
-secret_key_hex = ""
+[rna]
+new_profile_grant = 10000
+issue_fee = 1000
+transfer_fee = 100
+query_fee = 1
 ```
 
+Example mainnet server configuration:
 
+```toml
+[service]
+bind = "0.0.0.0:8787"
+network = "mainnet"
+data_dir = "/home/ubuntu/rgb-service-data"
+esplora_url = "https://mempool.space/api"
+
+[rna]
+new_profile_grant = 10000
+issue_fee = 1000
+transfer_fee = 100
+query_fee = 1
+
+[iroh]
+secret_key_hex = "<32-byte hex secret>"
+```
+
+`esplora_url` is the Bitcoin chain backend. It is used to check anchor transactions, outpoints, confirmations, and recovery-related chain state. It is not an RGB data source and it does not hold BTC keys.
+
+## Iroh configuration
+
+`[iroh]` is optional.
+
+Rules:
+
+```text
+missing [iroh] section -> iroh disabled
+[iroh] with empty secret_key_hex -> startup error
+secret_key_hex must decode to exactly 32 bytes
+```
+
+Generate a new iroh secret key on the server:
+
+```bash
+umask 077
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > ~/rgb-service-iroh-secret.hex
+```
+
+Then put the file content into:
+
+```toml
+[iroh]
+secret_key_hex = "..."
+```
+
+At startup the daemon logs the derived iroh `node_id`:
+
+```text
+INFO iroh node_id=<node_id>
+INFO iroh endpoint_addr=<endpoint address json>
+```
+
+The `node_id` is public and can be shared. The `secret_key_hex` must remain private.
+
+## Run locally
+
+```bash
+cargo run -p rgb-service-daemon -- examples/rgb-service.toml
+```
 
 Daemon logs are written to:
 
@@ -29,44 +170,164 @@ Daemon logs are written to:
 <service.data_dir>/rgb-service.log
 ```
 
-When `[iroh]` is configured, the daemon derives the iroh `node_id` from
-`secret_key_hex` and writes both `node_id` and the current endpoint address to
-this log file at startup.
+## Run on server with screen
 
-Run:
+Clone or update the repository:
 
 ```bash
-cargo run -p rgb-service-daemon -- examples/rgb-service.toml
+git clone https://github.com/bihelix-io/rgb-service.git ~/rgb-service
+cd ~/rgb-service
 ```
 
-`esplora_url` 是 BTC 链查询后端，用来检查 anchor tx、outpoint、confirmation 和 recovery
-相关链上状态。它不是 RGB 数据源，也不代表 service 托管 BTC 私钥。
+Start in a detached screen session:
+
+```bash
+screen -dmS rgb-service bash -lc 'cd ~/rgb-service && cargo run -p rgb-service-daemon -- examples/rgb-service.toml'
+```
+
+Attach to the session:
+
+```bash
+screen -r rgb-service
+```
+
+Detach from the session:
+
+```text
+Ctrl-a d
+```
+
+Stop the session:
+
+```bash
+screen -S rgb-service -X quit
+```
+
+Check screen sessions:
+
+```bash
+screen -list
+```
+
+Check daemon log:
+
+```bash
+tail -100 ~/rgb-service-data/rgb-service.log
+```
+
+Check port listening:
+
+```bash
+ss -ltnp | grep 8787
+```
+
+Expected mainnet startup log:
+
+```text
+starting rgb-service on 0.0.0.0:8787 for mainnet with data_dir /home/ubuntu/rgb-service-data
+INFO iroh node_id=<node_id>
+INFO rna new_profile_grant=10000 issue_fee=1000 transfer_fee=100 query_fee=1
+```
 
 ## Public HTTP API
 
 Current public daemon routes:
 
 ```text
-POST /v1/iroh-nodes/register    # 注册 BTC 地址对应的 iroh node_id
-POST /v1/iroh-nodes/lookup      # 用签名身份根据 BTC 地址查询 iroh node_id
-POST /v1/assets/issue          # 发行 RGB20 资产
-POST /v1/assets/list           # 查询 account 下资产列表
-POST /v1/balance               # 查询资产汇总余额
-POST /v1/balance/breakdown     # 查询 allocation / pending 明细
-POST /v1/invoices/create       # 创建 RGB 收款 invoice
-POST /v1/transfers/prepare     # 准备 RGB 转账，返回带 RGB commitment 的 anchor PSBT
-POST /v1/transfers/commit      # BTC 广播后提交 txid，推进 RGB pending 状态
-POST /v1/consignments/send     # 构建并传输 RGB consignment
-POST /v1/consignments/receive  # 接收外部 RGB consignment
-POST /v1/transfers/cancel      # 取消尚未完成的 transfer
-POST /v1/pending/list          # 查询 pending operations
-POST /v1/recover               # 恢复/推进 pending operations
-POST /v1/test/rgb              # 受控测试环境触发 RGB lifecycle 测试
+POST /v1/iroh-nodes/register    # Register caller BTC address -> iroh node_id
+POST /v1/iroh-nodes/lookup      # Signed lookup of target BTC address -> iroh node_id
+POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
+POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
+POST /v1/assets/list            # Query account asset list, charges query_fee
+POST /v1/balance                # Query asset balance summary, charges query_fee
+POST /v1/balance/breakdown      # Query allocations and pending detail, charges query_fee
+POST /v1/invoices/create        # Create RGB receive invoice
+POST /v1/transfers/prepare      # Prepare RGB transfer, charges transfer_fee
+POST /v1/transfers/commit       # Commit txid after BTC broadcast
+POST /v1/consignments/send      # Build and transmit RGB consignment
+POST /v1/consignments/receive   # Receive external RGB consignment
+POST /v1/transfers/cancel       # Cancel unfinished transfer
+POST /v1/pending/list           # List pending operations
+POST /v1/recover                # Promote/recover pending operations
+POST /v1/test/rgb               # Controlled RGB lifecycle test route
 ```
 
-所有请求都使用 `SignedRequest<T>`。`prepare` 和 `commit` 还需要
-`AssetSpendAuthorization`。public daemon 不暴露 raw fascia，也不提供任意 raw consignment 下载。
-consignment 通过 `/v1/consignments/send` 和 `/v1/consignments/receive` 做受控传输。
-`/v1/consignments/send` 支持 `service_inbox`、`iroh` 和 `inline` transport。请求 `iroh` 时，daemon 必须配置 `[iroh].secret_key_hex` 并启动真实 iroh endpoint。
+All requests use `SignedRequest<T>`.
 
-详细中文 API 文档见仓库根目录 `README.md` 的 `Public HTTP API 中文说明`。
+`prepare`, `commit`, and `send_consignment` also require `AssetSpendAuthorization`.
+
+The public daemon does not expose raw fascia download or arbitrary raw consignment download. Consignments move through controlled APIs:
+
+```text
+/v1/consignments/send
+/v1/consignments/receive
+```
+
+`/v1/consignments/send` supports:
+
+```text
+inline
+service_inbox
+iroh
+```
+
+When `iroh` transport is requested, the daemon must be started with a valid `[iroh].secret_key_hex`.
+
+## Storage layout
+
+Under `service.data_dir`:
+
+```text
+rgb-service.log          # daemon log
+kv/                      # fjall database
+accounts/<btc_addr>/     # RGB stock/account state
+```
+
+Important fjall keyspaces:
+
+```text
+profiles                 # btc_addr profile, stored as Zust Dynamic MsgPack
+usage_logs               # internal RNA debit logs
+prepared_transfers       # pending prepared transfer state
+```
+
+## Deployment note
+
+For public mainnet deployment, bind to:
+
+```toml
+bind = "0.0.0.0:8787"
+network = "mainnet"
+esplora_url = "https://mempool.space/api"
+```
+
+Make sure the server firewall/security group allows inbound TCP `8787` only from the intended clients if the service should not be public.
+
+## RNA balance request
+
+Querying RNA balance is signed but does not charge RNA. If the caller profile does not exist yet, the daemon creates it and grants `new_profile_grant`.
+
+```http
+POST /v1/rna/balance
+```
+
+Payload inside `SignedRequest<T>`:
+
+```json
+{
+  "account_id": "bc1pcaller..."
+}
+```
+
+Response:
+
+```json
+{
+  "account_id": "bc1pcaller...",
+  "rna_balance": 10000,
+  "new_profile_grant": 10000,
+  "issue_fee": 1000,
+  "transfer_fee": 100,
+  "query_fee": 1
+}
+```

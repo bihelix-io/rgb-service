@@ -30,6 +30,7 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
     Router::new()
         .route("/v1/iroh-nodes/register", post(register_iroh_node))
         .route("/v1/iroh-nodes/lookup", post(lookup_iroh_node))
+        .route("/v1/rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
         .route("/v1/balance", post(balance))
@@ -111,6 +112,14 @@ async fn lookup_iroh_node(
 ) -> Result<Json<LookupIrohNodeResponse>, HttpError> {
     let req = authorize(&state, Permission::LookupIrohNode, req).await?;
     Ok(Json(state.service.lookup_iroh_node(req).await?))
+}
+
+async fn rna_balance(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<RnaBalanceRequest>>,
+) -> Result<Json<RnaBalanceResponse>, HttpError> {
+    let req = authorize(&state, Permission::ReadRnaBalance, req).await?;
+    Ok(Json(state.service.rna_balance(req).await?))
 }
 
 async fn issue_asset(

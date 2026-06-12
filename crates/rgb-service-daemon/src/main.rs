@@ -28,7 +28,7 @@ use rgb_service_api::{
     Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryAction,
     ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoveryReport, RegisterIrohNodeRequest,
     RegisterIrohNodeResponse, LookupIrohNodeRequest, LookupIrohNodeResponse, IrohNodeBinding,
-    RequestSignature,
+    RnaBalanceRequest, RnaBalanceResponse, RequestSignature,
     RgbAllocation, RgbAssetInfo, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestStep,
     RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse,
     TrackedUtxo,
@@ -427,6 +427,20 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(err.to_string()))
     }
 
+    fn get_or_create_profile(&self, id: &str) -> rgb_service_api::Result<Value> {
+        if id.trim().is_empty() {
+            return Err(RgbServiceError::Unauthorized(
+                "account_id must not be empty for profile lookup".to_string(),
+            ));
+        }
+        if let Some(profile) = self.load_profile(id)? {
+            return Ok(profile);
+        }
+        let profile = self.new_profile(id, now_ms());
+        self.put_profile(id, &profile)?;
+        Ok(profile)
+    }
+
     fn charge_rna(
         &self,
         account_id: &str,
@@ -637,6 +651,21 @@ impl RgbServiceApi for LocalDaemonService {
         )?;
         let binding = self.get_iroh_node_binding(&req.payload.btc_address)?;
         Ok(LookupIrohNodeResponse { binding })
+    }
+
+    async fn rna_balance(
+        &self,
+        req: Authorized<RnaBalanceRequest>,
+    ) -> rgb_service_api::Result<RnaBalanceResponse> {
+        let profile = self.get_or_create_profile(&req.payload.account_id)?;
+        Ok(RnaBalanceResponse {
+            account_id: req.payload.account_id,
+            rna_balance: Self::profile_rna_balance(&profile)?,
+            new_profile_grant: self.rna.new_profile_grant,
+            issue_fee: self.rna.issue_fee,
+            transfer_fee: self.rna.transfer_fee,
+            query_fee: self.rna.query_fee,
+        })
     }
 
     async fn issue_asset(

@@ -8,6 +8,7 @@ use crate::error::Result;
 pub enum Permission {
     RegisterIrohNode,
     LookupIrohNode,
+    ReadRnaBalance,
     ReadAssets,
     IssueAsset,
     CreateInvoice,

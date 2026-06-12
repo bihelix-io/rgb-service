@@ -65,6 +65,7 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     let mut jit = vm.jit.write().unwrap();
     jit.add_native_module_ptr("rgb", "signed", &[Type::Any], Type::Any, rgb_signed as *const u8)?;
     jit.add_native_module_ptr("rgb", "register_iroh_node", &[Type::Any], Type::Any, rgb_register_iroh_node as *const u8)?;
+    jit.add_native_module_ptr("rgb", "rna_balance", &[Type::Any], Type::Any, rgb_rna_balance as *const u8)?;
     jit.add_native_module_ptr("rgb", "request_signature", &[Type::Any], Type::Any, rgb_request_signature as *const u8)?;
     jit.add_native_module_ptr("rgb", "asset_authorization", &[Type::Any], Type::Any, rgb_asset_authorization as *const u8)?;
     jit.add_native_module_ptr("rgb", "request", &[Type::Any], Type::Any, rgb_request as *const u8)?;
@@ -196,6 +197,7 @@ extern "C" fn rgb_request(input: *const Dynamic) -> *const Dynamic {
 
 extern "C" fn rgb_register_iroh_node(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/iroh-nodes/register") }
 extern "C" fn rgb_lookup_iroh_node(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/iroh-nodes/lookup") }
+extern "C" fn rgb_rna_balance(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/rna/balance") }
 extern "C" fn rgb_issue(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/assets/issue") }
 extern "C" fn rgb_assets(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/assets/list") }
 extern "C" fn rgb_balance(input: *const Dynamic) -> *const Dynamic { rgb_route(input, "/v1/balance") }
