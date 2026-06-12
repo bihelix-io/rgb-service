@@ -120,7 +120,7 @@ POST /v1/test/rgb
 
 Import/export、raw fascia 暂时不作为 public API 暴露。consignment 不作为任意文件下载接口暴露，
 但 RGB 转账必须支持受控传输：发送方通过 `/v1/consignments/send` 交付 consignment，
-接收方通过 `/v1/consignments/receive` 接收外部 consignment。当前支持 service 内部 inbox、iroh P2P delivery record 和显式 inline 传输；inline 只用于 SDK、调试或跨服务调用方自己负责转发的场景。
+接收方通过 `/v1/consignments/receive` 接收外部 consignment。当前支持 service 内部 inbox 和显式 inline 传输；inline 只用于 SDK、调试或跨服务调用方自己负责转发的场景。
 
 ### 通用请求格式
 

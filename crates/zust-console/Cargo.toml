@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 dynamic = { package = "zust-dynamic", version = "0.9.12" }
+iroh = "1.0.0-rc.0"
 root = { package = "zust-root", version = "0.9.6" }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "time"] }
 vm = { package = "zust-vm", version = "0.9.66" }

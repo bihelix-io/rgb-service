@@ -13,31 +13,6 @@ pub type ReservationId = String;
 pub type Txid = String;
 pub type Outpoint = String;
 pub type BtcAddress = String;
-pub type IrohNodeId = String;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RegisterIrohNodeRequest {
-    pub account_id: AccountId,
-    pub btc_address: BtcAddress,
-    pub iroh_node_id: IrohNodeId,
-    pub label: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RegisterIrohNodeResponse {
-    pub binding: IrohNodeBinding,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LookupIrohNodeRequest {
-    pub account_id: AccountId,
-    pub btc_address: BtcAddress,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LookupIrohNodeResponse {
-    pub binding: Option<IrohNodeBinding>,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RnaBalanceRequest {
@@ -52,15 +27,6 @@ pub struct RnaBalanceResponse {
     pub issue_fee: u64,
     pub transfer_fee: u64,
     pub query_fee: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct IrohNodeBinding {
-    pub account_id: AccountId,
-    pub btc_address: BtcAddress,
-    pub iroh_node_id: IrohNodeId,
-    pub label: Option<String>,
-    pub updated_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -261,11 +227,6 @@ pub struct SendConsignmentResponse {
 pub enum ConsignmentTransport {
     Inline,
     ServiceInbox { account_id: AccountId },
-    Iroh {
-        node_id: String,
-        topic: Option<String>,
-        timeout_ms: Option<u64>,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -273,11 +234,6 @@ pub enum ConsignmentTransport {
 pub enum ConsignmentDelivery {
     Inline { consignment_hex: String },
     ServiceInbox { account_id: AccountId },
-    Iroh {
-        node_id: String,
-        delivery_id: ConsignmentId,
-        status: ConsignmentDeliveryStatus,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -392,6 +348,140 @@ pub enum OperationStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RgbFundingRef {
+    pub transfer_id: TransferId,
+    pub operation_id: OperationId,
+    pub channel_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelOpenPrepareRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+    pub contract_id: ContractId,
+    pub funding_outpoint: Outpoint,
+    pub funding_rgb: u64,
+    pub to_local_rgb: u64,
+    pub to_remote_rgb: u64,
+    pub asset_authorization: AssetSpendAuthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelOpenPrepareResponse {
+    pub funding_ref: RgbFundingRef,
+    pub operation_id: OperationId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnCommitmentComposeRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+    pub funding_ref: RgbFundingRef,
+    pub unsigned_tx_hex: String,
+    pub funding_outpoint: Outpoint,
+    pub contract_id: ContractId,
+    pub to_local_rgb: u64,
+    pub to_local_vout: Option<u32>,
+    pub to_remote_rgb: u64,
+    pub to_remote_vout: Option<u32>,
+    #[serde(default)]
+    pub htlcs: Vec<LnRgbHtlcOutput>,
+    pub change_vout: u32,
+    pub asset_authorization: AssetSpendAuthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnClosingComposeRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+    pub funding_ref: RgbFundingRef,
+    pub unsigned_tx_hex: String,
+    pub funding_outpoint: Outpoint,
+    pub contract_id: ContractId,
+    pub to_local_rgb: u64,
+    pub to_local_vout: Option<u32>,
+    pub to_remote_rgb: u64,
+    pub to_remote_vout: Option<u32>,
+    pub change_vout: u32,
+    pub asset_authorization: AssetSpendAuthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnOnchainClaimComposeRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+    pub funding_ref: RgbFundingRef,
+    pub unsigned_tx_hex: String,
+    pub contract_id: ContractId,
+    pub claim_purpose: LnOnchainClaimPurpose,
+    pub claim_vout: u32,
+    pub change_vout: u32,
+    pub asset_authorization: AssetSpendAuthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnRgbHtlcOutput {
+    pub vout: u32,
+    pub amount_rgb: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LnOnchainClaimPurpose {
+    CommitmentSweep,
+    HtlcSuccess,
+    HtlcTimeout,
+    Penalty,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnComposeResponse {
+    pub operation_id: OperationId,
+    pub tx_hex: String,
+    pub rgb_state_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnRecoverRequest {
+    pub account_id: AccountId,
+    pub channel_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnRecoveryReport {
+    pub account_id: AccountId,
+    pub channel_id: Option<String>,
+    pub channels: Vec<LnRecoveredChannel>,
+    pub composes: Vec<LnRecoveredCompose>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnRecoveredChannel {
+    pub channel_id: String,
+    pub contract_id: ContractId,
+    pub funding_outpoint: Outpoint,
+    pub funding_rgb: u64,
+    pub to_local_rgb: u64,
+    pub to_remote_rgb: u64,
+    pub funding_ref: RgbFundingRef,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnRecoveredCompose {
+    pub channel_id: String,
+    pub operation_id: OperationId,
+    pub route: String,
+    pub contract_id: ContractId,
+    pub txid: Txid,
+    pub tx_hex: String,
+    pub rgb_state_ref: String,
+    pub fascia_len: usize,
+    pub funding_ref: RgbFundingRef,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecoveryAction {
     pub operation_id: OperationId,
     pub action: String,
@@ -411,8 +501,6 @@ macro_rules! account_scoped {
 }
 
 account_scoped!(
-    RegisterIrohNodeRequest,
-    LookupIrohNodeRequest,
     RnaBalanceRequest,
     IssueAssetRequest,
     ListAssetsRequest,
@@ -423,6 +511,11 @@ account_scoped!(
     CommitTransferRequest,
     SendConsignmentRequest,
     ReceiveConsignmentRequest,
+    LnChannelOpenPrepareRequest,
+    LnCommitmentComposeRequest,
+    LnClosingComposeRequest,
+    LnOnchainClaimComposeRequest,
+    LnRecoverRequest,
     CancelTransferRequest,
     ListPendingRequest,
     RecoverRequest,
@@ -442,6 +535,30 @@ impl AssetSpendAuthorized for CommitTransferRequest {
 }
 
 impl AssetSpendAuthorized for SendConsignmentRequest {
+    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
+        Some(&self.asset_authorization)
+    }
+}
+
+impl AssetSpendAuthorized for LnChannelOpenPrepareRequest {
+    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
+        Some(&self.asset_authorization)
+    }
+}
+
+impl AssetSpendAuthorized for LnCommitmentComposeRequest {
+    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
+        Some(&self.asset_authorization)
+    }
+}
+
+impl AssetSpendAuthorized for LnClosingComposeRequest {
+    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
+        Some(&self.asset_authorization)
+    }
+}
+
+impl AssetSpendAuthorized for LnOnchainClaimComposeRequest {
     fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
         Some(&self.asset_authorization)
     }

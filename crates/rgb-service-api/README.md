@@ -16,14 +16,13 @@ user wallet or signer.
 
 它负责表达：
 
-- BTC 地址到 iroh node_id 的注册和查询
 - RGB 资产发行
 - RGB 资产列表
 - L1/L2 余额查询
 - allocation 明细
 - RGB invoice 创建
 - RGB transfer prepare/commit/cancel
-- consignment send/receive 受控传输，包括 service inbox、iroh、inline transport
+- consignment send/receive 受控传输，包括 service inbox、inline transport
 - pending operation 查询
 - recovery 推进
 - 受控 RGB lifecycle 测试
@@ -39,8 +38,6 @@ user wallet or signer.
 ## Public daemon routes
 
 ```text
-POST /v1/iroh-nodes/register
-POST /v1/iroh-nodes/lookup
 POST /v1/assets/issue
 POST /v1/assets/list
 POST /v1/balance
@@ -50,6 +47,10 @@ POST /v1/transfers/prepare
 POST /v1/transfers/commit
 POST /v1/consignments/send
 POST /v1/consignments/receive
+POST /v1/ln/channels/open/prepare
+POST /v1/ln/commitments/compose
+POST /v1/ln/closing/compose
+POST /v1/ln/onchain-claims/compose
 POST /v1/transfers/cancel
 POST /v1/pending/list
 POST /v1/recover

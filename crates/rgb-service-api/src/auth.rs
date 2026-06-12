@@ -6,8 +6,6 @@ use crate::error::Result;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
-    RegisterIrohNode,
-    LookupIrohNode,
     ReadRnaBalance,
     ReadAssets,
     IssueAsset,
@@ -16,6 +14,11 @@ pub enum Permission {
     CommitTransfer,
     SendConsignment,
     ReceiveConsignment,
+    LnChannelOpenPrepare,
+    LnCommitmentCompose,
+    LnClosingCompose,
+    LnOnchainClaimCompose,
+    LnRecover,
     CancelTransfer,
     ManagePending,
     Recover,

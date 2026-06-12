@@ -11,6 +11,7 @@ members = [
     "crates/rgb-service-api",
     "crates/rgb-service-daemon",
     "crates/rgb-service-local",
+    "crates/ln-rgb-lightning",
     "crates/zust-console",
     "crates/rgb-schemas",
 ]
@@ -39,7 +40,6 @@ chrono = "0.4.38"
 dynamic = { package = "zust-dynamic", version = "0.9.12" }
 fjall = "3.1.4"
 indexmap = "2.4.0"
-iroh = "1.0.0-rc.0"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 nonasync = { version = "=0.1.3", features = ["log"] }
 rgb-ascii-armor = "1.0.1"

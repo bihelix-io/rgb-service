@@ -4,21 +4,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    body::{to_bytes, Body},
+    http::{header, Request, StatusCode},
 };
 use rgb_service_api::{
-    AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier, Authorized,
-    BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest, CancelTransferRequest,
-    CancelTransferResponse, CommitTransferRequest, CommitTransferResponse, CreateInvoiceRequest,
-    CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
-    ListAssetsResponse, ListPendingRequest, ListPendingResponse, Permission, PrepareTransferRequest,
-    PrepareTransferResponse, ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest,
-    RecoveryReport, RegisterIrohNodeRequest, RegisterIrohNodeResponse, LookupIrohNodeRequest,
-    LookupIrohNodeResponse, RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError,
-    RgbTestScenario, RgbTestStep, RunRgbTestRequest, SendConsignmentRequest,
-    SendConsignmentResponse,
-    RunRgbTestResponse, SignatureScheme, SignedRequest, axum_service::router,
+    axum_service::router, AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier,
+    Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
+    CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
+    CreateInvoiceRequest, CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse,
+    ListAssetsRequest, ListAssetsResponse, ListPendingRequest, ListPendingResponse, Permission,
+    PrepareTransferRequest, PrepareTransferResponse, ReceiveConsignmentRequest,
+    ReceiveConsignmentResponse, RecoverRequest, RecoveryReport, RequestSignature, RgbBalance,
+    RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep, RunRgbTestRequest,
+    RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse, SignatureScheme,
+    SignedRequest,
 };
 use tower::ServiceExt;
 
@@ -53,20 +52,6 @@ struct TestRgbService;
 
 #[async_trait]
 impl RgbServiceApi for TestRgbService {
-    async fn register_iroh_node(
-        &self,
-        _req: Authorized<RegisterIrohNodeRequest>,
-    ) -> rgb_service_api::Result<RegisterIrohNodeResponse> {
-        Err(unimplemented_call("register_iroh_node"))
-    }
-
-    async fn lookup_iroh_node(
-        &self,
-        _req: Authorized<LookupIrohNodeRequest>,
-    ) -> rgb_service_api::Result<LookupIrohNodeResponse> {
-        Err(unimplemented_call("lookup_iroh_node"))
-    }
-
     async fn issue_asset(
         &self,
         _req: Authorized<IssueAssetRequest>,

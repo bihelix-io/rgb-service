@@ -1,37 +1,14 @@
 use async_trait::async_trait;
 
-use crate::{
-    auth::Authorized,
-    dto::*,
-    error::Result,
-};
+use crate::{auth::Authorized, dto::*, error::Result};
 
 #[async_trait]
 pub trait RgbServiceApi: Send + Sync + 'static {
-    async fn register_iroh_node(
-        &self,
-        req: Authorized<RegisterIrohNodeRequest>,
-    ) -> Result<RegisterIrohNodeResponse>;
+    async fn rna_balance(&self, req: Authorized<RnaBalanceRequest>) -> Result<RnaBalanceResponse>;
 
-    async fn lookup_iroh_node(
-        &self,
-        req: Authorized<LookupIrohNodeRequest>,
-    ) -> Result<LookupIrohNodeResponse>;
+    async fn issue_asset(&self, req: Authorized<IssueAssetRequest>) -> Result<IssueAssetResponse>;
 
-    async fn rna_balance(
-        &self,
-        req: Authorized<RnaBalanceRequest>,
-    ) -> Result<RnaBalanceResponse>;
-
-    async fn issue_asset(
-        &self,
-        req: Authorized<IssueAssetRequest>,
-    ) -> Result<IssueAssetResponse>;
-
-    async fn list_assets(
-        &self,
-        req: Authorized<ListAssetsRequest>,
-    ) -> Result<ListAssetsResponse>;
+    async fn list_assets(&self, req: Authorized<ListAssetsRequest>) -> Result<ListAssetsResponse>;
 
     async fn balance(&self, req: Authorized<BalanceRequest>) -> Result<RgbBalance>;
 
@@ -77,8 +54,27 @@ pub trait RgbServiceApi: Send + Sync + 'static {
 
     async fn recover(&self, req: Authorized<RecoverRequest>) -> Result<RecoveryReport>;
 
-    async fn run_rgb_test(
+    async fn prepare_ln_channel_open(
         &self,
-        req: Authorized<RunRgbTestRequest>,
-    ) -> Result<RunRgbTestResponse>;
+        req: Authorized<LnChannelOpenPrepareRequest>,
+    ) -> Result<LnChannelOpenPrepareResponse>;
+
+    async fn compose_ln_commitment(
+        &self,
+        req: Authorized<LnCommitmentComposeRequest>,
+    ) -> Result<LnComposeResponse>;
+
+    async fn compose_ln_closing(
+        &self,
+        req: Authorized<LnClosingComposeRequest>,
+    ) -> Result<LnComposeResponse>;
+
+    async fn compose_ln_onchain_claim(
+        &self,
+        req: Authorized<LnOnchainClaimComposeRequest>,
+    ) -> Result<LnComposeResponse>;
+
+    async fn recover_ln(&self, req: Authorized<LnRecoverRequest>) -> Result<LnRecoveryReport>;
+
+    async fn run_rgb_test(&self, req: Authorized<RunRgbTestRequest>) -> Result<RunRgbTestResponse>;
 }

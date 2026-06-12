@@ -1,18 +1,17 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
+    Json, Router,
 };
 use serde::Serialize;
 
 use crate::{
     auth::{
-        AccountScoped, AssetSpendAuthorized, AuthVerifier, Authorized, Permission,
-        SignedRequest,
+        AccountScoped, AssetSpendAuthorized, AuthVerifier, Authorized, Permission, SignedRequest,
     },
     dto::*,
     error::RgbServiceError,
@@ -28,8 +27,6 @@ pub struct ApiState {
 pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> Router {
     let state = ApiState { service, auth };
     Router::new()
-        .route("/v1/iroh-nodes/register", post(register_iroh_node))
-        .route("/v1/iroh-nodes/lookup", post(lookup_iroh_node))
         .route("/v1/rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
@@ -40,6 +37,17 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/transfers/commit", post(commit_transfer))
         .route("/v1/consignments/send", post(send_consignment))
         .route("/v1/consignments/receive", post(receive_consignment))
+        .route(
+            "/v1/ln/channels/open/prepare",
+            post(prepare_ln_channel_open),
+        )
+        .route("/v1/ln/commitments/compose", post(compose_ln_commitment))
+        .route("/v1/ln/closing/compose", post(compose_ln_closing))
+        .route(
+            "/v1/ln/onchain-claims/compose",
+            post(compose_ln_onchain_claim),
+        )
+        .route("/v1/ln/recover", post(recover_ln))
         .route("/v1/transfers/cancel", post(cancel_transfer))
         .route("/v1/pending/list", post(list_pending))
         .route("/v1/recover", post(recover))
@@ -96,22 +104,6 @@ where
         .verify_asset_spend(&account_id, &authorization)
         .await?;
     Ok(authorized)
-}
-
-async fn register_iroh_node(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<RegisterIrohNodeRequest>>,
-) -> Result<Json<RegisterIrohNodeResponse>, HttpError> {
-    let req = authorize(&state, Permission::RegisterIrohNode, req).await?;
-    Ok(Json(state.service.register_iroh_node(req).await?))
-}
-
-async fn lookup_iroh_node(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<LookupIrohNodeRequest>>,
-) -> Result<Json<LookupIrohNodeResponse>, HttpError> {
-    let req = authorize(&state, Permission::LookupIrohNode, req).await?;
-    Ok(Json(state.service.lookup_iroh_node(req).await?))
 }
 
 async fn rna_balance(
@@ -194,6 +186,46 @@ async fn receive_consignment(
     Ok(Json(state.service.receive_consignment(req).await?))
 }
 
+async fn prepare_ln_channel_open(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnChannelOpenPrepareRequest>>,
+) -> Result<Json<LnChannelOpenPrepareResponse>, HttpError> {
+    let req = authorize_asset_spend(&state, Permission::LnChannelOpenPrepare, req).await?;
+    Ok(Json(state.service.prepare_ln_channel_open(req).await?))
+}
+
+async fn compose_ln_commitment(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnCommitmentComposeRequest>>,
+) -> Result<Json<LnComposeResponse>, HttpError> {
+    let req = authorize_asset_spend(&state, Permission::LnCommitmentCompose, req).await?;
+    Ok(Json(state.service.compose_ln_commitment(req).await?))
+}
+
+async fn compose_ln_closing(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnClosingComposeRequest>>,
+) -> Result<Json<LnComposeResponse>, HttpError> {
+    let req = authorize_asset_spend(&state, Permission::LnClosingCompose, req).await?;
+    Ok(Json(state.service.compose_ln_closing(req).await?))
+}
+
+async fn compose_ln_onchain_claim(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnOnchainClaimComposeRequest>>,
+) -> Result<Json<LnComposeResponse>, HttpError> {
+    let req = authorize_asset_spend(&state, Permission::LnOnchainClaimCompose, req).await?;
+    Ok(Json(state.service.compose_ln_onchain_claim(req).await?))
+}
+
+async fn recover_ln(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnRecoverRequest>>,
+) -> Result<Json<LnRecoveryReport>, HttpError> {
+    let req = authorize(&state, Permission::LnRecover, req).await?;
+    Ok(Json(state.service.recover_ln(req).await?))
+}
+
 async fn cancel_transfer(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<CancelTransferRequest>>,
@@ -246,6 +278,7 @@ impl IntoResponse for HttpError {
             RgbServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             RgbServiceError::NotFound(_) => StatusCode::NOT_FOUND,
             RgbServiceError::Conflict(_) => StatusCode::CONFLICT,
+            RgbServiceError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             RgbServiceError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = ErrorBody {

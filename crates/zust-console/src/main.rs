@@ -3,7 +3,7 @@ mod modules;
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use dynamic::{Dynamic, FromJson, ToJson};
+use dynamic::{Dynamic, ToJson};
 
 fn main() {
     if let Err(err) = run() {
@@ -22,26 +22,27 @@ fn run() -> Result<()> {
         print_help();
         return Ok(());
     }
-    let arg = match args.next() {
-        Some(json) => json_to_dynamic(&json).context("decode arg JSON")?,
-        None => Dynamic::Null,
-    };
-    let result = run_script(PathBuf::from(script), arg)?;
+    if args.next().is_some() {
+        anyhow::bail!("unexpected extra argument; usage: zust-console <script.zs>");
+    }
+    let result = run_script(PathBuf::from(script), Dynamic::Null)?;
     let json = dynamic_to_json(&result);
-    println!("{}", serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json)?)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&json)?)?
+    );
     Ok(())
 }
 
 fn print_help() {
-    eprintln!("usage: zust-console <script.zs> <daemon-config-json>");
+    eprintln!("usage: zust-console <script.zs>");
     eprintln!(
         "{}",
-        r#"example: cargo run -p zust-console -- crates/zust-console/examples/rgb-service-flow.zs '{"daemon_url":"http://127.0.0.1:8787","btc_addr":"bcrt1..."}'"#
+        r#"example: cargo run -p zust-console -- crates/zust-console/start.zs"#
     );
 }
 
 fn run_script(path: PathBuf, arg: Dynamic) -> Result<Dynamic> {
-    modules::configure_console(&arg).context("configure Zust console")?;
     let vm = vm::Vm::with_all().context("initialize Zust VM")?;
     modules::register_console_modules(&vm).context("register Zust console modules")?;
     let code = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -55,26 +56,8 @@ fn run_script(path: PathBuf, arg: Dynamic) -> Result<Dynamic> {
     Ok(*result)
 }
 
-fn json_to_dynamic(value: &str) -> Result<Dynamic> {
-    let (dynamic, consumed) = Dynamic::from_json(value.as_bytes())?;
-    ensure_consumed(value, consumed)?;
-    Ok(dynamic)
-}
-
 fn dynamic_to_json(value: &Dynamic) -> String {
     let mut json = String::new();
     value.to_json(&mut json);
     json
-}
-
-fn ensure_consumed(input: &str, consumed: usize) -> Result<()> {
-    let rest = input
-        .as_bytes()
-        .get(consumed..)
-        .context("invalid consumed length from Zust JSON decoder")?;
-    if rest.iter().all(|byte| byte.is_ascii_whitespace()) {
-        Ok(())
-    } else {
-        anyhow::bail!("trailing data after JSON input")
-    }
 }

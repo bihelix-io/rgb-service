@@ -23,6 +23,9 @@ pub enum RgbServiceError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("backend error: {0}")]
     Backend(String),
 }

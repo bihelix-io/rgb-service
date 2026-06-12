@@ -2,7 +2,7 @@
 
 `rgb-service-daemon` is the HTTP daemon for BiHelix RGB service APIs. It exposes the `rgb-service-api` Axum router and stores local service state in `fjall` under `service.data_dir`.
 
-The daemon is intentionally explicit: missing required configuration fails at startup. Do not rely on silent defaults for service bind address, Bitcoin network, data directory, chain backend, RNA fees, or iroh secret configuration.
+The daemon is intentionally explicit: missing required configuration fails at startup. Do not rely on silent defaults for service bind address, Bitcoin network, data directory, chain backend, or RNA fees.
 
 ## What the daemon owns
 
@@ -12,7 +12,6 @@ The daemon owns service-side state, not user private keys.
 rgb-service-daemon
   - RGB stock / account state
   - BTC address profile state
-  - btc_addr -> iroh_node_id signer discovery
   - internal RNA credit balance
   - internal usage logs
   - pending RGB transfer state
@@ -52,14 +51,6 @@ means:
 bc1pcaller... signs and pays for the request
 bc1ptarget... is the address being queried or operated on
 ```
-
-Registering an iroh node is stricter:
-
-```text
-account_id must equal btc_address
-```
-
-This prevents one user from binding an iroh signer node to someone else's BTC address.
 
 ## RNA credits
 
@@ -116,47 +107,9 @@ new_profile_grant = 10000
 issue_fee = 1000
 transfer_fee = 100
 query_fee = 1
-
-[iroh]
-secret_key_hex = "<32-byte hex secret>"
 ```
 
 `esplora_url` is the Bitcoin chain backend. It is used to check anchor transactions, outpoints, confirmations, and recovery-related chain state. It is not an RGB data source and it does not hold BTC keys.
-
-## Iroh configuration
-
-`[iroh]` is optional.
-
-Rules:
-
-```text
-missing [iroh] section -> iroh disabled
-[iroh] with empty secret_key_hex -> startup error
-secret_key_hex must decode to exactly 32 bytes
-```
-
-Generate a new iroh secret key on the server:
-
-```bash
-umask 077
-od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > ~/rgb-service-iroh-secret.hex
-```
-
-Then put the file content into:
-
-```toml
-[iroh]
-secret_key_hex = "..."
-```
-
-At startup the daemon logs the derived iroh `node_id`:
-
-```text
-INFO iroh node_id=<node_id>
-INFO iroh endpoint_addr=<endpoint address json>
-```
-
-The `node_id` is public and can be shared. The `secret_key_hex` must remain private.
 
 ## Run locally
 
@@ -225,7 +178,6 @@ Expected mainnet startup log:
 
 ```text
 starting rgb-service on 0.0.0.0:8787 for mainnet with data_dir /home/ubuntu/rgb-service-data
-INFO iroh node_id=<node_id>
 INFO rna new_profile_grant=10000 issue_fee=1000 transfer_fee=100 query_fee=1
 ```
 
@@ -234,8 +186,6 @@ INFO rna new_profile_grant=10000 issue_fee=1000 transfer_fee=100 query_fee=1
 Current public daemon routes:
 
 ```text
-POST /v1/iroh-nodes/register    # Register caller BTC address -> iroh node_id
-POST /v1/iroh-nodes/lookup      # Signed lookup of target BTC address -> iroh node_id
 POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
 POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
 POST /v1/assets/list            # Query account asset list, charges query_fee
@@ -251,6 +201,9 @@ POST /v1/pending/list           # List pending operations
 POST /v1/recover                # Promote/recover pending operations
 POST /v1/test/rgb               # Controlled RGB lifecycle test route
 ```
+
+
+LN compose routes are service-owned state-transition APIs for `ln-rgb-lightning`. They require both the outer request signature and `asset_authorization`. Until the daemon RGB-LN state machine is wired to `rgb-service-local`, these routes fail loudly with HTTP 501 instead of falling back to local LN RGB state.
 
 All requests use `SignedRequest<T>`.
 
@@ -268,10 +221,7 @@ The public daemon does not expose raw fascia download or arbitrary raw consignme
 ```text
 inline
 service_inbox
-iroh
 ```
-
-When `iroh` transport is requested, the daemon must be started with a valid `[iroh].secret_key_hex`.
 
 ## Storage layout
 

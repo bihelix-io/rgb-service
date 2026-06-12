@@ -1,5 +1,3 @@
-mod iroh_transport;
-
 use std::{
     env, fs,
     fs::OpenOptions,
@@ -8,48 +6,48 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use anyhow::Context;
 use axum::serve;
-use bitcoin::{OutPoint, Psbt, Txid};
+use bitcoin::{
+    consensus::{deserialize, serialize},
+    OutPoint, Psbt, Transaction, Txid,
+};
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
 use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
 use rgb_service_api::{
-    AllocationStatus, AssetLayer, AssetSpendAuthorization, AuthSubject, AuthVerifier, Authorized,
-    BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest, CancelTransferRequest,
-    CancelTransferResponse, CommitTransferRequest, CommitTransferResponse, ConsignmentDelivery,
-    ConsignmentDeliveryStatus, ConsignmentTransport, CreateInvoiceRequest,
-    CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
-    ListAssetsResponse, ListPendingRequest, ListPendingResponse, OperationStatus,
-    Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryAction,
-    ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoveryReport, RegisterIrohNodeRequest,
-    RegisterIrohNodeResponse, LookupIrohNodeRequest, LookupIrohNodeResponse, IrohNodeBinding,
-    RnaBalanceRequest, RnaBalanceResponse, RequestSignature,
-    RgbAllocation, RgbAssetInfo, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestStep,
-    RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse,
-    TrackedUtxo,
-    axum_service::router,
+    axum_service::router, AllocationStatus, AssetLayer, AssetSpendAuthorization, AuthSubject,
+    AuthVerifier, Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
+    CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
+    ConsignmentDelivery, ConsignmentTransport, CreateInvoiceRequest, CreateInvoiceResponse,
+    IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
+    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
+    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
+    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel,
+    LnRecoveredCompose, LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest,
+    PrepareTransferResponse, ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest,
+    RecoveryAction, RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance,
+    RgbFundingRef, RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest,
+    RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest,
+    SendConsignmentResponse, TrackedUtxo,
 };
 use rgb_service_local::{
-    ChainSource, EsploraConfig, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
     build_rgb20_transfer_consignment, decode_rgb20_transfer_consignment, encode_fascia_bytes,
     encode_rgb20_transfer_consignment, issue_rgb20_fixed_with_chain_source,
-    list_rgb20_assets_for_utxos, prepare_rgb20_psbt,
-    scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
+    list_rgb20_assets_for_utxos, prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks,
+    stage_receiver_transfer, stage_sender_fascia, ChainSource, EsploraConfig, Rgb20IssueRequest,
+    Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal};
 
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
     service: ServiceConfig,
     rna: RnaConfig,
-    iroh: Option<IrohConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,11 +56,6 @@ struct ServiceConfig {
     network: String,
     data_dir: PathBuf,
     esplora_url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct IrohConfig {
-    secret_key_hex: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,7 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = config.service.bind;
     let service = Arc::new(LocalDaemonService::new(config).await?);
-    spawn_iroh_receiver(Arc::clone(&service));
     let auth = Arc::new(ConfiguredAuthVerifier);
     let app = router(service, auth);
     let listener = TcpListener::bind(bind).await?;
@@ -135,11 +127,6 @@ fn load_config(path: &str) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
         return Err("service.esplora_url must not be empty".into());
     }
     config.rna.validate()?;
-    if let Some(iroh) = &config.iroh {
-        if iroh.secret_key_hex.trim().is_empty() {
-            return Err("iroh.secret_key_hex must not be empty when [iroh] is configured".into());
-        }
-    }
     Ok(config)
 }
 
@@ -188,7 +175,6 @@ impl AuthVerifier for ConfiguredAuthVerifier {
 struct LocalDaemonService {
     config: ServiceConfig,
     rna: RnaConfig,
-    iroh_endpoint: Option<Endpoint>,
     db: SingleWriterTxDatabase,
     logger: DaemonLogger,
 }
@@ -202,10 +188,7 @@ impl DaemonLogger {
     fn open(data_dir: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(data_dir)?;
         let path = data_dir.join("rgb-service.log");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
         })
@@ -213,10 +196,6 @@ impl DaemonLogger {
 
     fn info(&self, message: impl AsRef<str>) {
         self.write("INFO", message.as_ref());
-    }
-
-    fn error(&self, message: impl AsRef<str>) {
-        self.write("ERROR", message.as_ref());
     }
 
     fn write(&self, level: &str, message: &str) {
@@ -240,6 +219,33 @@ struct PreparedTransferRecord {
     fascia: Vec<u8>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct LnChannelRecord {
+    account_id: String,
+    channel_id: String,
+    contract_id: String,
+    funding_outpoint: String,
+    funding_rgb: u64,
+    to_local_rgb: u64,
+    to_remote_rgb: u64,
+    funding_ref: RgbFundingRef,
+    created_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LnComposeRecord {
+    account_id: String,
+    channel_id: String,
+    operation_id: String,
+    route: String,
+    contract_id: String,
+    txid: String,
+    tx_hex: String,
+    fascia: Vec<u8>,
+    funding_ref: RgbFundingRef,
+    created_at_ms: u64,
+}
+
 impl LocalDaemonService {
     async fn new(config: DaemonConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let logger = DaemonLogger::open(&config.service.data_dir)?;
@@ -256,18 +262,6 @@ impl LocalDaemonService {
         let kv_dir = config.service.data_dir.join("kv");
         fs::create_dir_all(&kv_dir)?;
         let db = SingleWriterTxDatabase::builder(&kv_dir).open()?;
-        let iroh_endpoint = if let Some(iroh) = &config.iroh {
-            let secret_key = iroh_transport::secret_key_from_hex(&iroh.secret_key_hex)?;
-            let node_id = secret_key.public().to_string();
-            let endpoint = iroh_transport::bind_assignment_endpoint(secret_key).await?;
-            let addr = endpoint.addr();
-            logger.info(format!("iroh node_id={node_id}"));
-            logger.info(format!("iroh endpoint_addr={}", serde_json::to_string(&addr)?));
-            Some(endpoint)
-        } else {
-            logger.info("iroh disabled: missing [iroh] config");
-            None
-        };
         logger.info(format!(
             "rna new_profile_grant={} issue_fee={} transfer_fee={} query_fee={}",
             config.rna.new_profile_grant,
@@ -278,7 +272,6 @@ impl LocalDaemonService {
         Ok(Self {
             config: config.service,
             rna: config.rna,
-            iroh_endpoint,
             db,
             logger,
         })
@@ -333,8 +326,8 @@ impl LocalDaemonService {
             .keyspace("prepared_transfers", KeyspaceCreateOptions::default)
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         let key = Self::prepared_key(account_id, transfer_id);
-        let bytes = serde_json::to_vec(record)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec(record).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         let mut tx = self.db.write_tx();
         tx.insert(&keyspace, key.as_bytes(), bytes);
         tx.commit()
@@ -359,11 +352,232 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?
             .map(|bytes| bytes.as_ref().to_vec())
             .ok_or_else(|| {
-                RgbServiceError::NotFound(format!(
-                    "prepared transfer not found: {transfer_id}"
-                ))
+                RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
             })?;
         serde_json::from_slice(&bytes).map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn ln_channel_key(account_id: &str, channel_id: &str) -> String {
+        format!("{account_id}:{channel_id}")
+    }
+
+    fn put_ln_channel_record(&self, record: &LnChannelRecord) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("ln_channels", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = Self::ln_channel_key(&record.account_id, &record.channel_id);
+        let bytes =
+            serde_json::to_vec(record).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn put_ln_compose_record(&self, record: &LnComposeRecord) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("ln_composes", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = format!("{}:{}", record.account_id, record.operation_id);
+        let bytes =
+            serde_json::to_vec(record).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn get_ln_channel_record(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+    ) -> rgb_service_api::Result<Option<LnChannelRecord>> {
+        let keyspace = self
+            .db
+            .keyspace("ln_channels", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = Self::ln_channel_key(account_id, channel_id);
+        let Some(bytes) = keyspace
+            .get(key.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(bytes.as_ref())
+            .map(Some)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn list_ln_channel_records(
+        &self,
+        account_id: &str,
+    ) -> rgb_service_api::Result<Vec<LnChannelRecord>> {
+        let keyspace = self
+            .db
+            .keyspace("ln_channels", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let prefix = format!("{account_id}:");
+        let mut records = Vec::new();
+        for item in keyspace.as_ref().prefix(prefix.as_bytes()) {
+            let value = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            records.push(
+                serde_json::from_slice(value.as_ref())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))?,
+            );
+        }
+        Ok(records)
+    }
+
+    fn list_ln_compose_records(
+        &self,
+        account_id: &str,
+        channel_id: Option<&str>,
+    ) -> rgb_service_api::Result<Vec<LnComposeRecord>> {
+        let keyspace = self
+            .db
+            .keyspace("ln_composes", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let prefix = format!("{account_id}:");
+        let mut records = Vec::new();
+        for item in keyspace.as_ref().prefix(prefix.as_bytes()) {
+            let value = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let record: LnComposeRecord = serde_json::from_slice(value.as_ref())
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            if channel_id.is_some_and(|id| record.channel_id != id) {
+                continue;
+            }
+            records.push(record);
+        }
+        records.sort_by_key(|record| record.created_at_ms);
+        Ok(records)
+    }
+
+    fn require_nonce(authorization: &AssetSpendAuthorization) -> rgb_service_api::Result<String> {
+        let nonce = authorization.signature.nonce.trim();
+        if nonce.is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "asset authorization signature nonce must not be empty".to_string(),
+            ));
+        }
+        Ok(nonce.to_string())
+    }
+
+    fn validate_ln_asset_authorization(
+        contract_id: &str,
+        amount: u64,
+        authorization: &AssetSpendAuthorization,
+    ) -> rgb_service_api::Result<()> {
+        if authorization.asset_id != contract_id {
+            return Err(RgbServiceError::Forbidden(format!(
+                "asset authorization asset_id {} does not match contract_id {}",
+                authorization.asset_id, contract_id
+            )));
+        }
+        if authorization.amount != amount {
+            return Err(RgbServiceError::Forbidden(format!(
+                "asset authorization amount {} does not match LN RGB amount {}",
+                authorization.amount, amount
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_vout(
+        amount: u64,
+        vout: Option<u32>,
+        label: &str,
+    ) -> rgb_service_api::Result<Option<u32>> {
+        if amount == 0 {
+            return Ok(None);
+        }
+        vout.map(Some).ok_or_else(|| {
+            RgbServiceError::InvalidRequest(format!(
+                "{label} is required when RGB amount is non-zero"
+            ))
+        })
+    }
+
+    fn decode_unsigned_tx(tx_hex: &str) -> rgb_service_api::Result<Transaction> {
+        deserialize(&hex_decode(tx_hex)?).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid unsigned_tx_hex: {err}"))
+        })
+    }
+
+    fn compose_ln_rgb_tx(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+        route: &str,
+        funding_ref: RgbFundingRef,
+        contract_id: &str,
+        unsigned_tx_hex: &str,
+        change_vout: u32,
+        assignments: Vec<Rgb20PsbtAssignment>,
+        authorization: &AssetSpendAuthorization,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        if channel_id.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "channel_id must not be empty".to_string(),
+            ));
+        }
+        if contract_id.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "contract_id must not be empty".to_string(),
+            ));
+        }
+        if assignments.is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "at least one RGB assignment is required for LN compose".to_string(),
+            ));
+        }
+        let amount = assignments
+            .iter()
+            .map(|assignment| assignment.amount)
+            .sum::<u64>();
+        Self::validate_ln_asset_authorization(contract_id, amount, authorization)?;
+        let operation_id = Self::require_nonce(authorization)?;
+        let tx = Self::decode_unsigned_tx(unsigned_tx_hex)?;
+        let psbt = Psbt::from_unsigned_tx(tx).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid unsigned transaction for PSBT: {err}"))
+        })?;
+        let stock_dir = self.account_stock_dir(account_id);
+        let prepared = prepare_rgb20_psbt(&stock_dir, psbt, change_vout, assignments)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let tx = prepared.psbt.unsigned_tx;
+        let txid = tx.compute_txid();
+        let tx_hex = hex_encode(&serialize(&tx));
+        let fascia = encode_fascia_bytes(&prepared.fascia)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let rgb_state_ref = format!("ln:{channel_id}:{operation_id}");
+        self.put_ln_compose_record(&LnComposeRecord {
+            account_id: account_id.to_string(),
+            channel_id: channel_id.to_string(),
+            operation_id: operation_id.clone(),
+            route: route.to_string(),
+            contract_id: contract_id.to_string(),
+            txid: txid.to_string(),
+            tx_hex: tx_hex.clone(),
+            fascia,
+            funding_ref,
+            created_at_ms: now_ms(),
+        })?;
+        Ok(LnComposeResponse {
+            operation_id,
+            tx_hex,
+            rgb_state_ref: Some(rgb_state_ref),
+        })
     }
 
     fn new_profile(&self, id: &str, now: u64) -> Value {
@@ -387,8 +601,8 @@ impl LocalDaemonService {
         else {
             return Ok(None);
         };
-        let (dynamic, consumed) = Dynamic::decode(&bytes)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let (dynamic, consumed) =
+            Dynamic::decode(&bytes).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         if consumed != bytes.len() {
             return Err(RgbServiceError::Backend(
                 "trailing data after profile Dynamic msgpack payload".to_string(),
@@ -401,15 +615,9 @@ impl LocalDaemonService {
         profile
             .get("rna_balance")
             .and_then(Value::as_u64)
-            .ok_or_else(|| RgbServiceError::Backend("profile missing numeric rna_balance".to_string()))
-    }
-
-    fn value_string(profile: &Value, key: &str) -> Option<String> {
-        profile
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                RgbServiceError::Backend("profile missing numeric rna_balance".to_string())
+            })
     }
 
     fn put_profile(&self, id: &str, profile: &Value) -> rgb_service_api::Result<()> {
@@ -487,8 +695,8 @@ impl LocalDaemonService {
             "created_at_ms": now
         });
         let profile_bytes = dynamic_to_msgpack(&json_value_to_dynamic(&profile)?);
-        let event_bytes = serde_json::to_vec(&event)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let event_bytes =
+            serde_json::to_vec(&event).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         let mut tx = self.db.write_tx();
         tx.insert(&profile_keyspace, account_id.as_bytes(), profile_bytes);
         tx.insert(&logs_keyspace, event_id.as_bytes(), event_bytes);
@@ -502,157 +710,10 @@ impl LocalDaemonService {
         ));
         Ok(new_balance)
     }
-
-    fn upsert_iroh_profile(&self, binding: &IrohNodeBinding) -> rgb_service_api::Result<()> {
-        let now = now_ms();
-        let mut profile = self
-            .load_profile(&binding.btc_address)?
-            .unwrap_or_else(|| self.new_profile(&binding.btc_address, now));
-        profile["id"] = json!(binding.btc_address);
-        profile["account_id"] = json!(binding.account_id);
-        profile["btc_address"] = json!(binding.btc_address);
-        profile["iroh_node_id"] = json!(binding.iroh_node_id);
-        profile["label"] = match &binding.label {
-            Some(label) => json!(label),
-            None => Value::Null,
-        };
-        profile["updated_at_ms"] = json!(binding.updated_at_ms);
-        self.put_profile(&binding.btc_address, &profile)
-    }
-
-    fn get_iroh_node_binding(
-        &self,
-        btc_address: &str,
-    ) -> rgb_service_api::Result<Option<IrohNodeBinding>> {
-        let Some(profile) = self.load_profile(btc_address)? else {
-            return Ok(None);
-        };
-        let Some(iroh_node_id) = Self::value_string(&profile, "iroh_node_id") else {
-            return Ok(None);
-        };
-        Ok(Some(IrohNodeBinding {
-            account_id: Self::value_string(&profile, "account_id").unwrap_or_default(),
-            btc_address: Self::value_string(&profile, "btc_address")
-                .unwrap_or_else(|| btc_address.to_string()),
-            iroh_node_id,
-            label: Self::value_string(&profile, "label"),
-            updated_at_ms: profile
-                .get("updated_at_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
-        }))
-    }
-
-}
-
-fn spawn_iroh_receiver(service: Arc<LocalDaemonService>) {
-    let Some(endpoint) = service.iroh_endpoint.clone() else {
-        return;
-    };
-    tokio::spawn(async move {
-        loop {
-            let log_service = Arc::clone(&service);
-            let accept_service = Arc::clone(&service);
-            match iroh_transport::receive_assignment_once(&endpoint, move |envelope, payload| {
-                accept_service.accept_iroh_assignment(envelope, payload)
-            })
-            .await
-            {
-                Ok(ack) if ack.accepted => {
-                    log_service.logger.info(format!(
-                        "accepted iroh RGB assignment transfer_id={}",
-                        ack.transfer_id
-                    ));
-                }
-                Ok(ack) => {
-                    log_service.logger.error(format!(
-                        "rejected iroh RGB assignment transfer_id={} message={}",
-                        ack.transfer_id, ack.message
-                    ));
-                }
-                Err(err) => {
-                    log_service.logger.error(format!(
-                        "iroh RGB assignment receiver failed: {err:#}"
-                    ));
-                }
-            }
-        }
-    });
-}
-
-impl LocalDaemonService {
-    fn accept_iroh_assignment(
-        &self,
-        envelope: &iroh_transport::IrohAssignmentEnvelope,
-        payload: &[u8],
-    ) -> anyhow::Result<()> {
-        let account_id = envelope
-            .topic
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .context("incoming Iroh consignment must include topic account_id")?;
-        let txid = Txid::from_str(&envelope.txid)
-            .with_context(|| format!("invalid incoming Iroh assignment txid: {}", envelope.txid))?;
-        let consignment = decode_rgb20_transfer_consignment(payload)
-            .context("decode incoming Iroh RGB transfer consignment")?;
-        let stock_dir = self.account_stock_dir(account_id);
-        stage_receiver_transfer(&stock_dir, txid, &consignment)
-            .context("stage incoming Iroh RGB transfer consignment")?;
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl RgbServiceApi for LocalDaemonService {
-    async fn register_iroh_node(
-        &self,
-        req: Authorized<RegisterIrohNodeRequest>,
-    ) -> rgb_service_api::Result<RegisterIrohNodeResponse> {
-        if req.payload.btc_address.trim().is_empty() {
-            return Err(RgbServiceError::InvalidRequest(
-                "btc_address must not be empty".to_string(),
-            ));
-        }
-        if req.payload.iroh_node_id.trim().is_empty() {
-            return Err(RgbServiceError::InvalidRequest(
-                "iroh_node_id must not be empty".to_string(),
-            ));
-        }
-        if req.payload.account_id != req.payload.btc_address {
-            return Err(RgbServiceError::Forbidden(
-                "account_id is the caller BTC address and must match btc_address when registering an iroh node".to_string(),
-            ));
-        }
-        let binding = IrohNodeBinding {
-            account_id: req.payload.account_id,
-            btc_address: req.payload.btc_address,
-            iroh_node_id: req.payload.iroh_node_id,
-            label: req.payload.label,
-            updated_at_ms: now_ms(),
-        };
-        self.upsert_iroh_profile(&binding)?;
-        Ok(RegisterIrohNodeResponse { binding })
-    }
-
-    async fn lookup_iroh_node(
-        &self,
-        req: Authorized<LookupIrohNodeRequest>,
-    ) -> rgb_service_api::Result<LookupIrohNodeResponse> {
-        if req.payload.btc_address.trim().is_empty() {
-            return Err(RgbServiceError::InvalidRequest(
-                "btc_address must not be empty".to_string(),
-            ));
-        }
-        self.charge_rna(
-            &req.payload.account_id,
-            "/v1/iroh-nodes/lookup",
-            "lookup_iroh_node",
-            self.rna.query_fee,
-        )?;
-        let binding = self.get_iroh_node_binding(&req.payload.btc_address)?;
-        Ok(LookupIrohNodeResponse { binding })
-    }
-
     async fn rna_balance(
         &self,
         req: Authorized<RnaBalanceRequest>,
@@ -718,11 +779,9 @@ impl RgbServiceApi for LocalDaemonService {
             self.rna.query_fee,
         )?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let allocations = list_rgb20_assets_for_utxos(
-            &stock_dir,
-            self.tracked_utxos(req.payload.tracked_utxos)?,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let allocations =
+            list_rgb20_assets_for_utxos(&stock_dir, self.tracked_utxos(req.payload.tracked_utxos)?)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let mut assets = Vec::<RgbAssetInfo>::new();
         for allocation in allocations {
             if assets
@@ -764,11 +823,9 @@ impl RgbServiceApi for LocalDaemonService {
         req: Authorized<BalanceBreakdownRequest>,
     ) -> rgb_service_api::Result<BalanceBreakdownResponse> {
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let allocations = list_rgb20_assets_for_utxos(
-            &stock_dir,
-            self.tracked_utxos(req.payload.tracked_utxos)?,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let allocations =
+            list_rgb20_assets_for_utxos(&stock_dir, self.tracked_utxos(req.payload.tracked_utxos)?)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let mut summary = RgbBalance {
             asset_id: req.payload.asset_id.clone(),
             total: 0,
@@ -887,7 +944,8 @@ impl RgbServiceApi for LocalDaemonService {
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let txid = Txid::from_str(&req.payload.txid)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let record = self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
+        let record =
+            self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
         let fascia = rgb_service_local::decode_fascia_bytes(&record.fascia)
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
         stage_sender_fascia(&stock_dir, txid, &fascia)
@@ -904,7 +962,8 @@ impl RgbServiceApi for LocalDaemonService {
         req: Authorized<SendConsignmentRequest>,
     ) -> rgb_service_api::Result<SendConsignmentResponse> {
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let record = self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
+        let record =
+            self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
         if record.asset_id != req.payload.asset_id {
             return Err(RgbServiceError::Conflict(format!(
                 "transfer {} belongs to asset {}, not {}",
@@ -918,14 +977,9 @@ impl RgbServiceApi for LocalDaemonService {
         let fascia = rgb_service_local::decode_fascia_bytes(&record.fascia)
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
         let recipient_vout = req.payload.recipient_vout.unwrap_or(record.recipient_vout);
-        let consignment = build_rgb20_transfer_consignment(
-            &stock_dir,
-            fascia,
-            contract_id,
-            txid,
-            recipient_vout,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let consignment =
+            build_rgb20_transfer_consignment(&stock_dir, fascia, contract_id, txid, recipient_vout)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let delivery = match req.payload.transport {
             ConsignmentTransport::Inline => {
                 let bytes = encode_rgb20_transfer_consignment(&consignment)
@@ -939,60 +993,6 @@ impl RgbServiceApi for LocalDaemonService {
                 stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
                     .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
                 ConsignmentDelivery::ServiceInbox { account_id }
-            }
-            ConsignmentTransport::Iroh {
-                node_id,
-                topic,
-                timeout_ms,
-            } => {
-                let endpoint = self.iroh_endpoint.as_ref().ok_or_else(|| {
-                    RgbServiceError::InvalidRequest(
-                        "iroh transport requested but [iroh].enabled is false".to_string(),
-                    )
-                })?;
-                if node_id.trim().is_empty() {
-                    return Err(RgbServiceError::InvalidRequest(
-                        "iroh transport node_id must not be empty".to_string(),
-                    ));
-                }
-                let remote_id = EndpointId::from_str(&node_id).map_err(|err| {
-                    RgbServiceError::InvalidRequest(format!(
-                        "invalid iroh transport node_id: {err}"
-                    ))
-                })?;
-                let remote_addr = EndpointAddr::new(remote_id);
-                let bytes = encode_rgb20_transfer_consignment(&consignment)
-                    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-                let recipient_outpoint = OutPoint::new(txid, recipient_vout);
-                let assignment = iroh_transport::assignment_from_consignment_bytes(
-                    bytes,
-                    req.payload.transfer_id.clone(),
-                    txid,
-                    req.payload.asset_id.clone(),
-                    recipient_outpoint,
-                    topic,
-                );
-                let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
-                let send = iroh_transport::send_assignment_with_retry(
-                    endpoint,
-                    remote_addr,
-                    &assignment,
-                    3,
-                    Duration::from_millis(1000),
-                );
-                let ack = tokio::time::timeout(timeout, send)
-                    .await
-                    .map_err(|_| RgbServiceError::Backend("iroh consignment send timed out".to_string()))?
-                    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-                self.logger.info(format!(
-                    "delivered iroh consignment transfer_id={} remote_node_id={} ack={}",
-                    assignment.envelope.transfer_id, node_id, ack.message
-                ));
-                ConsignmentDelivery::Iroh {
-                    node_id,
-                    delivery_id: assignment.envelope.transfer_id,
-                    status: ConsignmentDeliveryStatus::Delivered,
-                }
             }
         };
         Ok(SendConsignmentResponse {
@@ -1067,6 +1067,237 @@ impl RgbServiceApi for LocalDaemonService {
         })
     }
 
+    async fn prepare_ln_channel_open(
+        &self,
+        req: Authorized<LnChannelOpenPrepareRequest>,
+    ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
+        if req.payload.channel_id.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "channel_id must not be empty".to_string(),
+            ));
+        }
+        if req.payload.contract_id.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "contract_id must not be empty".to_string(),
+            ));
+        }
+        OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
+        })?;
+        if req.payload.to_local_rgb + req.payload.to_remote_rgb != req.payload.funding_rgb {
+            return Err(RgbServiceError::InvalidRequest(
+                "to_local_rgb + to_remote_rgb must equal funding_rgb".to_string(),
+            ));
+        }
+        Self::validate_ln_asset_authorization(
+            &req.payload.contract_id,
+            req.payload.funding_rgb,
+            &req.payload.asset_authorization,
+        )?;
+        self.charge_rna(
+            &req.payload.account_id,
+            "/v1/ln/channels/open/prepare",
+            "ln_channel_open_prepare",
+            self.rna.transfer_fee,
+        )?;
+        let operation_id = Self::require_nonce(&req.payload.asset_authorization)?;
+        let funding_ref = RgbFundingRef {
+            transfer_id: format!("ln-open:{operation_id}"),
+            operation_id: operation_id.clone(),
+            channel_id: Some(req.payload.channel_id.clone()),
+        };
+        self.put_ln_channel_record(&LnChannelRecord {
+            account_id: req.payload.account_id,
+            channel_id: req.payload.channel_id,
+            contract_id: req.payload.contract_id,
+            funding_outpoint: req.payload.funding_outpoint,
+            funding_rgb: req.payload.funding_rgb,
+            to_local_rgb: req.payload.to_local_rgb,
+            to_remote_rgb: req.payload.to_remote_rgb,
+            funding_ref: funding_ref.clone(),
+            created_at_ms: now_ms(),
+        })?;
+        Ok(LnChannelOpenPrepareResponse {
+            funding_ref,
+            operation_id,
+        })
+    }
+
+    async fn compose_ln_commitment(
+        &self,
+        req: Authorized<LnCommitmentComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
+        })?;
+        let contract_id = parse_contract_id(&req.payload.contract_id)?;
+        let mut assignments = Vec::new();
+        if let Some(vout) = Self::require_vout(
+            req.payload.to_local_rgb,
+            req.payload.to_local_vout,
+            "to_local_vout",
+        )? {
+            assignments.push(Rgb20PsbtAssignment {
+                contract_id,
+                amount: req.payload.to_local_rgb,
+                vout,
+            });
+        }
+        if let Some(vout) = Self::require_vout(
+            req.payload.to_remote_rgb,
+            req.payload.to_remote_vout,
+            "to_remote_vout",
+        )? {
+            assignments.push(Rgb20PsbtAssignment {
+                contract_id,
+                amount: req.payload.to_remote_rgb,
+                vout,
+            });
+        }
+        for htlc in req.payload.htlcs {
+            if htlc.amount_rgb == 0 {
+                continue;
+            }
+            assignments.push(Rgb20PsbtAssignment {
+                contract_id,
+                amount: htlc.amount_rgb,
+                vout: htlc.vout,
+            });
+        }
+        self.compose_ln_rgb_tx(
+            &req.payload.account_id,
+            &req.payload.channel_id,
+            "/v1/ln/commitments/compose",
+            req.payload.funding_ref,
+            &req.payload.contract_id,
+            &req.payload.unsigned_tx_hex,
+            req.payload.change_vout,
+            assignments,
+            &req.payload.asset_authorization,
+        )
+    }
+
+    async fn compose_ln_closing(
+        &self,
+        req: Authorized<LnClosingComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
+        })?;
+        let contract_id = parse_contract_id(&req.payload.contract_id)?;
+        let mut assignments = Vec::new();
+        if let Some(vout) = Self::require_vout(
+            req.payload.to_local_rgb,
+            req.payload.to_local_vout,
+            "to_local_vout",
+        )? {
+            assignments.push(Rgb20PsbtAssignment {
+                contract_id,
+                amount: req.payload.to_local_rgb,
+                vout,
+            });
+        }
+        if let Some(vout) = Self::require_vout(
+            req.payload.to_remote_rgb,
+            req.payload.to_remote_vout,
+            "to_remote_vout",
+        )? {
+            assignments.push(Rgb20PsbtAssignment {
+                contract_id,
+                amount: req.payload.to_remote_rgb,
+                vout,
+            });
+        }
+        self.compose_ln_rgb_tx(
+            &req.payload.account_id,
+            &req.payload.channel_id,
+            "/v1/ln/closing/compose",
+            req.payload.funding_ref,
+            &req.payload.contract_id,
+            &req.payload.unsigned_tx_hex,
+            req.payload.change_vout,
+            assignments,
+            &req.payload.asset_authorization,
+        )
+    }
+
+    async fn compose_ln_onchain_claim(
+        &self,
+        req: Authorized<LnOnchainClaimComposeRequest>,
+    ) -> rgb_service_api::Result<LnComposeResponse> {
+        let contract_id = parse_contract_id(&req.payload.contract_id)?;
+        let amount = req.payload.asset_authorization.amount;
+        if amount == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "asset authorization amount must be greater than zero for LN on-chain claim"
+                    .to_string(),
+            ));
+        }
+        let assignments = vec![Rgb20PsbtAssignment {
+            contract_id,
+            amount,
+            vout: req.payload.claim_vout,
+        }];
+        self.compose_ln_rgb_tx(
+            &req.payload.account_id,
+            &req.payload.channel_id,
+            "/v1/ln/onchain-claims/compose",
+            req.payload.funding_ref,
+            &req.payload.contract_id,
+            &req.payload.unsigned_tx_hex,
+            req.payload.change_vout,
+            assignments,
+            &req.payload.asset_authorization,
+        )
+    }
+
+    async fn recover_ln(
+        &self,
+        req: Authorized<LnRecoverRequest>,
+    ) -> rgb_service_api::Result<LnRecoveryReport> {
+        let channels = if let Some(channel_id) = req.payload.channel_id.as_deref() {
+            self.get_ln_channel_record(&req.payload.account_id, channel_id)?
+                .into_iter()
+                .collect()
+        } else {
+            self.list_ln_channel_records(&req.payload.account_id)?
+        };
+        let composes = self
+            .list_ln_compose_records(&req.payload.account_id, req.payload.channel_id.as_deref())?;
+        Ok(LnRecoveryReport {
+            account_id: req.payload.account_id,
+            channel_id: req.payload.channel_id,
+            channels: channels
+                .into_iter()
+                .map(|record| LnRecoveredChannel {
+                    channel_id: record.channel_id,
+                    contract_id: record.contract_id,
+                    funding_outpoint: record.funding_outpoint,
+                    funding_rgb: record.funding_rgb,
+                    to_local_rgb: record.to_local_rgb,
+                    to_remote_rgb: record.to_remote_rgb,
+                    funding_ref: record.funding_ref,
+                    created_at_ms: record.created_at_ms,
+                })
+                .collect(),
+            composes: composes
+                .into_iter()
+                .map(|record| LnRecoveredCompose {
+                    rgb_state_ref: format!("ln:{}:{}", record.channel_id, record.operation_id),
+                    fascia_len: record.fascia.len(),
+                    channel_id: record.channel_id,
+                    operation_id: record.operation_id,
+                    route: record.route,
+                    contract_id: record.contract_id,
+                    txid: record.txid,
+                    tx_hex: record.tx_hex,
+                    funding_ref: record.funding_ref,
+                    created_at_ms: record.created_at_ms,
+                })
+                .collect(),
+        })
+    }
+
     async fn run_rgb_test(
         &self,
         req: Authorized<RunRgbTestRequest>,
@@ -1087,7 +1318,10 @@ fn json_value_to_dynamic(value: &Value) -> rgb_service_api::Result<Dynamic> {
     let json = value.to_string();
     let (dynamic, consumed) = Dynamic::from_json(json.as_bytes())
         .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-    if json.as_bytes()[consumed..].iter().any(|byte| !byte.is_ascii_whitespace()) {
+    if json.as_bytes()[consumed..]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+    {
         return Err(RgbServiceError::Backend(
             "trailing data after profile JSON decode".to_string(),
         ));
@@ -1119,6 +1353,25 @@ fn test_step(name: &str) -> RgbTestStep {
         name: name.to_string(),
         passed: true,
         message: None,
+    }
+}
+
+fn parse_contract_id(
+    value: &str,
+) -> rgb_service_api::Result<rgb_service_local::rgbstd::ContractId> {
+    match rgb_service_local::rgbstd::ContractId::from_str(value) {
+        Ok(contract_id) => Ok(contract_id),
+        Err(parse_err) => {
+            let bytes = hex_decode(value)?;
+            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+                RgbServiceError::InvalidRequest(format!(
+                    "invalid contract_id; expected RGB contract id string or 32-byte hex: {parse_err:?}"
+                ))
+            })?;
+            rgb_service_local::rgbstd::ContractId::copy_from_slice(bytes).map_err(|err| {
+                RgbServiceError::InvalidRequest(format!("invalid 32-byte hex contract_id: {err}"))
+            })
+        }
     }
 }
 

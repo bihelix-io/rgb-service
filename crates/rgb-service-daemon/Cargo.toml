@@ -23,7 +23,6 @@ axum = { workspace = true, features = ["tokio"] }
 bitcoin = { workspace = true }
 dynamic = { package = "zust-dynamic", version = "0.9.12" }
 fjall = { workspace = true }
-iroh = { workspace = true }
 rgb-service-local = { version = "0.11.1-rc.10", path = "../rgb-service-local" }
 rgb-service-api = { workspace = true, features = ["axum"] }
 serde = { package = "serde", version = "1", features = ["derive"] }
