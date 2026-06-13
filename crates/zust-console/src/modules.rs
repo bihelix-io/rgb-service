@@ -247,13 +247,6 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
-        "register_iroh_node",
-        &[Type::Any],
-        Type::Any,
-        rgb_register_iroh_node as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
         "rna_balance",
         &[],
         Type::Any,
@@ -1460,9 +1453,6 @@ extern "C" fn rgb_request(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn rgb_register_iroh_node(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/iroh-nodes/register")
-}
 extern "C" fn rgb_rna_balance() -> *const Dynamic {
     native_result(|| rgb_post_dynamic(&Dynamic::Null, "/v1/rna/balance"))
 }
@@ -2900,18 +2890,6 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
     if route == "/v1/balance" {
         object.entry("scope".to_string()).or_insert(json!("all"));
     }
-    if route == "/v1/iroh-nodes/register" {
-        object
-            .entry("btc_address".to_string())
-            .or_insert(json!(default_account_id()?));
-        object
-            .entry("iroh_node_id".to_string())
-            .or_insert(json!(signer_node_id()?));
-    } else if route == "/v1/iroh-nodes/lookup" {
-        object
-            .entry("btc_address".to_string())
-            .or_insert(json!(default_account_id()?));
-    }
     Ok(Value::Object(object))
 }
 
@@ -3015,22 +2993,26 @@ async fn iroh_call(
     bytes: Vec<u8>,
 ) -> Result<Dynamic> {
     eprintln!("[zust-console] iroh connect signer");
-    let conn = endpoint
-        .connect(remote_addr, SIGNER_ALPN)
+    let conn = tokio::time::timeout(SIGNER_TIMEOUT, endpoint.connect(remote_addr, SIGNER_ALPN))
         .await
+        .context("connect signer iroh endpoint timed out")?
         .context("connect signer iroh endpoint")?;
     eprintln!("[zust-console] iroh open bi stream");
-    let (mut send, mut recv) = conn.open_bi().await.context("open signer iroh stream")?;
-    eprintln!("[zust-console] iroh write request: bytes={}", bytes.len());
-    send.write_all(&bytes)
+    let (mut send, mut recv) = tokio::time::timeout(SIGNER_TIMEOUT, conn.open_bi())
         .await
+        .context("open signer iroh stream timed out")?
+        .context("open signer iroh stream")?;
+    eprintln!("[zust-console] iroh write request: bytes={}", bytes.len());
+    tokio::time::timeout(SIGNER_TIMEOUT, send.write_all(&bytes))
+        .await
+        .context("write signer msgpack request timed out")?
         .context("write signer msgpack request")?;
     eprintln!("[zust-console] iroh finish request stream");
     send.finish().context("finish signer request stream")?;
     eprintln!("[zust-console] iroh read response");
-    let response = recv
-        .read_to_end(1024 * 1024)
+    let response = tokio::time::timeout(SIGNER_TIMEOUT, recv.read_to_end(1024 * 1024))
         .await
+        .context("read signer msgpack response timed out")?
         .context("read signer msgpack response")?;
     eprintln!(
         "[zust-console] iroh response received: bytes={}",
