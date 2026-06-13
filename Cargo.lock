@@ -9425,9 +9425,9 @@ dependencies = [
 
 [[package]]
 name = "zust-vm"
-version = "0.9.74"
+version = "0.9.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5406bdafa4c578d379e021ce6566890a2d0b555f330793b2ba24e5303260ecc7"
+checksum = "06242d7a765c9cab930a6001e7b2a23a4a26ff5e22bebdc57ae5b2c141414984"
 dependencies = [
  "anyhow",
  "axum",

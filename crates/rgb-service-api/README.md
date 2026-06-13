@@ -51,8 +51,6 @@ POST /v1/ln/commitments/compose
 POST /v1/ln/closing/compose
 POST /v1/ln/onchain-claims/compose
 POST /v1/transfers/cancel
-POST /v1/pending/list
-POST /v1/recover
 POST /v1/test/rgb
 ```
 

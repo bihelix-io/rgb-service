@@ -16,9 +16,9 @@ use rgb_service_api::{
     LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
     LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveryReport,
     Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryReport,
-    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario,
-    RgbTestStep, RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse,
-    SignatureScheme, SignedRequest, TokenListResponse,
+    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep,
+    RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SignatureScheme,
+    SignedRequest, TokenListResponse,
 };
 use tower::ServiceExt;
 

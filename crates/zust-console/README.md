@@ -14,10 +14,17 @@ cargo run -p zust-console -- -e 'ln_rgb::status()'
 root::add("local/rgb-service", "http://3.1.207.115:8091");
 root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 root::add("local/signer-node", "417c33530ab6097e5e2538ffd16e833ee4337318015f201452a540c49adb4158");
+root::add("local/signer-request", {
+  attempts: 60,
+  retry_interval_ms: 0,
+  timeout_ms: 60000,
+});
 ```
 
 `local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/signer-node` 是 signer App
 的 iroh node id。`local/rgb-service` 是 RGB daemon 的 HTTP 地址。
+`local/signer-request` 控制 signer Iroh 请求重试；它只重试签名请求，不重试
+RGB daemon POST。
 
 常用 REPL 命令：
 
@@ -186,35 +193,47 @@ block indexer。
 
 ## rgb
 
-`rgb` 模块访问 `local/rgb-service`。大多数调用会用 `signed_request(...)`
-包装 payload；除非输入里已经带有 `signature` 字段，否则会自动使用 signer App。
+`rgb` 模块访问 `local/rgb-service`。除 `rgb::token_list()` 外，RGB 调用都会
+启动后台线程并立刻返回 `{ ok: true, status: "spawned" }`；最终结果通过最后一个
+callback 参数返回。需要签名的调用会在后台线程里按 `local/signer-request`
+重试 signer Iroh 请求，拿到签名后只 POST 一次 RGB daemon。
 
 | 函数 | 路由 / 说明 |
 | --- | --- |
-| `rgb::signed(payload)` | 对任意 payload 返回 `{ payload, signature }`。 |
-| `rgb::rna_balance()` | POST `/v1/rna/balance`。无参数。 |
-| `rgb::request_signature(payload)` | 直接通过 `/v1/signer/request-signature` 请求签名。 |
-| `rgb::asset_authorization(asset_id, amount, purpose, recipient, anchor_psbt, expires_at_ms)` | 直接请求 signer asset authorization。默认值用 `""`/`0`。 |
-| `rgb::request(route, payload)` | POST 任意 RGB daemon route。 |
-| `rgb::issue(ticker, name, precision, supply, allocation_outpoint)` | POST `/v1/assets/issue`。 |
-| `rgb::assets()` | 对默认账户 POST `/v1/assets/list`。 |
+| `rgb::signed(payload, callback)` | 对任意 payload 返回 `{ payload, signature }` 到 callback。 |
+| `rgb::rna_balance(callback)` | POST `/v1/rna/balance`，结果进 callback。 |
+| `rgb::request_signature(payload, callback)` | 直接通过 `/v1/signer/request-signature` 请求签名，结果进 callback。 |
+| `rgb::asset_authorization(asset_id, amount, purpose, recipient, anchor_psbt, expires_at_ms, callback)` | 直接请求 signer asset authorization。默认值用 `""`/`0`，结果进 callback。 |
+| `rgb::request(route, payload, callback)` | POST 任意 RGB daemon route，结果进 callback。 |
+| `rgb::issue(ticker, name, precision, supply, allocation_outpoint, callback)` | POST `/v1/assets/issue`，结果进 callback。 |
+| `rgb::assets(callback)` | 对默认账户 POST `/v1/assets/list`，结果进 callback。 |
 | `rgb::token_list()` | GET `/v1/tokens/list`；公开 token/contract 列表。 |
-| `rgb::balance(asset_id, scope)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`。 |
-| `rgb::balance_breakdown(asset_id)` | POST `/v1/balance/breakdown`。 |
-| `rgb::prepare_transfer(asset_id, amount, recipient, unsigned_anchor_psbt, change_vout, recipient_vout, fee_rate_sat_vb)` | 先请求 asset authorization，再 POST `/v1/transfers/prepare`。 |
-| `rgb::commit_transfer(asset_id, amount, transfer_id, txid, signed_anchor_psbt)` | 先请求 asset authorization，再 POST `/v1/transfers/commit`。 |
-| `rgb::pending()` | POST `/v1/pending/list`。 |
-| `rgb::recover(operation_id)` | POST `/v1/recover`。传 `""` 表示恢复所有 recoverable operation。 |
-| `rgb::test(scenario)` | POST `/v1/test/rgb`。传 `""` 表示 `full_rgb20_lifecycle`。 |
+| `rgb::balance(asset_id, scope, callback)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`，结果进 callback。 |
+| `rgb::balance_breakdown(asset_id, callback)` | POST `/v1/balance/breakdown`，结果进 callback。 |
+| `rgb::prepare_transfer(asset_id, amount, recipient, unsigned_anchor_psbt, change_vout, recipient_vout, fee_rate_sat_vb, callback)` | 先请求 asset authorization，再 POST `/v1/transfers/prepare`，结果进 callback。 |
+| `rgb::commit_transfer(asset_id, amount, transfer_id, txid, signed_anchor_psbt, callback)` | 先请求 asset authorization，再 POST `/v1/transfers/commit`，结果进 callback。 |
+| `rgb::test(scenario, callback)` | POST `/v1/test/rgb`。传 `""` 表示 `full_rgb20_lifecycle`，结果进 callback。 |
 
 示例：
 
 ```zs
-rgb::rna_balance()
+rgb::rna_balance(|result| {
+  root::add("local/rgb/rna_balance", result);
+  result
+})
 rgb::token_list()
-rgb::balance("...", "")
-rgb::prepare_transfer("...", 100, "receiver-account", unsigned_psbt, 1, 0, 1)
-rgb::commit_transfer("...", 100, transfer_id, txid, signed_psbt)
+rgb::balance("...", "", |result| {
+  root::add("local/rgb/balance", result);
+  result
+})
+rgb::prepare_transfer("...", 100, "receiver-account", unsigned_psbt, 1, 0, 1, |result| {
+  root::add("local/rgb/prepare_transfer", result);
+  result
+})
+rgb::commit_transfer("...", 100, transfer_id, txid, signed_psbt, |result| {
+  root::add("local/rgb/commit_transfer", result);
+  result
+})
 ```
 
 RGB consignment 的存储和传输由 `rgb-service-daemon` 负责，不在本地 console RGB
@@ -266,9 +285,7 @@ ln_rgb::start()
 | `ln_rgb::close_channel(channel_id, counterparty_node_id, force, reason)` | 关闭 BTC LN channel。`reason` 传 `""` 表示无 reason。 |
 | `ln_rgb::invoice(amount_msat, description, expiry_secs)` | 创建 BOLT11 invoice。默认值用 `""`/`0`。 |
 | `ln_rgb::pay(invoice)` | 支付 BOLT11 invoice 字符串。 |
-| `ln_rgb::token_list()` | 通过 LN RGB service client 调 RGB daemon token list。 |
 | `ln_rgb::get_info()` | 返回 RGB LN runtime 信息、余额、peer/channel 数量。 |
-| `ln_rgb::rgb_channel_context(contract_id, amount, outbound)` | 构造指定 contract/amount 的 RGB channel context。 |
 | `ln_rgb::open_rgb_channel(node_id, address, capacity_sat, push_msat, user_channel_id, contract_id, amount)` | 打开 RGB-funded channel。`address` 可传 `""`，`user_channel_id` 可传 `0` 使用默认值。 |
 | `ln_rgb::send_rgb_payment(recipient_node_id, amount_msat, payment_id, contract_id, amount)` | 发送 RGB spontaneous payment。`payment_id` 传 `""` 时自动生成。 |
 

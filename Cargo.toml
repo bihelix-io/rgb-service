@@ -37,7 +37,7 @@ baid64 = "=0.4.1"
 bitcoin = { version = "0.32.7", features = ["serde"] }
 bp-wallet = { version = "0.11.1-alpha.2" }
 chrono = "0.4.38"
-dynamic = { package = "zust-dynamic", version = "0.9.12" }
+dynamic = { package = "zust-dynamic", version = "0.9.16" }
 fjall = "3.1.4"
 indexmap = "2.4.0"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
@@ -51,7 +51,7 @@ serde_yaml = "0.9.19"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 toml = "0.8"
-vm = { package = "zust-vm", version = "0.9.66" }
+vm = { package = "zust-vm", version = "0.9.75" }
 
 rgb-aluvm = { version = "0.11.1-rc.3", path = "crates/rgb-aluvm" }
 rgb-api = { version = "0.11.1-rc.10", path = "crates/rgb-api" }

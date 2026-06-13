@@ -1,34 +1,24 @@
 // Minimal RGB service flow sketch for zust-console.
 // Fill real outpoints, PSBTs, and txids from the external BTC wallet side.
 
-let account_id = arg.btc_addr;
-let signer_id = "zust-console";
-
-let issue = rgb::issue({
-  signer_id: signer_id,
-  account_id: account_id,
-  ticker: "ZUSD",
-  name: "Zust Console USD",
-  precision: 2,
-  supply: 1000000,
-  allocation_outpoint: arg.allocation_outpoint,
+let issue = rgb::issue("ZUSD", "Zust Console USD", 2, 1000000, arg.allocation_outpoint, |result| {
+  root::add("local/rgb/flow/issue", result);
+  result
 });
 
-let assets = rgb::assets({
-  signer_id: signer_id,
-  account_id: account_id,
-  tracked_utxos: arg.tracked_utxos,
+let assets = rgb::assets(|result| {
+  root::add("local/rgb/flow/assets", result);
+  result
 });
 
-let daemon_test = rgb::test({
-  signer_id: signer_id,
-  account_id: account_id,
-  scenario: "full_rgb20_lifecycle",
+let daemon_test = rgb::test("full_rgb20_lifecycle", |result| {
+  root::add("local/rgb/flow/test", result);
+  result
 });
 
 {
   issue: issue,
   assets: assets,
   daemon_test: daemon_test,
-  ln: ln::status(),
+  ln: ln_rgb::status(),
 }

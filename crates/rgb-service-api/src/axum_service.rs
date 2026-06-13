@@ -47,8 +47,6 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         )
         .route("/v1/ln/recover", post(recover_ln))
         .route("/v1/transfers/cancel", post(cancel_transfer))
-        .route("/v1/pending/list", post(list_pending))
-        .route("/v1/recover", post(recover))
         .route("/v1/test/rgb", post(run_rgb_test))
         .with_state(state)
 }
@@ -128,9 +126,7 @@ async fn list_assets(
     Ok(Json(state.service.list_assets(req).await?))
 }
 
-async fn token_list(
-    State(state): State<ApiState>,
-) -> Result<Json<TokenListResponse>, HttpError> {
+async fn token_list(State(state): State<ApiState>) -> Result<Json<TokenListResponse>, HttpError> {
     Ok(Json(state.service.token_list().await?))
 }
 
@@ -212,22 +208,6 @@ async fn cancel_transfer(
 ) -> Result<Json<CancelTransferResponse>, HttpError> {
     let req = authorize(&state, Permission::CancelTransfer, req).await?;
     Ok(Json(state.service.cancel_transfer(req).await?))
-}
-
-async fn list_pending(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<ListPendingRequest>>,
-) -> Result<Json<ListPendingResponse>, HttpError> {
-    let req = authorize(&state, Permission::ManagePending, req).await?;
-    Ok(Json(state.service.list_pending(req).await?))
-}
-
-async fn recover(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<RecoverRequest>>,
-) -> Result<Json<RecoveryReport>, HttpError> {
-    let req = authorize(&state, Permission::Recover, req).await?;
-    Ok(Json(state.service.recover(req).await?))
 }
 
 async fn run_rgb_test(

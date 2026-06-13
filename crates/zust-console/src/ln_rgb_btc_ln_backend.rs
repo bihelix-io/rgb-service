@@ -2,11 +2,12 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi;
 use bdk_wallet::keys::bip39::{Language as BdkLanguage, Mnemonic as BdkMnemonic};
 use bdk_wallet::KeychainKind;
@@ -14,8 +15,9 @@ use bdk_wallet::SignOptions;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-use bitcoin::{Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use bitcoin::psbt::Psbt;
+use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
 use lightning::chain::chainmonitor::ChainMonitor;
 use lightning::chain::channelmonitor::{Balance, BalanceSource};
@@ -26,15 +28,18 @@ use lightning::ln::channelmanager::{
     ChainParameters, ChannelManagerReadArgs, PaymentId, RecipientOnionFields,
     SimpleArcChannelManager,
 };
+use lightning::ln::funding::{FundingTxInput, SpliceContribution};
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
 use lightning::ln::types::ChannelId as LnRgbChannelId;
 use lightning::onion_message::messenger::DefaultMessageRouter;
 use lightning::rgb::{
-    AssetSpendAuthorization, AssetSpendPurpose, LnChannelOpenPrepareRequest, RequestSignature,
-    RgbAssetAmount as LdkRgbAssetAmount, RgbChannelContext, RgbFundingRef,
-    RgbFundingTransfer as LdkRgbFundingTransfer, RgbPaymentMetadata, RgbServiceClient,
-    RgbServiceClientError, RgbServiceSigner,
+    init_rgb_ln_tx_composer, AssetSpendAuthorization, AssetSpendPurpose, BalanceRequest,
+    BalanceScope, ListAssetsRequest, ListAssetsResponse, LnChannelOpenPrepareRequest,
+    RequestSignature, RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext,
+    RgbDaemonLnTxComposer, RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer,
+    RgbLnTxComposer, RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner,
+    SignatureScheme, TrackedUtxo,
 };
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::router::{
@@ -67,8 +72,9 @@ use tokio::task::JoinHandle;
 
 use crate::btc_ln::{
     BtcLnBalanceSnapshot, BtcLnBolt11InvoiceRequest, BtcLnBolt11PaymentRequest,
-    BtcLnChannelCloseRequest, BtcLnChannelOpenRequest, BtcLnChannelSnapshot, BtcLnEvent,
-    BtcLnKeysendRequest, BtcLnNode, BtcLnPeerSnapshot, BtcLnRuntimeConfig,
+    BtcLnChannelCloseRequest, BtcLnChannelOpenRequest, BtcLnChannelSnapshot,
+    BtcLnChannelSpliceRequest, BtcLnEvent, BtcLnKeysendRequest, BtcLnNode, BtcLnPeerSnapshot,
+    BtcLnRuntimeConfig,
 };
 use crate::lnnode::{
     ChannelId, RgbAssetAmount, RgbChannelOpenRequest, RgbFundingTransfer, RgbLnNode,
@@ -226,6 +232,15 @@ struct GeneratedRgbFundingTransferRecord {
     funding_ref: RgbFundingRef,
     created_at: u64,
     updated_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedPeerRecord {
+    node_id: String,
+    address: String,
+    created_at: u64,
+    updated_at: u64,
+    last_connected_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -589,7 +604,10 @@ impl FeeEstimator for LnRgbFeeEstimator {
     }
 }
 
-struct BackendRgbServiceSigner;
+struct BackendRgbServiceSigner {
+    node_id: PublicKey,
+    node_secret: SecretKey,
+}
 
 impl RgbServiceSigner for BackendRgbServiceSigner {
     fn sign_rgb_service_payload(
@@ -597,16 +615,28 @@ impl RgbServiceSigner for BackendRgbServiceSigner {
         purpose: &str,
         payload: &[u8],
     ) -> std::result::Result<RequestSignature, RgbServiceClientError> {
-        let mut body: serde_json::Value = serde_json::from_slice(payload).map_err(|err| {
-            RgbServiceClientError::Compose(format!("decode LN RGB signer payload: {err}"))
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|err| {
+            RgbServiceClientError::Compose(format!("generate LN RGB authorization nonce: {err}"))
         })?;
-        if let serde_json::Value::Object(object) = &mut body {
-            object.insert("purpose".to_string(), json!(purpose));
-        }
-        let signature = crate::modules::request_signature("/v1/signer/request-signature", &body)
-            .map_err(|err| RgbServiceClientError::Compose(err.to_string()))?;
-        serde_json::from_value(signature).map_err(|err| {
-            RgbServiceClientError::Compose(format!("decode LN RGB signer response: {err}"))
+        let nonce = bytes_to_hex(&nonce);
+        let timestamp_ms = now_millis();
+        let mut engine = sha256::Hash::engine();
+        engine.input(b"bihelix-ln-rgb-auth-v1");
+        engine.input(purpose.as_bytes());
+        engine.input(nonce.as_bytes());
+        engine.input(&timestamp_ms.to_be_bytes());
+        engine.input(payload);
+        let message = Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array());
+        let secp = Secp256k1::new();
+        let signature = secp.sign_ecdsa(&message, &self.node_secret);
+        Ok(RequestSignature {
+            signer_id: self.node_id.to_string(),
+            public_key: self.node_id.to_string(),
+            scheme: SignatureScheme::Ecdsa,
+            nonce,
+            timestamp_ms,
+            signature: bytes_to_hex(&signature.serialize_der()),
         })
     }
 }
@@ -661,6 +691,50 @@ impl LnRgbBtcLnBackend {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.config.account_id
+    }
+
+    pub fn list_rgb_assets(&self, tracked_utxos: Vec<TrackedUtxo>) -> Result<ListAssetsResponse> {
+        let client = RgbServiceClient::new(
+            self.config.rgb_service_url.clone(),
+            Arc::new(BackendRgbServiceSigner {
+                node_id: self.node_id,
+                node_secret: self.node_secret,
+            }),
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        client
+            .list_assets(ListAssetsRequest {
+                account_id: self.config.account_id.clone(),
+                tracked_utxos,
+            })
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    pub fn rgb_balance(
+        &self,
+        asset_id: String,
+        tracked_utxos: Vec<TrackedUtxo>,
+    ) -> Result<RgbBalance> {
+        let client = RgbServiceClient::new(
+            self.config.rgb_service_url.clone(),
+            Arc::new(BackendRgbServiceSigner {
+                node_id: self.node_id,
+                node_secret: self.node_secret,
+            }),
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        client
+            .balance(BalanceRequest {
+                account_id: self.config.account_id.clone(),
+                asset_id,
+                scope: BalanceScope::All,
+                tracked_utxos,
+            })
+            .map_err(|err| anyhow!("{err}"))
     }
 
     fn esplora_urls(&self) -> Vec<String> {
@@ -937,6 +1011,53 @@ impl LnRgbBtcLnBackend {
         Ok(count)
     }
 
+    fn load_persisted_peers_from_disk(&self) -> Result<Vec<(PublicKey, SocketAddress)>> {
+        let dir = self.peer_record_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut peers = Vec::new();
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let record: PersistedPeerRecord = serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read peer record {}", path.display()))?,
+            )
+            .with_context(|| format!("decode peer record {}", path.display()))?;
+            let node_id = record
+                .node_id
+                .parse::<PublicKey>()
+                .with_context(|| format!("invalid peer node id in {}", path.display()))?;
+            let address = SocketAddress::from_str(&record.address)
+                .map_err(|_| anyhow!("invalid peer address in {}", path.display()))?;
+            peers.push((node_id, address));
+        }
+        Ok(peers)
+    }
+
+    fn persist_connected_peer(&self, node_id: PublicKey, address: &SocketAddress) -> Result<()> {
+        let path = self.peer_record_path(&node_id);
+        let now = now_secs();
+        let created_at = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedPeerRecord>(&bytes).ok())
+            .map(|record| record.created_at)
+            .unwrap_or(now);
+        let record = PersistedPeerRecord {
+            node_id: node_id.to_string(),
+            address: address.to_string(),
+            created_at,
+            updated_at: now,
+            last_connected_at: now,
+        };
+        ensure_parent_dir(&path)?;
+        fs::write(&path, serde_json::to_vec_pretty(&record)?)
+            .with_context(|| format!("save peer record {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn rgb_payment_states(&self) -> Result<Vec<RgbPaymentStateRecord>> {
         let dir = self.rgb_payment_state_dir();
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -1186,17 +1307,39 @@ impl LnRgbBtcLnBackend {
                     let expires_at_ms = now_secs().saturating_mul(1000).saturating_add(300_000);
                     let contract_id = asset.contract_id.to_string();
                     let purpose = AssetSpendPurpose::L2Reserve;
-                    let signature = crate::modules::request_signature(
-                        "/v1/signer/asset-authorization",
-                        &json!({
-                            "asset_id": contract_id,
-                            "amount": asset.amount,
-                            "purpose": purpose,
-                            "recipient": null,
-                            "anchor_psbt": unsigned_tx_hex,
-                            "expires_at_ms": expires_at_ms
-                        }),
-                    )?;
+                    let authorization_payload = json!({
+                        "asset_id": contract_id,
+                        "amount": asset.amount,
+                        "purpose": purpose,
+                        "recipient": null,
+                        "anchor_psbt": unsigned_tx_hex,
+                        "expires_at_ms": expires_at_ms
+                    });
+                    let mut nonce = [0u8; 16];
+                    getrandom::fill(&mut nonce)
+                        .context("generate LN RGB asset authorization nonce")?;
+                    let nonce = bytes_to_hex(&nonce);
+                    let timestamp_ms = now_millis();
+                    let authorization_payload_bytes = serde_json::to_vec(&authorization_payload)
+                        .context("encode LN RGB asset authorization payload")?;
+                    let mut engine = sha256::Hash::engine();
+                    engine.input(b"bihelix-ln-rgb-auth-v1");
+                    engine.input(b"l2_reserve");
+                    engine.input(nonce.as_bytes());
+                    engine.input(&timestamp_ms.to_be_bytes());
+                    engine.input(&authorization_payload_bytes);
+                    let message =
+                        Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array());
+                    let secp = Secp256k1::new();
+                    let signature = secp.sign_ecdsa(&message, &self.node_secret);
+                    let signature = RequestSignature {
+                        signer_id: self.node_id.to_string(),
+                        public_key: self.node_id.to_string(),
+                        scheme: SignatureScheme::Ecdsa,
+                        nonce,
+                        timestamp_ms,
+                        signature: bytes_to_hex(&signature.serialize_der()),
+                    };
                     let asset_authorization = AssetSpendAuthorization {
                         asset_id: contract_id.clone(),
                         amount: asset.amount,
@@ -1204,12 +1347,14 @@ impl LnRgbBtcLnBackend {
                         recipient: None,
                         anchor_psbt: Some(unsigned_tx_hex),
                         expires_at_ms,
-                        signature: serde_json::from_value(signature)
-                            .context("decode signer asset authorization signature")?,
+                        signature,
                     };
                     let client = RgbServiceClient::new(
                         self.config.rgb_service_url.clone(),
-                        Arc::new(BackendRgbServiceSigner),
+                        Arc::new(BackendRgbServiceSigner {
+                            node_id: self.node_id,
+                            node_secret: self.node_secret,
+                        }),
                     )
                     .map_err(|err| anyhow!("{err}"))?;
                     let channel = hex32(temporary_channel_id.0);
@@ -1278,6 +1423,66 @@ impl LnRgbBtcLnBackend {
                             "ln-rgb funding transaction generated: user_channel_id={user_channel_id} temporary_channel_id={temporary_channel_id} funding_outpoint={funding_outpoint} txid={txid}"
                         ));
                 }
+            }
+            Event::FundingTransactionReadyForSigning {
+                channel_id,
+                counterparty_node_id,
+                user_channel_id,
+                unsigned_transaction,
+            } => {
+                let txid = unsigned_transaction.compute_txid();
+                let signed_transaction =
+                    self.sign_interactive_funding_transaction(unsigned_transaction)?;
+                channel_manager
+                    .funding_transaction_signed(
+                        &channel_id,
+                        &counterparty_node_id,
+                        signed_transaction,
+                    )
+                    .map_err(|err| {
+                        anyhow!("LDK rejected signed splice funding transaction: {err:?}")
+                    })?;
+                self.events
+                    .lock()
+                    .expect("ln-rgb event lock poisoned")
+                    .push_back(format!(
+                        "ln-rgb interactive funding transaction signed: user_channel_id={user_channel_id} channel_id={channel_id} peer={counterparty_node_id} txid={txid}"
+                    ));
+            }
+            Event::SplicePending {
+                channel_id,
+                user_channel_id,
+                counterparty_node_id,
+                new_funding_txo,
+                ..
+            } => {
+                self.events
+                    .lock()
+                    .expect("ln-rgb event lock poisoned")
+                    .push_back(format!(
+                        "ln-rgb splice pending: user_channel_id={user_channel_id} channel_id={channel_id} peer={counterparty_node_id} new_funding_txo={new_funding_txo}"
+                    ));
+            }
+            Event::SpliceFailed {
+                channel_id,
+                user_channel_id,
+                counterparty_node_id,
+                abandoned_funding_txo,
+                contributed_inputs,
+                ..
+            } => {
+                self.events
+                    .lock()
+                    .expect("ln-rgb event lock poisoned")
+                    .push_back(format!(
+                        "ln-rgb splice failed: user_channel_id={user_channel_id} channel_id={channel_id} peer={counterparty_node_id} abandoned_funding_txo={abandoned_funding_txo:?} contributed_inputs={contributed_inputs:?}"
+                    ));
+            }
+            Event::DiscardFunding { channel_id, .. } => {
+                self.events
+                    .lock()
+                    .expect("ln-rgb event lock poisoned")
+                    .push_back(format!("ln-rgb discard funding: channel_id={channel_id}"));
             }
             Event::OpenChannelRequest {
                 temporary_channel_id,
@@ -1555,6 +1760,146 @@ impl LnRgbBtcLnBackend {
             local.persist()?;
             psbt.extract_tx()
                 .context("failed to extract LN funding transaction")
+        })
+    }
+
+    fn build_splice_in_contribution(
+        &self,
+        amount_sats: u64,
+        funding_feerate_per_kw: u32,
+    ) -> Result<SpliceContribution> {
+        self.retry_transient_esplora("select LN splice inputs", || {
+            let mut local = self.open_l1_wallet()?;
+            let esplora = self.next_esplora_url();
+            self.sync_l1_wallet_or_use_cached(&mut local, &esplora, "select LN splice inputs")?;
+            let client = esplora_client_with_config(&self.esplora_config(esplora));
+            let mut candidates = local
+                .wallet
+                .list_unspent()
+                .filter(|utxo| utxo.chain_position.is_confirmed())
+                .filter(|utxo| {
+                    utxo.txout.script_pubkey.is_p2wpkh() || utxo.txout.script_pubkey.is_p2tr()
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|utxo| utxo.txout.value.to_sat());
+
+            let fee_rate_sat_vb = u64::from(funding_feerate_per_kw)
+                .saturating_add(249)
+                .checked_div(250)
+                .unwrap_or(1)
+                .max(1);
+            let mut selected_sats = 0u64;
+            let mut inputs = Vec::new();
+            for utxo in candidates {
+                let outpoint = utxo.outpoint;
+                let prevtx = client
+                    .get_tx(&outpoint.txid)
+                    .with_context(|| format!("fetch splice input prevtx {outpoint}"))?
+                    .with_context(|| format!("splice input prevtx not found: {outpoint}"))?;
+                let input = if utxo.txout.script_pubkey.is_p2wpkh() {
+                    FundingTxInput::new_p2wpkh(prevtx, outpoint.vout)
+                } else {
+                    FundingTxInput::new_p2tr_key_spend(prevtx, outpoint.vout)
+                }
+                .map_err(|()| anyhow!("unsupported splice input script for {outpoint}"))?;
+                selected_sats = selected_sats.saturating_add(utxo.txout.value.to_sat());
+                inputs.push(input);
+
+                let estimated_vbytes = 250u64.saturating_add((inputs.len() as u64) * 110);
+                let required_sats =
+                    amount_sats.saturating_add(fee_rate_sat_vb.saturating_mul(estimated_vbytes));
+                if selected_sats >= required_sats {
+                    break;
+                }
+            }
+
+            let estimated_vbytes = 250u64.saturating_add((inputs.len() as u64) * 110);
+            let required_sats =
+                amount_sats.saturating_add(fee_rate_sat_vb.saturating_mul(estimated_vbytes));
+            ensure!(
+                selected_sats >= required_sats,
+                "insufficient confirmed P2WPKH/P2TR L1 funds for splice: need about {required_sats} sats, selected {selected_sats} sats"
+            );
+            let change_script = local
+                .wallet
+                .reveal_next_address(KeychainKind::Internal)
+                .address
+                .script_pubkey();
+            local.persist()?;
+            Ok(SpliceContribution::SpliceIn {
+                value: Amount::from_sat(amount_sats),
+                inputs,
+                change_script: Some(change_script),
+            })
+        })
+    }
+
+    fn build_splice_out_contribution(&self, amount_sats: u64) -> Result<SpliceContribution> {
+        let mut local = self.open_l1_wallet()?;
+        let address = local
+            .wallet
+            .reveal_next_address(KeychainKind::External)
+            .address;
+        let script_pubkey = address.script_pubkey();
+        local.persist()?;
+        Ok(SpliceContribution::SpliceOut {
+            outputs: vec![TxOut {
+                value: Amount::from_sat(amount_sats),
+                script_pubkey,
+            }],
+        })
+    }
+
+    fn sign_interactive_funding_transaction(
+        &self,
+        unsigned_transaction: Transaction,
+    ) -> Result<Transaction> {
+        self.retry_transient_esplora("sign LN interactive funding transaction", || {
+            let unsigned_txid = unsigned_transaction.compute_txid();
+            let mut local = self.open_l1_wallet()?;
+            let esplora = self.next_esplora_url();
+            self.sync_l1_wallet_or_use_cached(
+                &mut local,
+                &esplora,
+                "sign LN interactive funding transaction",
+            )?;
+            let known_utxos = local
+                .wallet
+                .list_unspent()
+                .map(|utxo| (utxo.outpoint, utxo.txout))
+                .collect::<HashMap<_, _>>();
+            let mut psbt = Psbt::from_unsigned_tx(unsigned_transaction.clone())
+                .context("build splice funding PSBT")?;
+            for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+                if let Some(txout) = known_utxos.get(&txin.previous_output) {
+                    psbt.inputs[index].witness_utxo = Some(txout.clone());
+                }
+            }
+            local
+                .wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        trust_witness_utxo: true,
+                        try_finalize: true,
+                        ..SignOptions::default()
+                    },
+                )
+                .context("sign LN interactive funding PSBT")?;
+            let signed_transaction = psbt.extract_tx_unchecked_fee_rate();
+            ensure!(
+                signed_transaction.compute_txid() == unsigned_txid,
+                "LDK interactive funding txid changed while signing"
+            );
+            ensure!(
+                signed_transaction
+                    .input
+                    .iter()
+                    .any(|input| !input.witness.is_empty()),
+                "BDK did not sign any local splice input"
+            );
+            local.persist()?;
+            Ok(signed_transaction)
         })
     }
 
@@ -2590,6 +2935,14 @@ impl LnRgbBtcLnBackend {
         self.config.storage_dir.join("ln-rgb").join("rgb-payments")
     }
 
+    fn peer_record_dir(&self) -> PathBuf {
+        self.config.storage_dir.join("ln-rgb").join("peers")
+    }
+
+    fn peer_record_path(&self, node_id: &PublicKey) -> PathBuf {
+        self.peer_record_dir().join(format!("{node_id}.json"))
+    }
+
     fn is_trusted_0conf_peer(&self, peer_node_id: &PublicKey) -> bool {
         self.config
             .trusted_peers_0conf
@@ -2667,111 +3020,6 @@ impl LnRgbBtcLnBackend {
                         .expect("ln-rgb event lock poisoned")
                         .push_back(format!(
                             "ln-rgb pending RGB funding transfer replay deferred: channel={channel_id} error={err:?}"
-                        ));
-                }
-            }
-        }
-        let payload = json!({
-            "account_id": self.config.account_id,
-            "channel_id": null
-        });
-        let mut sign_body = payload.clone();
-        if let serde_json::Value::Object(object) = &mut sign_body {
-            object.insert("purpose".to_string(), json!("ln_recover"));
-        }
-        let signature =
-            crate::modules::request_signature("/v1/signer/request-signature", &sign_body)?;
-        let url = format!(
-            "{}/v1/ln/recover",
-            self.config.rgb_service_url.trim_end_matches('/')
-        );
-        let body = serde_json::to_string(&json!({
-            "payload": payload,
-            "signature": signature
-        }))?;
-        let response = attohttpc::post(&url)
-            .header("content-type", "application/json")
-            .text(body)
-            .send()
-            .with_context(|| format!("POST {url}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .with_context(|| format!("read RGB daemon response from {url}"))?;
-        if !(200..300).contains(&status.as_u16()) {
-            bail!("RGB daemon LN recover failed with HTTP {status}: {body}");
-        }
-        let report: serde_json::Value =
-            serde_json::from_str(&body).context("decode RGB daemon LN recover response")?;
-        let channels = report
-            .get("channels")
-            .and_then(serde_json::Value::as_array)
-            .context("RGB daemon LN recover response missing channels")?;
-        let ldk_channels = runtime.channel_manager.list_channels();
-        for channel in channels {
-            let channel_id_hex = channel
-                .get("channel_id")
-                .and_then(serde_json::Value::as_str)
-                .context("RGB daemon recovered channel missing channel_id")?;
-            let funding_ref = channel
-                .get("funding_ref")
-                .cloned()
-                .context("RGB daemon recovered channel missing funding_ref")
-                .and_then(|value| {
-                    serde_json::from_value::<RgbFundingRef>(value)
-                        .context("decode RGB daemon recovered funding_ref")
-                })?;
-            let funding_outpoint = channel
-                .get("funding_outpoint")
-                .and_then(serde_json::Value::as_str)
-                .context("RGB daemon recovered channel missing funding_outpoint")?;
-            let channel_id = LnRgbChannelId(hex_to_32(channel_id_hex)?);
-            let peer_node_id = self
-                .rgb_funding_bindings
-                .lock()
-                .expect("rgb funding binding lock poisoned")
-                .values()
-                .find(|binding| {
-                    binding.channel_id.as_deref() == Some(channel_id_hex)
-                        || binding.temporary_channel_id == channel_id_hex
-                })
-                .and_then(|binding| binding.peer_node_id.parse::<PublicKey>().ok())
-                .or_else(|| {
-                    ldk_channels
-                        .iter()
-                        .find(|channel| {
-                            channel.channel_id == channel_id
-                                || channel.funding_txo.map(|outpoint| outpoint.to_string())
-                                    == Some(funding_outpoint.to_string())
-                        })
-                        .map(|channel| channel.counterparty.node_id)
-                });
-            let Some(peer_node_id) = peer_node_id else {
-                bail!(
-                    "missing local LN counterparty node id for recovered RGB channel {channel_id}"
-                );
-            };
-            match runtime
-                .channel_manager
-                .provide_funding_rgb_transfer_for_channel(
-                    channel_id,
-                    peer_node_id,
-                    ldk_rgb_funding_transfer(funding_ref),
-                ) {
-                Ok(()) => {
-                    runtime.peer_manager.process_events();
-                    Self::persist_channel_manager_to_store(
-                        &runtime.kv_store,
-                        &runtime.channel_manager,
-                    )?;
-                    replayed += 1;
-                }
-                Err(err) => {
-                    self.events
-                        .lock()
-                        .expect("ln-rgb event lock poisoned")
-                        .push_back(format!(
-                            "ln-rgb daemon RGB funding ref replay deferred: channel={channel_id} error={err:?}"
                         ));
                 }
             }
@@ -3412,6 +3660,20 @@ impl BtcLnNode for LnRgbBtcLnBackend {
         let loaded_payment_states = self
             .load_rgb_payment_states_from_disk()
             .context("load RGB payment states")?;
+        let persisted_peers = self
+            .load_persisted_peers_from_disk()
+            .context("load persisted LN peers")?;
+        let signer: Arc<dyn RgbServiceSigner + Send + Sync> = Arc::new(BackendRgbServiceSigner {
+            node_id: self.node_id,
+            node_secret: self.node_secret,
+        });
+        let client = RgbServiceClient::new(self.config.rgb_service_url.clone(), signer)
+            .map_err(|err| anyhow!("{err}"))?;
+        let composer: Arc<dyn RgbLnTxComposer + Send + Sync> = Arc::new(
+            RgbDaemonLnTxComposer::new(client, self.config.account_id.clone(), 300000)
+                .map_err(|err| anyhow!("{err}"))?,
+        );
+        init_rgb_ln_tx_composer(composer);
         let runtime = self.build_runtime()?;
         let replayed_rgb_funding = self
             .retry_pending_rgb_funding_recovery(&runtime)
@@ -3434,6 +3696,26 @@ impl BtcLnNode for LnRgbBtcLnBackend {
             .lock()
             .expect("ln-rgb event lock poisoned")
             .push_back("ln-rgb peer runtime started".to_string());
+        for (peer_node_id, address) in persisted_peers.iter().cloned() {
+            match self.connect(peer_node_id, address.clone(), true) {
+                Ok(()) => {
+                    self.events
+                        .lock()
+                        .expect("ln-rgb event lock poisoned")
+                        .push_back(format!(
+                            "ln-rgb persisted peer reconnected: {peer_node_id}@{address}"
+                        ));
+                }
+                Err(err) => {
+                    self.events
+                        .lock()
+                        .expect("ln-rgb event lock poisoned")
+                        .push_back(format!(
+                        "ln-rgb persisted peer reconnect failed: {peer_node_id}@{address}: {err:#}"
+                    ));
+                }
+            }
+        }
         if loaded_bindings > 0 {
             self.events
                 .lock()
@@ -3455,6 +3737,15 @@ impl BtcLnNode for LnRgbBtcLnBackend {
                 .expect("ln-rgb event lock poisoned")
                 .push_back(format!(
                     "ln-rgb durable RGB state loaded: pending_funding_txs={loaded_pending_funding_txs} pending_transfers={loaded_pending_rgb_transfers} generated_transfers={loaded_generated_transfers} payment_states={loaded_payment_states} replayed_funding={replayed_rgb_funding} replayed_bindings={replayed_rgb_bindings}"
+                ));
+        }
+        if !persisted_peers.is_empty() {
+            self.events
+                .lock()
+                .expect("ln-rgb event lock poisoned")
+                .push_back(format!(
+                    "ln-rgb persisted peers loaded: count={}",
+                    persisted_peers.len()
                 ));
         }
         Ok(())
@@ -3719,6 +4010,10 @@ impl BtcLnNode for LnRgbBtcLnBackend {
             peer_manager.process_events();
             std::thread::sleep(Duration::from_millis(25));
         }
+        if persist {
+            self.persist_connected_peer(node_id, &address)
+                .context("persist connected LN peer")?;
+        }
         self.peers
             .lock()
             .expect("ln-rgb peers lock poisoned")
@@ -3790,6 +4085,58 @@ impl BtcLnNode for LnRgbBtcLnBackend {
             .push_back(format!(
                 "ln-rgb channel close requested: channel_id={} peer={} force={}",
                 request.channel_id, request.counterparty_node_id, request.force
+            ));
+        Ok(())
+    }
+
+    fn splice_channel(&self, request: BtcLnChannelSpliceRequest) -> Result<()> {
+        ensure!(request.amount_sats != 0, "amount_sats must not be zero");
+        if !self.started.load(Ordering::SeqCst) {
+            self.start()?;
+        }
+        let channel_id = parse_channel_id(&request.channel_id)?;
+        let contribution = if request.amount_sats > 0 {
+            self.build_splice_in_contribution(
+                request.amount_sats as u64,
+                request.funding_feerate_per_kw,
+            )?
+        } else {
+            let amount_sats = request
+                .amount_sats
+                .checked_abs()
+                .and_then(|amount| u64::try_from(amount).ok())
+                .context("amount_sats is too small")?;
+            self.build_splice_out_contribution(amount_sats)?
+        };
+        let direction = if request.amount_sats > 0 { "in" } else { "out" };
+        let runtime_guard = self.runtime.lock().expect("ln-rgb runtime lock poisoned");
+        let runtime = runtime_guard
+            .as_ref()
+            .context("ln-rgb runtime did not start")?;
+        runtime
+            .channel_manager
+            .splice_channel(
+                &channel_id,
+                &request.counterparty_node_id,
+                contribution,
+                request.funding_feerate_per_kw,
+                request.locktime,
+            )
+            .map_err(|err| anyhow!("LDK splice-in failed: {err:?}"))?;
+        runtime.peer_manager.process_events();
+        Self::persist_channel_manager_to_store(&runtime.kv_store, &runtime.channel_manager)?;
+        drop(runtime_guard);
+        self.poll_ldk_events();
+        self.events
+            .lock()
+            .expect("ln-rgb event lock poisoned")
+            .push_back(format!(
+                "ln-rgb BTC splice-{direction} requested: channel_id={} peer={} amount_sats={} funding_feerate_per_kw={} locktime={:?}",
+                request.channel_id,
+                request.counterparty_node_id,
+                request.amount_sats,
+                request.funding_feerate_per_kw,
+                request.locktime
             ));
         Ok(())
     }
@@ -4217,6 +4564,13 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn now_nanos() -> u32 {

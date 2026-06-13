@@ -23,6 +23,15 @@ pub struct BtcLnChannelCloseRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct BtcLnChannelSpliceRequest {
+    pub channel_id: String,
+    pub counterparty_node_id: PublicKey,
+    pub amount_sats: i64,
+    pub funding_feerate_per_kw: u32,
+    pub locktime: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct BtcLnBolt11InvoiceRequest {
     pub amount_msat: u64,
     pub description: Bolt11InvoiceDescription,
@@ -149,6 +158,7 @@ pub trait BtcLnNode {
     fn connect(&self, node_id: PublicKey, address: SocketAddress, persist: bool) -> Result<()>;
     fn open_channel(&self, request: BtcLnChannelOpenRequest) -> Result<String>;
     fn close_channel(&self, request: BtcLnChannelCloseRequest) -> Result<()>;
+    fn splice_channel(&self, request: BtcLnChannelSpliceRequest) -> Result<()>;
     fn receive_bolt11(&self, request: BtcLnBolt11InvoiceRequest) -> Result<Bolt11Invoice>;
     fn pay_bolt11(&self, request: BtcLnBolt11PaymentRequest) -> Result<String>;
     fn send_keysend(&self, request: BtcLnKeysendRequest) -> Result<String>;
@@ -216,6 +226,10 @@ where
 
     fn close_channel(&self, request: BtcLnChannelCloseRequest) -> Result<()> {
         (**self).close_channel(request)
+    }
+
+    fn splice_channel(&self, request: BtcLnChannelSpliceRequest) -> Result<()> {
+        (**self).splice_channel(request)
     }
 
     fn receive_bolt11(&self, request: BtcLnBolt11InvoiceRequest) -> Result<Bolt11Invoice> {
@@ -293,6 +307,10 @@ where
 
     fn close_channel(&self, request: BtcLnChannelCloseRequest) -> Result<()> {
         (**self).close_channel(request)
+    }
+
+    fn splice_channel(&self, request: BtcLnChannelSpliceRequest) -> Result<()> {
+        (**self).splice_channel(request)
     }
 
     fn receive_bolt11(&self, request: BtcLnBolt11InvoiceRequest) -> Result<Bolt11Invoice> {

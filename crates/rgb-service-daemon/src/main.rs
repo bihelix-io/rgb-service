@@ -7,13 +7,15 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use axum::serve;
 use bitcoin::{
     consensus::{deserialize, serialize},
+    hashes::{sha256, Hash, HashEngine},
+    secp256k1::{ecdsa, Message, PublicKey, Secp256k1},
     OutPoint, Psbt, Transaction, Txid,
 };
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson};
@@ -30,7 +32,7 @@ use rgb_service_api::{
     PrepareTransferResponse, RecoverRequest, RecoveryAction, RecoveryReport, RequestSignature,
     RgbAllocation, RgbAssetInfo, RgbBalance, RgbContractInfo, RgbFundingRef, RgbServiceApi,
     RgbServiceError, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest,
-    RunRgbTestResponse, TokenListResponse, TrackedUtxo,
+    RunRgbTestResponse, SignatureScheme, TokenListResponse, TrackedUtxo,
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, encode_fascia_bytes, issue_rgb20_fixed_with_chain_source,
@@ -54,6 +56,8 @@ struct ServiceConfig {
     network: String,
     data_dir: PathBuf,
     esplora_url: String,
+    #[serde(default)]
+    recovery_scan_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = config.service.bind;
     let service = Arc::new(LocalDaemonService::new(config).await?);
+    spawn_recovery_scanner(Arc::clone(&service));
     let auth = Arc::new(ConfiguredAuthVerifier);
     let app = router(service, auth);
     let listener = TcpListener::bind(bind).await?;
@@ -128,20 +133,85 @@ fn load_config(path: &str) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
+fn spawn_recovery_scanner(service: Arc<LocalDaemonService>) {
+    let Some(interval_secs) = service.config.recovery_scan_interval_secs.or(Some(60)) else {
+        return;
+    };
+    if interval_secs == 0 {
+        service
+            .logger
+            .info("rgb pending recovery scanner disabled by config");
+        return;
+    }
+    service.logger.info(format!(
+        "rgb pending recovery scanner enabled interval_secs={interval_secs}"
+    ));
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(interval_secs);
+        loop {
+            let service_for_scan = Arc::clone(&service);
+            match tokio::task::spawn_blocking(move || service_for_scan.scan_pending_rgb_stocks())
+                .await
+            {
+                Ok(Ok(report)) => {
+                    if report.scanned > 0
+                        || report.promoted > 0
+                        || report.pending > 0
+                        || report.failed > 0
+                    {
+                        service.logger.info(format!(
+                            "rgb pending recovery scan accounts={} scanned={} promoted={} pending={} skipped={} failed={}",
+                            report.accounts,
+                            report.scanned,
+                            report.promoted,
+                            report.pending,
+                            report.skipped,
+                            report.failed
+                        ));
+                    }
+                }
+                Ok(Err(err)) => service
+                    .logger
+                    .info(format!("rgb pending recovery scan failed: {err}")),
+                Err(err) => service
+                    .logger
+                    .info(format!("rgb pending recovery scanner task failed: {err}")),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+const SIGNATURE_DOMAIN: &[u8] = b"bihelix-ln-rgb-auth-v1";
+const REQUEST_SIGNATURE_MAX_AGE_MS: u64 = 5 * 60 * 1000;
+const REQUEST_SIGNATURE_FUTURE_SKEW_MS: u64 = 60 * 1000;
+
 struct ConfiguredAuthVerifier;
 
-#[async_trait]
-impl AuthVerifier for ConfiguredAuthVerifier {
-    async fn verify_request(
-        &self,
-        permission: Permission,
-        account_id: &str,
-        _payload: &[u8],
+#[derive(Serialize)]
+struct UnsignedAssetSpendAuthorizationRef<'a> {
+    asset_id: &'a str,
+    amount: u64,
+    purpose: &'a rgb_service_api::AssetSpendPurpose,
+    recipient: &'a Option<String>,
+    anchor_psbt: &'a Option<String>,
+    expires_at_ms: u64,
+}
+
+impl ConfiguredAuthVerifier {
+    fn verify_ecdsa_signature(
+        purpose: &str,
+        payload: &[u8],
         signature: &RequestSignature,
-    ) -> rgb_service_api::Result<AuthSubject> {
-        if account_id.trim().is_empty() {
+    ) -> rgb_service_api::Result<()> {
+        if signature.public_key.trim().is_empty() {
             return Err(RgbServiceError::Unauthorized(
-                "account_id must not be empty".to_string(),
+                "request signature public_key must not be empty".to_string(),
+            ));
+        }
+        if signature.nonce.trim().is_empty() {
+            return Err(RgbServiceError::Unauthorized(
+                "request signature nonce must not be empty".to_string(),
             ));
         }
         if signature.signature.trim().is_empty() {
@@ -149,6 +219,148 @@ impl AuthVerifier for ConfiguredAuthVerifier {
                 "request signature must not be empty".to_string(),
             ));
         }
+        Self::verify_signature_timestamp(signature.timestamp_ms)?;
+
+        let public_key = PublicKey::from_str(&signature.public_key).map_err(|err| {
+            RgbServiceError::Unauthorized(format!("invalid request signature public_key: {err}"))
+        })?;
+        let signature_bytes = hex_decode(&signature.signature).map_err(|err| {
+            RgbServiceError::Unauthorized(format!("invalid request signature hex: {err}"))
+        })?;
+        let ecdsa_signature = ecdsa::Signature::from_der(&signature_bytes).map_err(|err| {
+            RgbServiceError::Unauthorized(format!("invalid request ECDSA signature: {err}"))
+        })?;
+        let message = Self::signature_message(
+            purpose,
+            payload,
+            signature.nonce.as_str(),
+            signature.timestamp_ms,
+        );
+        Secp256k1::verification_only()
+            .verify_ecdsa(&message, &ecdsa_signature, &public_key)
+            .map_err(|err| {
+                RgbServiceError::Unauthorized(format!("invalid request signature: {err}"))
+            })
+    }
+
+    fn verify_signature_timestamp(timestamp_ms: u64) -> rgb_service_api::Result<()> {
+        let now = now_ms();
+        if timestamp_ms > now.saturating_add(REQUEST_SIGNATURE_FUTURE_SKEW_MS) {
+            return Err(RgbServiceError::Unauthorized(
+                "request signature timestamp is too far in the future".to_string(),
+            ));
+        }
+        if now.saturating_sub(timestamp_ms) > REQUEST_SIGNATURE_MAX_AGE_MS {
+            return Err(RgbServiceError::Unauthorized(
+                "request signature has expired".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn signature_message(purpose: &str, payload: &[u8], nonce: &str, timestamp_ms: u64) -> Message {
+        let mut engine = sha256::Hash::engine();
+        engine.input(SIGNATURE_DOMAIN);
+        engine.input(purpose.as_bytes());
+        engine.input(nonce.as_bytes());
+        engine.input(&timestamp_ms.to_be_bytes());
+        engine.input(payload);
+        Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array())
+    }
+
+    fn permission_purposes(permission: &Permission) -> &'static [&'static str] {
+        match permission {
+            Permission::ReadRnaBalance => &["read_rna_balance", "rna_balance"],
+            Permission::ReadAssets => {
+                &["read_assets", "list_assets", "balance", "balance_breakdown"]
+            }
+            Permission::IssueAsset => &["issue_asset"],
+            Permission::PrepareTransfer => &["prepare_transfer"],
+            Permission::CommitTransfer => &["commit_transfer"],
+            Permission::LnChannelOpenPrepare => &["ln_channel_open_prepare"],
+            Permission::LnCommitmentCompose => &["ln_commitment_compose"],
+            Permission::LnClosingCompose => &["ln_closing_compose"],
+            Permission::LnOnchainClaimCompose => &["ln_onchain_claim_compose"],
+            Permission::LnRecover => &["ln_recover"],
+            Permission::CancelTransfer => &["cancel_transfer"],
+            Permission::ManagePending => &["manage_pending", "list_pending"],
+            Permission::Recover => &["recover"],
+            Permission::RunTest => &["run_test", "run_rgb_test"],
+            Permission::L2Reserve => &["l2_reserve"],
+            Permission::L2Settle => &["l2_settle"],
+            Permission::Admin => &["admin"],
+        }
+    }
+
+    fn verify_request_signature(
+        account_id: &str,
+        permission: &Permission,
+        payload: &[u8],
+        signature: &RequestSignature,
+    ) -> rgb_service_api::Result<()> {
+        match signature.scheme {
+            SignatureScheme::Ecdsa => {
+                let mut last_error = None;
+                for purpose in Self::permission_purposes(permission) {
+                    match Self::verify_ecdsa_signature(purpose, payload, signature) {
+                        Ok(()) => return Ok(()),
+                        Err(err) => last_error = Some(err),
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    RgbServiceError::Unauthorized(
+                        "request signature purpose did not match permission".to_string(),
+                    )
+                }))
+            }
+            SignatureScheme::Bip322 => Self::verify_legacy_signer_app_bip322(account_id, signature),
+            SignatureScheme::Schnorr | SignatureScheme::Ed25519 => {
+                Err(RgbServiceError::Unauthorized(format!(
+                    "unsupported request signature scheme: {:?}",
+                    signature.scheme
+                )))
+            }
+        }
+    }
+
+    fn verify_legacy_signer_app_bip322(
+        account_id: &str,
+        signature: &RequestSignature,
+    ) -> rgb_service_api::Result<()> {
+        if signature.signer_id != account_id {
+            return Err(RgbServiceError::Unauthorized(
+                "BIP322 signer_id must match account_id".to_string(),
+            ));
+        }
+        if signature.signature.trim().is_empty() {
+            return Err(RgbServiceError::SignatureRequired(
+                "BIP322 request signature must not be empty".to_string(),
+            ));
+        }
+        if signature.nonce.trim().is_empty() {
+            return Err(RgbServiceError::Unauthorized(
+                "BIP322 request signature nonce must not be empty".to_string(),
+            ));
+        }
+        Self::verify_signature_timestamp(signature.timestamp_ms)
+    }
+}
+
+#[async_trait]
+impl AuthVerifier for ConfiguredAuthVerifier {
+    async fn verify_request(
+        &self,
+        permission: Permission,
+        account_id: &str,
+        payload: &[u8],
+        signature: &RequestSignature,
+    ) -> rgb_service_api::Result<AuthSubject> {
+        if account_id.trim().is_empty() {
+            return Err(RgbServiceError::Unauthorized(
+                "account_id must not be empty".to_string(),
+            ));
+        }
+        Self::verify_request_signature(account_id, &permission, payload, signature)?;
         Ok(AuthSubject {
             account_id: account_id.to_string(),
             signer_id: signature.signer_id.clone(),
@@ -161,12 +373,35 @@ impl AuthVerifier for ConfiguredAuthVerifier {
         _account_id: &str,
         authorization: &AssetSpendAuthorization,
     ) -> rgb_service_api::Result<()> {
-        if authorization.signature.signature.trim().is_empty() {
-            return Err(RgbServiceError::AssetSpendAuthorizationRequired(
-                "asset spend signature must not be empty".to_string(),
+        if authorization.expires_at_ms < now_ms() {
+            return Err(RgbServiceError::Unauthorized(
+                "asset spend authorization has expired".to_string(),
             ));
         }
-        Ok(())
+        let unsigned_payload = UnsignedAssetSpendAuthorizationRef {
+            asset_id: &authorization.asset_id,
+            amount: authorization.amount,
+            purpose: &authorization.purpose,
+            recipient: &authorization.recipient,
+            anchor_psbt: &authorization.anchor_psbt,
+            expires_at_ms: authorization.expires_at_ms,
+        };
+        let payload = serde_json::to_vec(&unsigned_payload)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        match authorization.signature.scheme {
+            SignatureScheme::Ecdsa => {
+                Self::verify_ecdsa_signature("asset_spend", &payload, &authorization.signature)
+            }
+            SignatureScheme::Bip322 => {
+                Self::verify_legacy_signer_app_bip322(_account_id, &authorization.signature)
+            }
+            SignatureScheme::Schnorr | SignatureScheme::Ed25519 => {
+                Err(RgbServiceError::AssetSpendAuthorizationRequired(format!(
+                    "unsupported asset spend signature scheme: {:?}",
+                    authorization.signature.scheme
+                )))
+            }
+        }
     }
 }
 
@@ -175,6 +410,16 @@ struct LocalDaemonService {
     rna: RnaConfig,
     db: SingleWriterTxDatabase,
     logger: DaemonLogger,
+}
+
+#[derive(Default)]
+struct RecoveryScanSummary {
+    accounts: usize,
+    scanned: usize,
+    promoted: usize,
+    pending: usize,
+    skipped: usize,
+    failed: usize,
 }
 
 #[derive(Clone)]
@@ -300,8 +545,8 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(format!("read accounts dir: {err}")))?;
         let mut dirs = Vec::new();
         for entry in entries {
-            let entry =
-                entry.map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
+            let entry = entry
+                .map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
             let path = entry.path().join("rgb-stock");
             if path.exists() {
                 dirs.push(path);
@@ -311,12 +556,43 @@ impl LocalDaemonService {
     }
 
     fn network(&self) -> rgb_service_api::Result<bitcoin::Network> {
-        bitcoin::Network::from_str(&self.config.network)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("invalid network: {err}")))
+        parse_network(&self.config.network)
     }
 
     fn chain_source(&self) -> ChainSource {
         ChainSource::Esplora(EsploraConfig::new(self.config.esplora_url.clone()))
+    }
+
+    fn scan_pending_rgb_stocks(&self) -> rgb_service_api::Result<RecoveryScanSummary> {
+        let network = self.network()?;
+        let esplora_urls = std::slice::from_ref(&self.config.esplora_url);
+        let mut summary = RecoveryScanSummary::default();
+        for stock_dir in self.account_stock_dirs()? {
+            summary.accounts += 1;
+            match scan_and_promote_confirmed_staged_rgb_stocks(&stock_dir, network, esplora_urls) {
+                Ok(report) => {
+                    summary.scanned += report.scanned;
+                    summary.promoted += report.promoted;
+                    summary.pending += report.pending;
+                    summary.skipped += report.skipped;
+                    if report.promoted > 0 {
+                        self.logger.info(format!(
+                            "rgb pending recovery promoted stock_dir={} txids={:?}",
+                            stock_dir.display(),
+                            report.promoted_txids
+                        ));
+                    }
+                }
+                Err(err) => {
+                    summary.failed += 1;
+                    self.logger.info(format!(
+                        "rgb pending recovery scan account failed stock_dir={} error={err:#}",
+                        stock_dir.display()
+                    ));
+                }
+            }
+        }
+        Ok(summary)
     }
 
     fn tracked_utxos(
@@ -767,6 +1043,84 @@ impl LocalDaemonService {
         ));
         Ok(new_balance)
     }
+
+    fn refund_rna(
+        &self,
+        account_id: &str,
+        route: &str,
+        purpose: &str,
+        amount: u64,
+        reason: &str,
+    ) -> rgb_service_api::Result<u64> {
+        let now = now_ms();
+        let profile_keyspace = self
+            .db
+            .keyspace("profiles", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let logs_keyspace = self
+            .db
+            .keyspace("usage_logs", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut profile = self.load_profile(account_id)?.ok_or_else(|| {
+            RgbServiceError::Backend(format!(
+                "profile missing for RNA refund account_id={account_id}"
+            ))
+        })?;
+        let current = Self::profile_rna_balance(&profile)?;
+        let new_balance = current
+            .checked_add(amount)
+            .ok_or_else(|| RgbServiceError::Backend("RNA balance overflow".to_string()))?;
+        profile["rna_balance"] = json!(new_balance);
+        profile["updated_at_ms"] = json!(now);
+        let event_id = format!("{now}:{account_id}:{purpose}:refund");
+        let event = json!({
+            "event_id": event_id,
+            "account_id": account_id,
+            "kind": "refund",
+            "route": route,
+            "purpose": purpose,
+            "amount": amount,
+            "balance_before": current,
+            "balance_after": new_balance,
+            "reason": reason,
+            "created_at_ms": now
+        });
+        let profile_bytes = dynamic_to_msgpack(&json_value_to_dynamic(&profile)?);
+        let event_bytes =
+            serde_json::to_vec(&event).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&profile_keyspace, account_id.as_bytes(), profile_bytes);
+        tx.insert(&logs_keyspace, event_id.as_bytes(), event_bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.logger.info(format!(
+            "rna refund account_id={account_id} purpose={purpose} amount={amount} balance_after={new_balance} reason={reason}"
+        ));
+        Ok(new_balance)
+    }
+
+    fn refund_rna_on_error<T>(
+        &self,
+        result: rgb_service_api::Result<T>,
+        account_id: &str,
+        route: &str,
+        purpose: &str,
+        amount: u64,
+    ) -> rgb_service_api::Result<T> {
+        if let Err(err) = &result {
+            if let Err(refund_err) =
+                self.refund_rna(account_id, route, purpose, amount, &err.to_string())
+            {
+                self.logger.info(format!(
+                    "rna refund failed account_id={account_id} purpose={purpose} amount={amount} error={refund_err}"
+                ));
+            }
+        }
+        result
+    }
 }
 
 #[async_trait]
@@ -790,33 +1144,47 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<IssueAssetRequest>,
     ) -> rgb_service_api::Result<IssueAssetResponse> {
-        self.charge_rna(
-            &req.payload.account_id,
-            "/v1/assets/issue",
-            "issue_asset",
-            self.rna.issue_fee,
-        )?;
-        let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let outpoint = OutPoint::from_str(&req.payload.allocation_outpoint)
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let issued = issue_rgb20_fixed_with_chain_source(
-            &stock_dir,
-            self.network()?,
-            &self.chain_source(),
-            Rgb20IssueRequest {
-                ticker: req.payload.ticker,
-                name: req.payload.name,
-                amount: req.payload.supply,
-                precision: req.payload.precision,
-                utxo: outpoint,
-            },
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        Ok(IssueAssetResponse {
-            contract_id: issued.contract_id.to_string(),
-            asset_id: issued.contract_id.to_string(),
-            allocation_outpoint: issued.utxo.to_string(),
-        })
+        let route = "/v1/assets/issue";
+        let purpose = "issue_asset";
+        let amount = self.rna.issue_fee;
+        let payload = req.payload;
+        let account_id = payload.account_id.clone();
+        let ticker = payload.ticker.clone();
+        let allocation_outpoint = payload.allocation_outpoint.clone();
+        self.charge_rna(&account_id, route, purpose, amount)?;
+        let result = (|| {
+            let stock_dir = self.account_stock_dir(&account_id);
+            let outpoint = OutPoint::from_str(&payload.allocation_outpoint)
+                .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+            let issued = issue_rgb20_fixed_with_chain_source(
+                &stock_dir,
+                self.network()?,
+                &self.chain_source(),
+                Rgb20IssueRequest {
+                    ticker: payload.ticker,
+                    name: payload.name,
+                    amount: payload.supply,
+                    precision: payload.precision,
+                    utxo: outpoint,
+                },
+            )
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            Ok(IssueAssetResponse {
+                contract_id: issued.contract_id.to_string(),
+                asset_id: issued.contract_id.to_string(),
+                allocation_outpoint: issued.utxo.to_string(),
+            })
+        })();
+        match &result {
+            Ok(response) => self.logger.info(format!(
+                "rgb issue success account_id={account_id} ticker={ticker} allocation_outpoint={allocation_outpoint} contract_id={}",
+                response.contract_id
+            )),
+            Err(err) => self.logger.info(format!(
+                "rgb issue failed account_id={account_id} ticker={ticker} allocation_outpoint={allocation_outpoint} error={err}"
+            )),
+        }
+        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn list_assets(
@@ -948,65 +1316,67 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<PrepareTransferRequest>,
     ) -> rgb_service_api::Result<PrepareTransferResponse> {
-        if req.payload.recipient.trim().is_empty() {
+        let route = "/v1/transfers/prepare";
+        let purpose = "prepare_transfer";
+        let amount = self.rna.transfer_fee;
+        let payload = req.payload;
+        let account_id = payload.account_id.clone();
+        if payload.recipient.trim().is_empty() {
             return Err(RgbServiceError::InvalidRequest(
                 "recipient account_id must not be empty".to_string(),
             ));
         }
-        self.charge_rna(
-            &req.payload.account_id,
-            "/v1/transfers/prepare",
-            "prepare_transfer",
-            self.rna.transfer_fee,
-        )?;
-        let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let psbt = req
-            .payload
-            .unsigned_anchor_psbt
-            .as_deref()
-            .ok_or_else(|| {
-                RgbServiceError::InvalidRequest(
-                    "unsigned_anchor_psbt is required for prepare_transfer".to_string(),
-                )
-            })
-            .and_then(|value| {
-                Psbt::deserialize(&hex_decode(value)?)
-                    .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))
+        self.charge_rna(&account_id, route, purpose, amount)?;
+        let result = (|| {
+            let stock_dir = self.account_stock_dir(&account_id);
+            let psbt = payload
+                .unsigned_anchor_psbt
+                .as_deref()
+                .ok_or_else(|| {
+                    RgbServiceError::InvalidRequest(
+                        "unsigned_anchor_psbt is required for prepare_transfer".to_string(),
+                    )
+                })
+                .and_then(|value| {
+                    Psbt::deserialize(&hex_decode(value)?)
+                        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))
+                })?;
+            let change_vout = payload.change_vout.ok_or_else(|| {
+                RgbServiceError::InvalidRequest("change_vout is required".to_string())
             })?;
-        let change_vout = req.payload.change_vout.ok_or_else(|| {
-            RgbServiceError::InvalidRequest("change_vout is required".to_string())
-        })?;
-        let recipient_vout = req.payload.recipient_vout.ok_or_else(|| {
-            RgbServiceError::InvalidRequest("recipient_vout is required".to_string())
-        })?;
-        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&req.payload.asset_id)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
-        let prepared = prepare_rgb20_psbt(
-            &stock_dir,
-            psbt,
-            change_vout,
-            [Rgb20PsbtAssignment {
-                contract_id,
-                amount: req.payload.amount,
-                vout: recipient_vout,
-            }],
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let fascia = encode_fascia_bytes(&prepared.fascia)
+            let recipient_vout = payload.recipient_vout.ok_or_else(|| {
+                RgbServiceError::InvalidRequest("recipient_vout is required".to_string())
+            })?;
+            let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&payload.asset_id)
+                .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+            let prepared = prepare_rgb20_psbt(
+                &stock_dir,
+                psbt,
+                change_vout,
+                [Rgb20PsbtAssignment {
+                    contract_id,
+                    amount: payload.amount,
+                    vout: recipient_vout,
+                }],
+            )
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let transfer_id = req.payload.asset_authorization.signature.nonce;
-        let record = PreparedTransferRecord {
-            asset_id: req.payload.asset_id.clone(),
-            recipient_account_id: req.payload.recipient.clone(),
-            recipient_vout,
-            fascia,
-        };
-        self.put_prepared_transfer(&req.payload.account_id, &transfer_id, &record)?;
-        Ok(PrepareTransferResponse {
-            transfer_id,
-            operation_id: "prepare_transfer".to_string(),
-            anchor_psbt: Some(hex_encode(&prepared.psbt.serialize())),
-        })
+            let fascia = encode_fascia_bytes(&prepared.fascia)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            let transfer_id = payload.asset_authorization.signature.nonce;
+            let record = PreparedTransferRecord {
+                asset_id: payload.asset_id.clone(),
+                recipient_account_id: payload.recipient.clone(),
+                recipient_vout,
+                fascia,
+            };
+            self.put_prepared_transfer(&account_id, &transfer_id, &record)?;
+            Ok(PrepareTransferResponse {
+                transfer_id,
+                operation_id: "prepare_transfer".to_string(),
+                anchor_psbt: Some(hex_encode(&prepared.psbt.serialize())),
+            })
+        })();
+        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn commit_transfer(
@@ -1092,56 +1462,59 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnChannelOpenPrepareRequest>,
     ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
-        if req.payload.channel_id.trim().is_empty() {
+        let route = "/v1/ln/channels/open/prepare";
+        let purpose = "ln_channel_open_prepare";
+        let amount = self.rna.transfer_fee;
+        let payload = req.payload;
+        let account_id = payload.account_id.clone();
+        if payload.channel_id.trim().is_empty() {
             return Err(RgbServiceError::InvalidRequest(
                 "channel_id must not be empty".to_string(),
             ));
         }
-        if req.payload.contract_id.trim().is_empty() {
+        if payload.contract_id.trim().is_empty() {
             return Err(RgbServiceError::InvalidRequest(
                 "contract_id must not be empty".to_string(),
             ));
         }
-        OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
+        OutPoint::from_str(&payload.funding_outpoint).map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
         })?;
-        if req.payload.to_local_rgb + req.payload.to_remote_rgb != req.payload.funding_rgb {
+        if payload.to_local_rgb + payload.to_remote_rgb != payload.funding_rgb {
             return Err(RgbServiceError::InvalidRequest(
                 "to_local_rgb + to_remote_rgb must equal funding_rgb".to_string(),
             ));
         }
         Self::validate_ln_asset_authorization(
-            &req.payload.contract_id,
-            req.payload.funding_rgb,
-            &req.payload.asset_authorization,
+            &payload.contract_id,
+            payload.funding_rgb,
+            &payload.asset_authorization,
         )?;
-        self.charge_rna(
-            &req.payload.account_id,
-            "/v1/ln/channels/open/prepare",
-            "ln_channel_open_prepare",
-            self.rna.transfer_fee,
-        )?;
-        let operation_id = Self::require_nonce(&req.payload.asset_authorization)?;
-        let funding_ref = RgbFundingRef {
-            transfer_id: format!("ln-open:{operation_id}"),
-            operation_id: operation_id.clone(),
-            channel_id: Some(req.payload.channel_id.clone()),
-        };
-        self.put_ln_channel_record(&LnChannelRecord {
-            account_id: req.payload.account_id,
-            channel_id: req.payload.channel_id,
-            contract_id: req.payload.contract_id,
-            funding_outpoint: req.payload.funding_outpoint,
-            funding_rgb: req.payload.funding_rgb,
-            to_local_rgb: req.payload.to_local_rgb,
-            to_remote_rgb: req.payload.to_remote_rgb,
-            funding_ref: funding_ref.clone(),
-            created_at_ms: now_ms(),
-        })?;
-        Ok(LnChannelOpenPrepareResponse {
-            funding_ref,
-            operation_id,
-        })
+        self.charge_rna(&account_id, route, purpose, amount)?;
+        let result = (|| {
+            let operation_id = Self::require_nonce(&payload.asset_authorization)?;
+            let funding_ref = RgbFundingRef {
+                transfer_id: format!("ln-open:{operation_id}"),
+                operation_id: operation_id.clone(),
+                channel_id: Some(payload.channel_id.clone()),
+            };
+            self.put_ln_channel_record(&LnChannelRecord {
+                account_id: payload.account_id,
+                channel_id: payload.channel_id,
+                contract_id: payload.contract_id,
+                funding_outpoint: payload.funding_outpoint,
+                funding_rgb: payload.funding_rgb,
+                to_local_rgb: payload.to_local_rgb,
+                to_remote_rgb: payload.to_remote_rgb,
+                funding_ref: funding_ref.clone(),
+                created_at_ms: now_ms(),
+            })?;
+            Ok(LnChannelOpenPrepareResponse {
+                funding_ref,
+                operation_id,
+            })
+        })();
+        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn compose_ln_commitment(
@@ -1419,6 +1792,15 @@ fn test_step(name: &str) -> RgbTestStep {
     }
 }
 
+fn parse_network(value: &str) -> rgb_service_api::Result<bitcoin::Network> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "mainnet" => Ok(bitcoin::Network::Bitcoin),
+        network => bitcoin::Network::from_str(network)
+            .map_err(|err| RgbServiceError::InvalidRequest(format!("invalid network: {err}"))),
+    }
+}
+
 fn parse_contract_id(
     value: &str,
 ) -> rgb_service_api::Result<rgb_service_local::rgbstd::ContractId> {
@@ -1462,4 +1844,90 @@ fn hex_decode(value: &str) -> rgb_service_api::Result<Vec<u8>> {
                 .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::SecretKey;
+
+    #[test]
+    fn parse_network_accepts_mainnet_alias() {
+        assert_eq!(parse_network("mainnet").unwrap(), bitcoin::Network::Bitcoin);
+    }
+
+    #[test]
+    fn parse_network_accepts_bitcoin_network_name() {
+        assert_eq!(parse_network("bitcoin").unwrap(), bitcoin::Network::Bitcoin);
+    }
+
+    #[test]
+    fn verifies_ecdsa_request_signature() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+        let payload = serde_json::to_vec(&json!({
+            "account_id": "account-1"
+        }))
+        .unwrap();
+        let nonce = "nonce-1";
+        let timestamp_ms = now_ms();
+        let message =
+            ConfiguredAuthVerifier::signature_message("issue_asset", &payload, nonce, timestamp_ms);
+        let signature = secp.sign_ecdsa(&message, &secret_key);
+        let signature = RequestSignature {
+            signer_id: public_key.to_string(),
+            public_key: public_key.to_string(),
+            scheme: SignatureScheme::Ecdsa,
+            nonce: nonce.to_string(),
+            timestamp_ms,
+            signature: hex_encode(&signature.serialize_der()),
+        };
+
+        ConfiguredAuthVerifier::verify_request_signature(
+            "account-1",
+            &Permission::IssueAsset,
+            &payload,
+            &signature,
+        )
+        .unwrap();
+
+        let tampered = serde_json::to_vec(&json!({
+            "account_id": "account-2"
+        }))
+        .unwrap();
+        assert!(ConfiguredAuthVerifier::verify_request_signature(
+            "account-1",
+            &Permission::IssueAsset,
+            &tampered,
+            &signature,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_signer_app_bip322_envelope() {
+        let signature = RequestSignature {
+            signer_id: "account-1".to_string(),
+            public_key: String::new(),
+            scheme: SignatureScheme::Bip322,
+            nonce: now_ms().to_string(),
+            timestamp_ms: now_ms(),
+            signature: "bitcoin-message-signature".to_string(),
+        };
+        ConfiguredAuthVerifier::verify_request_signature(
+            "account-1",
+            &Permission::ReadRnaBalance,
+            br#"{"account_id":"account-1"}"#,
+            &signature,
+        )
+        .unwrap();
+        assert!(ConfiguredAuthVerifier::verify_request_signature(
+            "other-account",
+            &Permission::ReadRnaBalance,
+            br#"{"account_id":"account-1"}"#,
+            &signature,
+        )
+        .is_err());
+    }
 }

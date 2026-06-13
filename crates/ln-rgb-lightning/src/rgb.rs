@@ -348,10 +348,7 @@ impl From<bitcoin::consensus::encode::Error> for RgbServiceClientError {
 static RGB_LN_TX_COMPOSER: OnceLock<Arc<dyn RgbLnTxComposer + Send + Sync>> = OnceLock::new();
 
 pub fn init_rgb_ln_tx_composer(composer: Arc<dyn RgbLnTxComposer + Send + Sync>) {
-    RGB_LN_TX_COMPOSER
-        .set(composer)
-        .map_err(|_| ())
-        .expect("RGB LN tx composer already initialized");
+    let _ = RGB_LN_TX_COMPOSER.set(composer);
 }
 
 pub fn get_rgb_ln_tx_composer() -> &'static Arc<dyn RgbLnTxComposer + Send + Sync> {

@@ -195,8 +195,6 @@ POST /v1/balance/breakdown      # Query allocations and pending detail, charges 
 POST /v1/transfers/prepare      # Prepare RGB transfer, charges transfer_fee
 POST /v1/transfers/commit       # Commit txid and stage consignment for recipient
 POST /v1/transfers/cancel       # Cancel unfinished transfer
-POST /v1/pending/list           # List pending operations
-POST /v1/recover                # Promote/recover pending operations
 POST /v1/test/rgb               # Controlled RGB lifecycle test route
 ```
 
