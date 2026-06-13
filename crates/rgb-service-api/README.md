@@ -2,8 +2,8 @@
 
 Shared API layer for BiHelix RGB services.
 
-This crate defines the stable boundary for RGB asset, balance, invoice,
-transfer, and pending/recovery operations. It also defines the authorization
+This crate defines the stable boundary for RGB asset, balance, direct transfer,
+and pending/recovery operations. It also defines the authorization
 model used by HTTP services and SDK callers.
 
 Mutating asset operations require signed requests. Operations that move or lock
@@ -20,9 +20,8 @@ user wallet or signer.
 - RGB 资产列表
 - L1/L2 余额查询
 - allocation 明细
-- RGB invoice 创建
 - RGB transfer prepare/commit/cancel
-- consignment send/receive 受控传输，包括 service inbox、inline transport
+- direct send：commit 阶段直接把 consignment 暂存到接收方 account
 - pending operation 查询
 - recovery 推进
 - 受控 RGB lifecycle 测试
@@ -30,7 +29,9 @@ user wallet or signer.
 它不公开表达：
 
 - raw fascia 下载
+- public consignment send/receive endpoint
 - 任意 raw consignment 下载
+- RGB invoice/blinded receiver flow；当前采用 direct send
 - RGB stock 直接导入/导出
 - BTC 私钥托管
 - BTC 交易广播
@@ -40,13 +41,11 @@ user wallet or signer.
 ```text
 POST /v1/assets/issue
 POST /v1/assets/list
+GET  /v1/tokens/list
 POST /v1/balance
 POST /v1/balance/breakdown
-POST /v1/invoices/create
 POST /v1/transfers/prepare
 POST /v1/transfers/commit
-POST /v1/consignments/send
-POST /v1/consignments/receive
 POST /v1/ln/channels/open/prepare
 POST /v1/ln/commitments/compose
 POST /v1/ln/closing/compose

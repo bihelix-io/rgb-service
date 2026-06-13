@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    OnceLock,
+    Arc, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, ensure, Context, Result};
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
+use lightning::rgb::{
+    init_rgb_ln_tx_composer, ContractId as LnContractId, RequestSignature as LnRequestSignature,
+    RgbAssetAmount, RgbChannelContext, RgbDaemonLnTxComposer, RgbLnTxComposer, RgbServiceClient,
+    RgbServiceClientError, RgbServiceSigner,
+};
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use vm::Vm;
@@ -33,8 +38,31 @@ const LN_LOW_WATER_SATS: u64 = 100_000;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static LN_RGB_COMPOSER: OnceLock<Arc<RgbDaemonLnTxComposer>> = OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleRgbServiceSigner;
+
+impl RgbServiceSigner for ConsoleRgbServiceSigner {
+    fn sign_rgb_service_payload(
+        &self,
+        purpose: &str,
+        payload: &[u8],
+    ) -> std::result::Result<LnRequestSignature, RgbServiceClientError> {
+        let mut body: Value = serde_json::from_slice(payload).map_err(|err| {
+            RgbServiceClientError::Compose(format!("decode LN RGB signer payload: {err}"))
+        })?;
+        if let Value::Object(object) = &mut body {
+            object.insert("purpose".to_string(), json!(purpose));
+        }
+        let signature = request_signature(SIGNER_REQUEST_SIGNATURE_PATH, &body)
+            .map_err(|err| RgbServiceClientError::Compose(err.to_string()))?;
+        serde_json::from_value(signature).map_err(|err| {
+            RgbServiceClientError::Compose(format!("decode LN RGB signer response: {err}"))
+        })
+    }
+}
 
 fn daemon_url() -> Result<String> {
     let daemon_url =
@@ -166,6 +194,13 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
+        "token_list",
+        &[],
+        Type::Any,
+        rgb_token_list as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
         "balance",
         &[Type::Any],
         Type::Any,
@@ -180,13 +215,6 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
-        "invoice",
-        &[Type::Any],
-        Type::Any,
-        rgb_invoice as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
         "prepare_transfer",
         &[Type::Any],
         Type::Any,
@@ -198,20 +226,6 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         rgb_commit_transfer as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
-        "send_consignment",
-        &[Type::Any],
-        Type::Any,
-        rgb_send_consignment as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
-        "receive_consignment",
-        &[Type::Any],
-        Type::Any,
-        rgb_receive_consignment as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
@@ -266,6 +280,20 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         ln_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "token_list",
+        &[Type::Any],
+        Type::Any,
+        ln_token_list as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "rgb_channel_context",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_channel_context as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln",
@@ -420,26 +448,23 @@ extern "C" fn rgb_issue(input: *const Dynamic) -> *const Dynamic {
 extern "C" fn rgb_assets(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/assets/list")
 }
+extern "C" fn rgb_token_list() -> *const Dynamic {
+    native_result(|| {
+        let response = http_get_json(&daemon_route_url("/v1/tokens/list")?)?;
+        Ok(json_to_dynamic(&response))
+    })
+}
 extern "C" fn rgb_balance(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/balance")
 }
 extern "C" fn rgb_balance_breakdown(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/balance/breakdown")
 }
-extern "C" fn rgb_invoice(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/invoices/create")
-}
 extern "C" fn rgb_prepare_transfer(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/transfers/prepare")
 }
 extern "C" fn rgb_commit_transfer(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/transfers/commit")
-}
-extern "C" fn rgb_send_consignment(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/consignments/send")
-}
-extern "C" fn rgb_receive_consignment(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/consignments/receive")
 }
 extern "C" fn rgb_pending(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/pending/list")
@@ -456,11 +481,44 @@ extern "C" fn ln_status(input: *const Dynamic) -> *const Dynamic {
         Ok(ok(json!({
             "module": "ln",
             "enabled": true,
+            "ln_rgb_lightning_linked": true,
+            "ln_rgb_composer_bound": LN_RGB_COMPOSER.get().is_some(),
             "started": LN_STARTED.load(Ordering::SeqCst),
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "layers": ["l1", "l2"],
             "mode": "hot_wallet",
-            "note": "LN node service is deferred; only the Zust API and scanner placeholder are wired"
+            "backend": "ln-rgb-lightning"
+        })))
+    })
+}
+
+extern "C" fn ln_token_list(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |_input| {
+        let signer: Arc<dyn RgbServiceSigner + Send + Sync> = Arc::new(ConsoleRgbServiceSigner);
+        let client =
+            RgbServiceClient::new(daemon_url()?, signer).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let response = client
+            .token_list()
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(json_to_dynamic(&serde_json::to_value(response)?))
+    })
+}
+
+extern "C" fn ln_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let contract_id = parse_ln_contract_id(&required_string(input, "contract_id")?)?;
+        let amount = required_u64(input, "amount")?;
+        let outbound = optional_bool(input, "outbound").unwrap_or(true);
+        let asset = RgbAssetAmount::new(contract_id, amount);
+        let context = RgbChannelContext::new(asset).into_rgb_context(outbound);
+        Ok(ok(json!({
+            "module": "ln",
+            "backend": "ln-rgb-lightning",
+            "contract_id": context.contract_id.to_string(),
+            "funding_rgb": context.funding_rgb,
+            "to_self": context.to_self,
+            "outbound": outbound,
+            "has_funding_ref": context.has_funding_ref()
         })))
     })
 }
@@ -478,6 +536,7 @@ extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
         let address = find_string_field(&node, &["address", "btc_address"]).unwrap_or_default();
         let low_water_sats = value_u64(&node, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
         let config = normalized_ln_config(ln_config_from_value(&node), low_water_sats);
+        let composer_bound = bind_ln_rgb_composer()?;
         let interval_ms = optional_u64(&lightning, "interval_ms")
             .or_else(|| value_u64(&node, "interval_ms"))
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
@@ -491,6 +550,8 @@ extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
                 "address": address,
                 "config": config,
                 "source": "local/lightning",
+                "backend": "ln-rgb-lightning",
+                "ln_rgb_composer_bound": composer_bound,
                 "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
                 "scan_enabled": false
             })));
@@ -512,9 +573,11 @@ extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
             "address": address,
             "config": config,
             "source": "local/lightning",
+            "backend": "ln-rgb-lightning",
+            "ln_rgb_composer_bound": composer_bound,
             "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
             "scan_enabled": false,
-            "note": "LN inbound listener is running; real L1/L2 scanning is intentionally disabled"
+            "note": "LN inbound listener is running with ln-rgb-lightning RGB daemon composer; real L1/L2 scanning is intentionally disabled"
         })))
     })
 }
@@ -601,6 +664,23 @@ extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
+fn bind_ln_rgb_composer() -> Result<bool> {
+    if LN_RGB_COMPOSER.get().is_some() {
+        return Ok(true);
+    }
+    let signer: Arc<dyn RgbServiceSigner + Send + Sync> = Arc::new(ConsoleRgbServiceSigner);
+    let client =
+        RgbServiceClient::new(daemon_url()?, signer).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let composer = Arc::new(
+        RgbDaemonLnTxComposer::new(client, default_account_id()?, 300000)
+            .map_err(|err| anyhow::anyhow!("{err}"))?,
+    );
+    let global_composer: Arc<dyn RgbLnTxComposer + Send + Sync> = composer.clone();
+    init_rgb_ln_tx_composer(global_composer);
+    let _ = LN_RGB_COMPOSER.set(composer);
+    Ok(LN_RGB_COMPOSER.get().is_some())
+}
+
 extern "C" fn ln_scanner_status(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |_input| {
         Ok(ok(json!({
@@ -635,8 +715,7 @@ fn rgb_post_dynamic(input: &Dynamic, route: &str) -> Result<Dynamic> {
 }
 
 fn request_options(input: &Dynamic, route: &str) -> Result<Dynamic> {
-    let daemon_url = daemon_url()?;
-    let url = format!("{}{}", daemon_url.trim_end_matches('/'), route);
+    let url = daemon_route_url(route)?;
     let request = json!({
         "method": "POST",
         "url": url,
@@ -644,6 +723,11 @@ fn request_options(input: &Dynamic, route: &str) -> Result<Dynamic> {
         "timeout_ms": optional_u64(input, "timeout_ms").unwrap_or(30000)
     });
     Ok(json_to_dynamic(&request))
+}
+
+fn daemon_route_url(route: &str) -> Result<String> {
+    let daemon_url = daemon_url()?;
+    Ok(format!("{}{}", daemon_url.trim_end_matches('/'), route))
 }
 
 fn http_request_options(options: &Dynamic) -> Result<Value> {
@@ -673,6 +757,41 @@ fn http_post_json(url: &str, body: &Value) -> Result<Value> {
     stream.write_all(&body)?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
+    let response = String::from_utf8(response).context("RGB service response is not UTF-8")?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .context("invalid HTTP response from RGB service")?;
+    let status = head.lines().next().unwrap_or_default();
+    let status_code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .context("missing HTTP status code from RGB service")?;
+    let json = if body.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(body)
+            .with_context(|| format!("decode RGB service JSON body: {body}"))?
+    };
+    if !(200..300).contains(&status_code) {
+        bail!("RGB service {path} failed with HTTP {status_code}: {json}");
+    }
+    Ok(json)
+}
+
+fn http_get_json(url: &str) -> Result<Value> {
+    let (host, port, path) = parse_http_url(url)?;
+    let mut stream = TcpStream::connect((host.as_str(), port))
+        .with_context(|| format!("connect RGB service daemon {host}:{port}"))?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    parse_http_json_response(&path, response)
+}
+
+fn parse_http_json_response(path: &str, response: Vec<u8>) -> Result<Value> {
     let response = String::from_utf8(response).context("RGB service response is not UTF-8")?;
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -979,6 +1098,30 @@ fn optional_u64(input: &Dynamic, key: &str) -> Option<u64> {
         value if value.is_str() => value.as_str().parse::<u64>().ok(),
         _ => None,
     })
+}
+
+fn optional_bool(input: &Dynamic, key: &str) -> Option<bool> {
+    input.get_dynamic(key).and_then(|value| match value {
+        Dynamic::Bool(value) => Some(value),
+        value if value.is_str() => match value.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+fn parse_ln_contract_id(value: &str) -> Result<LnContractId> {
+    let value = value.trim();
+    ensure!(value.len() == 64, "contract_id must be 32-byte hex");
+    let mut bytes = [0u8; 32];
+    for index in 0..32 {
+        let offset = index * 2;
+        bytes[index] = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .with_context(|| format!("invalid contract_id hex at byte {index}"))?;
+    }
+    Ok(LnContractId::from(bytes))
 }
 
 fn json_to_dynamic(value: &Value) -> Dynamic {

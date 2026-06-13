@@ -191,6 +191,14 @@ pub struct Rgb20IssueResult {
 }
 
 #[derive(Clone, Debug)]
+pub struct Rgb20ContractInfo {
+    pub contract_id: ContractId,
+    pub ticker: String,
+    pub name: String,
+    pub precision: u8,
+}
+
+#[derive(Clone, Debug)]
 pub struct Rgb20TrackedUtxo {
     pub outpoint: OutPoint,
     pub address: Option<String>,
@@ -557,6 +565,45 @@ pub fn list_rgb20_assets_for_address(
             .into_iter()
             .filter(|utxo| utxo.address.as_deref() == Some(address)),
     )
+}
+
+pub fn list_rgb20_contracts(stock_dir: &Path) -> Result<Vec<Rgb20ContractInfo>> {
+    let stock = open_or_create_stock(stock_dir)?;
+    let mut contracts = Vec::new();
+    for contract in stock
+        .contracts()
+        .map_err(|err| anyhow!("failed to list RGB contracts: {err:?}"))?
+    {
+        let contract_data = stock
+            .contract_data(contract.id)
+            .map_err(|err| anyhow!("failed to load RGB contract data: {err:?}"))?;
+        let spec = contract_data
+            .global("spec")
+            .next()
+            .map(|strict_val| AssetSpec::from_strict_val_unchecked(&strict_val));
+        let (ticker, name, precision) = spec
+            .map(|spec| {
+                (
+                    spec.ticker.to_string(),
+                    spec.name.to_string(),
+                    spec.precision,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    String::new(),
+                    String::new(),
+                    rgbstd::Precision::Indivisible,
+                )
+            });
+        contracts.push(Rgb20ContractInfo {
+            contract_id: contract.id,
+            ticker,
+            name,
+            precision: precision.decimals(),
+        });
+    }
+    Ok(contracts)
 }
 
 pub fn list_rgb20_assets_for_utxos(

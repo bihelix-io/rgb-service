@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     fs::OpenOptions,
     io::Write,
@@ -21,21 +22,19 @@ use rgb_service_api::{
     axum_service::router, AllocationStatus, AssetLayer, AssetSpendAuthorization, AuthSubject,
     AuthVerifier, Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
     CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
-    ConsignmentDelivery, CreateInvoiceRequest, CreateInvoiceResponse, IssueAssetRequest,
-    IssueAssetResponse, ListAssetsRequest, ListAssetsResponse, ListPendingRequest,
-    ListPendingResponse, LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse,
-    LnClosingComposeRequest, LnCommitmentComposeRequest, LnComposeResponse,
-    LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel, LnRecoveredCompose,
-    LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest, PrepareTransferResponse,
-    ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest, RecoveryAction,
-    RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance, RgbFundingRef,
-    RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse,
-    RunRgbTestRequest, RunRgbTestResponse, SendConsignmentRequest, SendConsignmentResponse,
-    TrackedUtxo,
+    IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
+    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
+    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
+    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel,
+    LnRecoveredCompose, LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest,
+    PrepareTransferResponse, RecoverRequest, RecoveryAction, RecoveryReport, RequestSignature,
+    RgbAllocation, RgbAssetInfo, RgbBalance, RgbContractInfo, RgbFundingRef, RgbServiceApi,
+    RgbServiceError, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest,
+    RunRgbTestResponse, TokenListResponse, TrackedUtxo,
 };
 use rgb_service_local::{
-    build_rgb20_transfer_consignment, decode_rgb20_transfer_consignment, encode_fascia_bytes,
-    issue_rgb20_fixed_with_chain_source, list_rgb20_assets_for_utxos, prepare_rgb20_psbt,
+    build_rgb20_transfer_consignment, encode_fascia_bytes, issue_rgb20_fixed_with_chain_source,
+    list_rgb20_assets_for_utxos, list_rgb20_contracts, prepare_rgb20_psbt,
     scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
     ChainSource, EsploraConfig, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
@@ -214,6 +213,7 @@ impl DaemonLogger {
 #[derive(Debug, Deserialize, Serialize)]
 struct PreparedTransferRecord {
     asset_id: String,
+    recipient_account_id: String,
     recipient_vout: u32,
     fascia: Vec<u8>,
 }
@@ -289,6 +289,25 @@ impl LocalDaemonService {
             .join("accounts")
             .join(account_id)
             .join("rgb-stock")
+    }
+
+    fn account_stock_dirs(&self) -> rgb_service_api::Result<Vec<PathBuf>> {
+        let accounts_dir = self.config.data_dir.join("accounts");
+        if !accounts_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&accounts_dir)
+            .map_err(|err| RgbServiceError::Backend(format!("read accounts dir: {err}")))?;
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
+            let path = entry.path().join("rgb-stock");
+            if path.exists() {
+                dirs.push(path);
+            }
+        }
+        Ok(dirs)
     }
 
     fn network(&self) -> rgb_service_api::Result<bitcoin::Network> {
@@ -810,12 +829,6 @@ impl RgbServiceApi for LocalDaemonService {
             "list_assets",
             self.rna.query_fee,
         )?;
-        self.charge_rna(
-            &req.payload.account_id,
-            "/v1/balance/breakdown",
-            "balance_breakdown",
-            self.rna.query_fee,
-        )?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let allocations =
             list_rgb20_assets_for_utxos(&stock_dir, self.tracked_utxos(req.payload.tracked_utxos)?)
@@ -837,6 +850,38 @@ impl RgbServiceApi for LocalDaemonService {
             });
         }
         Ok(ListAssetsResponse { assets })
+    }
+
+    async fn token_list(&self) -> rgb_service_api::Result<TokenListResponse> {
+        let mut seen = BTreeSet::<String>::new();
+        let mut contracts = Vec::<RgbContractInfo>::new();
+        let mut assets = Vec::<RgbAssetInfo>::new();
+        for stock_dir in self.account_stock_dirs()? {
+            let stock_contracts = list_rgb20_contracts(&stock_dir)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            for contract in stock_contracts {
+                let contract_id = contract.contract_id.to_string();
+                if !seen.insert(contract_id.clone()) {
+                    continue;
+                }
+                contracts.push(RgbContractInfo {
+                    contract_id: contract_id.clone(),
+                    schema: "rgb20".to_string(),
+                    asset_id: Some(contract_id.clone()),
+                    ticker: contract.ticker.clone(),
+                    name: contract.name.clone(),
+                    precision: contract.precision,
+                });
+                assets.push(RgbAssetInfo {
+                    asset_id: contract_id.clone(),
+                    contract_id,
+                    ticker: contract.ticker,
+                    name: contract.name,
+                    precision: contract.precision,
+                });
+            }
+        }
+        Ok(TokenListResponse { contracts, assets })
     }
 
     async fn balance(
@@ -899,27 +944,15 @@ impl RgbServiceApi for LocalDaemonService {
         })
     }
 
-    async fn create_invoice(
-        &self,
-        req: Authorized<CreateInvoiceRequest>,
-    ) -> rgb_service_api::Result<CreateInvoiceResponse> {
-        let invoice_id = format!(
-            "{}:{}:{}",
-            req.payload.account_id, req.payload.asset_id, req.payload.expiry_seconds
-        );
-        Ok(CreateInvoiceResponse {
-            invoice_id,
-            invoice: serde_json::to_string(&req.payload)
-                .map_err(|err| RgbServiceError::Backend(err.to_string()))?,
-            blinded_seal: None,
-            expires_at_ms: req.payload.expiry_seconds.saturating_mul(1000),
-        })
-    }
-
     async fn prepare_transfer(
         &self,
         req: Authorized<PrepareTransferRequest>,
     ) -> rgb_service_api::Result<PrepareTransferResponse> {
+        if req.payload.recipient.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "recipient account_id must not be empty".to_string(),
+            ));
+        }
         self.charge_rna(
             &req.payload.account_id,
             "/v1/transfers/prepare",
@@ -964,6 +997,7 @@ impl RgbServiceApi for LocalDaemonService {
         let transfer_id = req.payload.asset_authorization.signature.nonce;
         let record = PreparedTransferRecord {
             asset_id: req.payload.asset_id.clone(),
+            recipient_account_id: req.payload.recipient.clone(),
             recipient_vout,
             fascia,
         };
@@ -988,63 +1022,23 @@ impl RgbServiceApi for LocalDaemonService {
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
         stage_sender_fascia(&stock_dir, txid, &fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        Ok(CommitTransferResponse {
-            transfer_id: req.payload.transfer_id,
-            operation_id: "commit_transfer".to_string(),
-            status: OperationStatus::Committed,
-        })
-    }
-
-    async fn send_consignment(
-        &self,
-        req: Authorized<SendConsignmentRequest>,
-    ) -> rgb_service_api::Result<SendConsignmentResponse> {
-        let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let record =
-            self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
-        if record.asset_id != req.payload.asset_id {
-            return Err(RgbServiceError::Conflict(format!(
-                "transfer {} belongs to asset {}, not {}",
-                req.payload.transfer_id, record.asset_id, req.payload.asset_id
-            )));
-        }
-        let txid = Txid::from_str(&req.payload.txid)
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&req.payload.asset_id)
+        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&record.asset_id)
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
-        let fascia = rgb_service_local::decode_fascia_bytes(&record.fascia)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
-        let recipient_vout = req.payload.recipient_vout.unwrap_or(record.recipient_vout);
-        let consignment =
-            build_rgb20_transfer_consignment(&stock_dir, fascia, contract_id, txid, recipient_vout)
-                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let account_id = req.payload.transport.account_id;
-        let receiver_stock_dir = self.account_stock_dir(&account_id);
+        let consignment = build_rgb20_transfer_consignment(
+            &stock_dir,
+            fascia,
+            contract_id,
+            txid,
+            record.recipient_vout,
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
         stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        Ok(SendConsignmentResponse {
+        Ok(CommitTransferResponse {
             transfer_id: req.payload.transfer_id,
             operation_id: txid.to_string(),
-            status: OperationStatus::Pending,
-            delivery: ConsignmentDelivery { account_id },
-        })
-    }
-
-    async fn receive_consignment(
-        &self,
-        req: Authorized<ReceiveConsignmentRequest>,
-    ) -> rgb_service_api::Result<ReceiveConsignmentResponse> {
-        let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let txid = Txid::from_str(&req.payload.txid)
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let bytes = hex_decode(&req.payload.consignment_hex)?;
-        let consignment = decode_rgb20_transfer_consignment(&bytes)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
-        stage_receiver_transfer(&stock_dir, txid, &consignment)
-            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        Ok(ReceiveConsignmentResponse {
-            operation_id: txid.to_string(),
-            status: OperationStatus::Pending,
+            status: OperationStatus::Committed,
         })
     }
 

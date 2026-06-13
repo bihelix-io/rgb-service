@@ -11,15 +11,14 @@ use rgb_service_api::{
     axum_service::router, AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier,
     Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
     CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
-    CreateInvoiceRequest, CreateInvoiceResponse, IssueAssetRequest, IssueAssetResponse,
-    ListAssetsRequest, ListAssetsResponse, ListPendingRequest, ListPendingResponse,
-    LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse, LnClosingComposeRequest,
-    LnCommitmentComposeRequest, LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest,
-    LnRecoveryReport, Permission, PrepareTransferRequest, PrepareTransferResponse,
-    ReceiveConsignmentRequest, ReceiveConsignmentResponse, RecoverRequest, RecoveryReport,
-    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep,
-    RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse,
-    SendConsignmentRequest, SendConsignmentResponse, SignatureScheme, SignedRequest,
+    IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
+    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
+    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
+    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveryReport,
+    Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryReport,
+    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario,
+    RgbTestStep, RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse,
+    SignatureScheme, SignedRequest, TokenListResponse,
 };
 use tower::ServiceExt;
 
@@ -75,6 +74,13 @@ impl RgbServiceApi for TestRgbService {
         Err(unimplemented_call("list_assets"))
     }
 
+    async fn token_list(&self) -> rgb_service_api::Result<TokenListResponse> {
+        Ok(TokenListResponse {
+            contracts: Vec::new(),
+            assets: Vec::new(),
+        })
+    }
+
     async fn balance(
         &self,
         _req: Authorized<BalanceRequest>,
@@ -89,13 +95,6 @@ impl RgbServiceApi for TestRgbService {
         Err(unimplemented_call("balance_breakdown"))
     }
 
-    async fn create_invoice(
-        &self,
-        _req: Authorized<CreateInvoiceRequest>,
-    ) -> rgb_service_api::Result<CreateInvoiceResponse> {
-        Err(unimplemented_call("create_invoice"))
-    }
-
     async fn prepare_transfer(
         &self,
         _req: Authorized<PrepareTransferRequest>,
@@ -108,20 +107,6 @@ impl RgbServiceApi for TestRgbService {
         _req: Authorized<CommitTransferRequest>,
     ) -> rgb_service_api::Result<CommitTransferResponse> {
         Err(unimplemented_call("commit_transfer"))
-    }
-
-    async fn send_consignment(
-        &self,
-        _req: Authorized<SendConsignmentRequest>,
-    ) -> rgb_service_api::Result<SendConsignmentResponse> {
-        Err(unimplemented_call("send_consignment"))
-    }
-
-    async fn receive_consignment(
-        &self,
-        _req: Authorized<ReceiveConsignmentRequest>,
-    ) -> rgb_service_api::Result<ReceiveConsignmentResponse> {
-        Err(unimplemented_call("receive_consignment"))
     }
 
     async fn cancel_transfer(
@@ -189,15 +174,30 @@ impl RgbServiceApi for TestRgbService {
             passed: true,
             steps: vec![
                 step("issue_rgb20"),
-                step("create_invoice"),
                 step("prepare_transfer"),
                 step("commit_transfer"),
-                step("send_consignment"),
-                step("receive_consignment"),
+                step("direct_delivery"),
                 step("recover_pending"),
             ],
         })
     }
+}
+
+#[tokio::test]
+async fn token_list_route_is_public() {
+    let app = router(Arc::new(TestRgbService), Arc::new(AllowAllAuth));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/tokens/list")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let response: TokenListResponse = serde_json::from_slice(&body).unwrap();
+    assert!(response.contracts.is_empty());
+    assert!(response.assets.is_empty());
 }
 
 #[tokio::test]
@@ -223,7 +223,7 @@ async fn rgb_test_route_returns_full_lifecycle_report() {
     let report: RunRgbTestResponse = serde_json::from_slice(&body).unwrap();
     assert!(report.passed);
     assert_eq!(report.scenario, RgbTestScenario::FullRgb20Lifecycle);
-    assert_eq!(report.steps.len(), 7);
+    assert_eq!(report.steps.len(), 5);
 }
 
 fn account(value: &str) -> AccountId {

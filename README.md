@@ -29,7 +29,6 @@ Internal RGB workspace crates are kept where required:
 
 - asset and contract management
 - balance and allocation queries
-- RGB invoice creation
 - transfer prepare/commit/cancel
 - pending operation and recovery workflows
 - admin-triggered RGB test workflows
@@ -105,13 +104,11 @@ POST /v1/iroh-nodes/register
 POST /v1/iroh-nodes/lookup
 POST /v1/assets/issue
 POST /v1/assets/list
+GET  /v1/tokens/list
 POST /v1/balance
 POST /v1/balance/breakdown
-POST /v1/invoices/create
 POST /v1/transfers/prepare
 POST /v1/transfers/commit
-POST /v1/consignments/send
-POST /v1/consignments/receive
 POST /v1/transfers/cancel
 POST /v1/pending/list
 POST /v1/recover
@@ -119,12 +116,12 @@ POST /v1/test/rgb
 ```
 
 Import/export、raw fascia 暂时不作为 public API 暴露。consignment 不作为任意文件下载接口暴露，
-但 RGB 转账必须支持受控传输：发送方通过 `/v1/consignments/send` 交付 consignment，
-接收方通过 `/v1/consignments/receive` 接收外部 consignment。当前支持 service 内部 inbox 和显式 inline 传输；inline 只用于 SDK、调试或跨服务调用方自己负责转发的场景。
+RGB 转账采用 direct send：`/v1/transfers/commit` 会根据 prepare 阶段保存的接收方 account_id，
+直接把 consignment 暂存到接收方 service inbox。
 
 ### 通用请求格式
 
-所有 HTTP 请求都使用 `SignedRequest<T>` 包装：
+除公开 catalog 外，HTTP 请求都使用 `SignedRequest<T>` 包装：
 
 ```json
 {
@@ -168,7 +165,7 @@ ed25519
   "asset_id": "rgb:...",
   "amount": 1000,
   "purpose": "l1_transfer",
-  "recipient": "rgb invoice or recipient seal",
+  "recipient": "receiver account_id",
   "anchor_psbt": "optional psbt hex/base64 according to caller convention",
   "expires_at_ms": 1760000000000,
   "signature": {
@@ -340,6 +337,38 @@ channel_withdraw
 
 说明：`tracked_utxos` 由外部钱包提供，用于限定或辅助查询钱包正在跟踪的 UTXO。
 
+### `GET /v1/tokens/list`
+
+用途：公开列出 daemon 已知的所有 RGB20 合约和资产元信息。
+
+说明：这是公开 catalog 接口，不需要签名、不需要 account_id、不扣 RNA。
+
+响应：
+
+```json
+{
+  "contracts": [
+    {
+      "contract_id": "...",
+      "schema": "rgb20",
+      "asset_id": "...",
+      "ticker": "RGB",
+      "name": "RGB Token",
+      "precision": 8
+    }
+  ],
+  "assets": [
+    {
+      "asset_id": "...",
+      "contract_id": "...",
+      "ticker": "RGB",
+      "name": "RGB Token",
+      "precision": 8
+    }
+  ]
+}
+```
+
 ### `POST /v1/balance`
 
 用途：查询某个 RGB asset 的汇总余额。
@@ -438,38 +467,6 @@ account
 
 `status` 可选值：`available`, `reserved`, `pending_in`, `pending_out`, `settling`, `locked`。
 
-### `POST /v1/invoices/create`
-
-用途：创建 RGB 收款 invoice。
-
-权限：`create_invoice`
-
-请求 payload：
-
-```json
-{
-  "account_id": "alice",
-  "asset_id": "...",
-  "amount": 1000,
-  "expiry_seconds": 3600,
-  "transport_hints": ["iroh:..."]
-}
-```
-
-响应：
-
-```json
-{
-  "invoice_id": "...",
-  "invoice": "rgb:...",
-  "blinded_seal": "...",
-  "expires_at_ms": 1760000000000
-}
-```
-
-说明：`amount` 可以为空，用于生成不固定金额 invoice。`transport_hints` 用于放入
-接收方希望使用的传输方式，例如未来的 iroh endpoint。
-
 ### `POST /v1/transfers/prepare`
 
 用途：准备 RGB 转账。调用方传入未签名 BTC anchor PSBT，RGB Service 生成 RGB commitment，
@@ -486,7 +483,7 @@ account
   "account_id": "alice",
   "asset_id": "...",
   "amount": 1000,
-  "recipient": "rgb invoice or blinded seal",
+  "recipient": "bob",
   "fee_rate_sat_vb": 2,
   "unsigned_anchor_psbt": "...",
   "change_vout": 1,
@@ -495,7 +492,7 @@ account
     "asset_id": "...",
     "amount": 1000,
     "purpose": "l1_transfer",
-    "recipient": "rgb invoice or blinded seal",
+    "recipient": "bob",
     "anchor_psbt": "...",
     "expires_at_ms": 1760000000000,
     "signature": {
@@ -543,7 +540,7 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
     "asset_id": "...",
     "amount": 1000,
     "purpose": "l1_transfer",
-    "recipient": "rgb invoice or blinded seal",
+    "recipient": "bob",
     "anchor_psbt": "...",
     "expires_at_ms": 1760000000000,
     "signature": {
@@ -564,102 +561,13 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
 {
   "transfer_id": "...",
   "operation_id": "...",
-  "status": "pending"
+  "status": "committed"
 }
 ```
 
 说明：`signed_anchor_psbt` 是可选字段。当前核心确认依据是 `txid` 和 service 内部保存的 pending RGB 状态。
-
-### `POST /v1/consignments/send`
-
-用途：根据 `transfer_id`、anchor `txid` 和 service 内部保存的 sender fascia 构建 RGB transfer consignment，
-并把 consignment 交付给接收方。
-
-权限：`send_consignment`
-
-额外要求：`asset_authorization`
-
-请求 payload：
-
-```json
-{
-  "account_id": "alice",
-  "transfer_id": "...",
-  "asset_id": "...",
-  "txid": "bitcoin-txid",
-  "recipient_vout": 0,
-  "transport": {
-    "account_id": "bob"
-  },
-  "asset_authorization": {
-    "asset_id": "...",
-    "amount": 1000,
-    "purpose": "l1_transfer",
-    "recipient": "rgb invoice or blinded seal",
-    "anchor_psbt": "...",
-    "expires_at_ms": 1760000000000,
-    "signature": {
-      "signer_id": "alice-wallet",
-      "public_key": "...",
-      "scheme": "bip322",
-      "nonce": "asset-spend-nonce",
-      "timestamp_ms": 1760000000000,
-      "signature": "..."
-    }
-  }
-}
-```
-
-`transport` 固定为 service inbox：
-
-```json
-{ "account_id": "bob" }
-```
-
-响应：
-
-```json
-{
-  "transfer_id": "...",
-  "operation_id": "bitcoin-txid",
-  "status": "pending",
-  "delivery": {
-    "account_id": "bob"
-  }
-}
-```
-
-说明：service inbox 用于同一个 RGB Service 内部账户之间交付，不把 consignment 返回给调用方。
-
-### `POST /v1/consignments/receive`
-
-用途：接收外部 RGB consignment，把它放入接收方 account 的 receiver pending 状态，之后通过 `/v1/recover`
-在 anchor tx 满足条件后推进到正式 RGB stock。
-
-权限：`receive_consignment`
-
-请求 payload：
-
-```json
-{
-  "account_id": "bob",
-  "txid": "bitcoin-txid",
-  "consignment_hex": "...",
-  "source_transfer_id": "optional-transfer-id"
-}
-```
-
-响应：
-
-```json
-{
-  "operation_id": "bitcoin-txid",
-  "status": "pending"
-}
-```
-
-说明：这个接口是“接收转账证明”，不是通用导入 RGB stock。服务会把 consignment 暂存为 receiver pending，
-再由 recovery/confirmation 流程验证和接收。
+`commit` 会根据 prepare 阶段保存的 `recipient` account_id 构造 consignment，并直接暂存到接收方 stock pending。
+之后由 recovery/confirmation 流程推进最终状态。
 
 ### `POST /v1/transfers/cancel`
 
@@ -810,10 +718,9 @@ recovery_required
 5. RGB Service 写入 RGB commitment，内部保存 sender fascia 状态，返回 anchor_psbt。
 6. 外部 BTC 钱包签名并广播 anchor_psbt。
 7. 钱包拿到 txid 后调用 POST /v1/transfers/commit。
-8. 钱包或业务服务调用 POST /v1/consignments/send，把 consignment 交付给接收方。
-9. 外部接收方如果不在同一个 service inbox 内，通过 POST /v1/consignments/receive 提交 consignment。
-10. RGB Service 根据 transfer_id / txid 找回内部 RGB 状态并进入 pending/recovery 流程。
-11. 调用方或后台任务调用 POST /v1/recover 推进最终状态。
+8. RGB Service 构造 consignment，并直接暂存到 `recipient` 对应的接收方 account。
+9. RGB Service 根据 transfer_id / txid 进入 pending/recovery 流程。
+10. 调用方或后台任务调用 POST /v1/recover 推进最终状态。
 ```
 
 这个流程里，BTC 私钥、BTC 签名和广播都在外部钱包；RGB 合约状态、资产分配、pending 状态
@@ -832,10 +739,9 @@ For an L1 transfer, the external wallet remains responsible for BTC ownership:
 3. RGB Service updates the PSBT with RGB commitments and stores internal fascia in KV.
 4. Wallet signs and broadcasts the returned PSBT.
 5. Wallet calls /v1/transfers/commit with transfer_id + txid.
-6. Wallet or business service calls /v1/consignments/send to deliver the transfer consignment.
-7. Receiver calls /v1/consignments/receive when the consignment comes from another service.
-8. RGB Service marks the RGB operation pending and later /v1/recover promotes it.
+6. RGB Service builds the consignment and stages it directly for the recipient account.
+7. RGB Service marks the RGB operation pending and later /v1/recover promotes it.
 ```
 
 The external caller never receives raw fascia in this public flow. Consignment
-is transmitted only through controlled send/receive endpoints.
+is delivered internally by `/v1/transfers/commit`.

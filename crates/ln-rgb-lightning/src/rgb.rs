@@ -113,18 +113,15 @@ impl RgbServiceClient {
         self.post_signed("/v1/assets/list", "list_assets", req)
     }
 
+    pub fn token_list(&self) -> Result<TokenListResponse, RgbServiceClientError> {
+        self.get_json("/v1/tokens/list")
+    }
+
     pub fn balance(
         &self,
         req: BalanceRequest,
     ) -> Result<RgbBalance, RgbServiceClientError> {
         self.post_signed("/v1/balance", "balance", req)
-    }
-
-    pub fn create_invoice(
-        &self,
-        req: CreateInvoiceRequest,
-    ) -> Result<CreateInvoiceResponse, RgbServiceClientError> {
-        self.post_signed("/v1/invoices/create", "create_invoice", req)
     }
 
     pub fn issue_asset(
@@ -146,13 +143,6 @@ impl RgbServiceClient {
         req: CommitTransferRequest,
     ) -> Result<CommitTransferResponse, RgbServiceClientError> {
         self.post_signed("/v1/transfers/commit", "commit_transfer", req)
-    }
-
-    pub fn send_consignment(
-        &self,
-        req: SendConsignmentRequest,
-    ) -> Result<SendConsignmentResponse, RgbServiceClientError> {
-        self.post_signed("/v1/consignments/send", "send_consignment", req)
     }
 
     pub fn prepare_ln_channel_open(
@@ -230,6 +220,37 @@ impl RgbServiceClient {
         );
         std::io::Write::write_all(&mut stream, request.as_bytes())?;
         std::io::Write::write_all(&mut stream, &body)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        let response = String::from_utf8(response)?;
+        let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+            RgbServiceClientError::Http("invalid daemon HTTP response".to_string())
+        })?;
+        let status_code = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| RgbServiceClientError::Http("missing daemon HTTP status".to_string()))?;
+        if !(200..300).contains(&status_code) {
+            return Err(RgbServiceClientError::Daemon {
+                status_code,
+                body: body.to_string(),
+            });
+        }
+        Ok(serde_json::from_str(body)?)
+    }
+
+    fn get_json<R>(&self, route: &str) -> Result<R, RgbServiceClientError>
+    where
+        R: for<'de> Deserialize<'de>,
+    {
+        let url = format!("{}{}", self.daemon_url.trim_end_matches('/'), route);
+        let (host, port, path) = parse_http_url(&url)?;
+        let mut stream = TcpStream::connect((host.as_str(), port))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+        std::io::Write::write_all(&mut stream, request.as_bytes())?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response)?;
         let response = String::from_utf8(response)?;
@@ -704,6 +725,22 @@ pub struct ListAssetsResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenListResponse {
+    pub contracts: Vec<RgbContractInfo>,
+    pub assets: Vec<RgbAssetInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RgbContractInfo {
+    pub contract_id: ContractIdString,
+    pub schema: String,
+    pub asset_id: Option<AssetId>,
+    pub ticker: String,
+    pub name: String,
+    pub precision: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RgbAssetInfo {
     pub asset_id: AssetId,
     pub contract_id: ContractIdString,
@@ -754,23 +791,6 @@ pub struct TrackedUtxo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateInvoiceRequest {
-    pub account_id: AccountId,
-    pub asset_id: AssetId,
-    pub amount: Option<u64>,
-    pub expiry_seconds: u64,
-    pub transport_hints: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateInvoiceResponse {
-    pub invoice_id: InvoiceId,
-    pub invoice: String,
-    pub blinded_seal: Option<String>,
-    pub expires_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PrepareTransferRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
@@ -804,35 +824,6 @@ pub struct CommitTransferResponse {
     pub transfer_id: TransferId,
     pub operation_id: OperationId,
     pub status: OperationStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SendConsignmentRequest {
-    pub account_id: AccountId,
-    pub transfer_id: TransferId,
-    pub asset_id: AssetId,
-    pub txid: TxidString,
-    pub recipient_vout: Option<u32>,
-    pub transport: ConsignmentTransport,
-    pub asset_authorization: AssetSpendAuthorization,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SendConsignmentResponse {
-    pub transfer_id: TransferId,
-    pub operation_id: OperationId,
-    pub status: OperationStatus,
-    pub delivery: ConsignmentDelivery,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ConsignmentTransport {
-    pub account_id: AccountId,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ConsignmentDelivery {
-    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

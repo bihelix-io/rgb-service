@@ -9108,6 +9108,7 @@ version = "0.11.1-rc.10"
 dependencies = [
  "anyhow",
  "iroh",
+ "lightning",
  "serde_json",
  "tokio",
  "zust-dynamic",

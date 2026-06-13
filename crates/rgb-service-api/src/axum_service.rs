@@ -4,7 +4,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Serialize;
@@ -30,13 +30,11 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
+        .route("/v1/tokens/list", get(token_list))
         .route("/v1/balance", post(balance))
         .route("/v1/balance/breakdown", post(balance_breakdown))
-        .route("/v1/invoices/create", post(create_invoice))
         .route("/v1/transfers/prepare", post(prepare_transfer))
         .route("/v1/transfers/commit", post(commit_transfer))
-        .route("/v1/consignments/send", post(send_consignment))
-        .route("/v1/consignments/receive", post(receive_consignment))
         .route(
             "/v1/ln/channels/open/prepare",
             post(prepare_ln_channel_open),
@@ -130,6 +128,12 @@ async fn list_assets(
     Ok(Json(state.service.list_assets(req).await?))
 }
 
+async fn token_list(
+    State(state): State<ApiState>,
+) -> Result<Json<TokenListResponse>, HttpError> {
+    Ok(Json(state.service.token_list().await?))
+}
+
 async fn balance(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<BalanceRequest>>,
@@ -146,14 +150,6 @@ async fn balance_breakdown(
     Ok(Json(state.service.balance_breakdown(req).await?))
 }
 
-async fn create_invoice(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<CreateInvoiceRequest>>,
-) -> Result<Json<CreateInvoiceResponse>, HttpError> {
-    let req = authorize(&state, Permission::CreateInvoice, req).await?;
-    Ok(Json(state.service.create_invoice(req).await?))
-}
-
 async fn prepare_transfer(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<PrepareTransferRequest>>,
@@ -168,22 +164,6 @@ async fn commit_transfer(
 ) -> Result<Json<CommitTransferResponse>, HttpError> {
     let req = authorize_asset_spend(&state, Permission::CommitTransfer, req).await?;
     Ok(Json(state.service.commit_transfer(req).await?))
-}
-
-async fn send_consignment(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<SendConsignmentRequest>>,
-) -> Result<Json<SendConsignmentResponse>, HttpError> {
-    let req = authorize_asset_spend(&state, Permission::SendConsignment, req).await?;
-    Ok(Json(state.service.send_consignment(req).await?))
-}
-
-async fn receive_consignment(
-    State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<ReceiveConsignmentRequest>>,
-) -> Result<Json<ReceiveConsignmentResponse>, HttpError> {
-    let req = authorize(&state, Permission::ReceiveConsignment, req).await?;
-    Ok(Json(state.service.receive_consignment(req).await?))
 }
 
 async fn prepare_ln_channel_open(

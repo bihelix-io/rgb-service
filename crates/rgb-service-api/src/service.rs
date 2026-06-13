@@ -10,17 +10,14 @@ pub trait RgbServiceApi: Send + Sync + 'static {
 
     async fn list_assets(&self, req: Authorized<ListAssetsRequest>) -> Result<ListAssetsResponse>;
 
+    async fn token_list(&self) -> Result<TokenListResponse>;
+
     async fn balance(&self, req: Authorized<BalanceRequest>) -> Result<RgbBalance>;
 
     async fn balance_breakdown(
         &self,
         req: Authorized<BalanceBreakdownRequest>,
     ) -> Result<BalanceBreakdownResponse>;
-
-    async fn create_invoice(
-        &self,
-        req: Authorized<CreateInvoiceRequest>,
-    ) -> Result<CreateInvoiceResponse>;
 
     async fn prepare_transfer(
         &self,
@@ -31,16 +28,6 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         &self,
         req: Authorized<CommitTransferRequest>,
     ) -> Result<CommitTransferResponse>;
-
-    async fn send_consignment(
-        &self,
-        req: Authorized<SendConsignmentRequest>,
-    ) -> Result<SendConsignmentResponse>;
-
-    async fn receive_consignment(
-        &self,
-        req: Authorized<ReceiveConsignmentRequest>,
-    ) -> Result<ReceiveConsignmentResponse>;
 
     async fn cancel_transfer(
         &self,

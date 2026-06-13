@@ -189,13 +189,11 @@ Current public daemon routes:
 POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
 POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
 POST /v1/assets/list            # Query account asset list, charges query_fee
+GET  /v1/tokens/list            # Public RGB20 contract/asset catalog, no signature required
 POST /v1/balance                # Query asset balance summary, charges query_fee
 POST /v1/balance/breakdown      # Query allocations and pending detail, charges query_fee
-POST /v1/invoices/create        # Create RGB receive invoice
 POST /v1/transfers/prepare      # Prepare RGB transfer, charges transfer_fee
-POST /v1/transfers/commit       # Commit txid after BTC broadcast
-POST /v1/consignments/send      # Build and transmit RGB consignment
-POST /v1/consignments/receive   # Receive external RGB consignment
+POST /v1/transfers/commit       # Commit txid and stage consignment for recipient
 POST /v1/transfers/cancel       # Cancel unfinished transfer
 POST /v1/pending/list           # List pending operations
 POST /v1/recover                # Promote/recover pending operations
@@ -205,22 +203,13 @@ POST /v1/test/rgb               # Controlled RGB lifecycle test route
 
 LN compose routes are service-owned state-transition APIs for `ln-rgb-lightning`. They require both the outer request signature and `asset_authorization`. Until the daemon RGB-LN state machine is wired to `rgb-service-local`, these routes fail loudly with HTTP 501 instead of falling back to local LN RGB state.
 
-All requests use `SignedRequest<T>`.
+All non-public requests use `SignedRequest<T>`.
 
-`prepare`, `commit`, and `send_consignment` also require `AssetSpendAuthorization`.
+`prepare` and `commit` also require `AssetSpendAuthorization`.
 
-The public daemon does not expose raw fascia download or arbitrary raw consignment download. Consignments move through controlled APIs:
-
-```text
-/v1/consignments/send
-/v1/consignments/receive
-```
-
-`/v1/consignments/send` delivers to the service inbox:
-
-```text
-transport.account_id
-```
+The service uses direct send: sender prepares and commits the transfer, and
+`/v1/transfers/commit` builds the consignment and stages it directly for the
+recipient account saved in `prepare.recipient`.
 
 ## Storage layout
 

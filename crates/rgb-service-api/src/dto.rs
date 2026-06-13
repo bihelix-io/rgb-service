@@ -59,6 +59,22 @@ pub struct ListAssetsResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenListResponse {
+    pub contracts: Vec<RgbContractInfo>,
+    pub assets: Vec<RgbAssetInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RgbContractInfo {
+    pub contract_id: ContractId,
+    pub schema: String,
+    pub asset_id: Option<AssetId>,
+    pub ticker: String,
+    pub name: String,
+    pub precision: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RgbAssetInfo {
     pub asset_id: AssetId,
     pub contract_id: ContractId,
@@ -151,27 +167,11 @@ pub enum AllocationStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateInvoiceRequest {
-    pub account_id: AccountId,
-    pub asset_id: AssetId,
-    pub amount: Option<u64>,
-    pub expiry_seconds: u64,
-    pub transport_hints: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateInvoiceResponse {
-    pub invoice_id: InvoiceId,
-    pub invoice: String,
-    pub blinded_seal: Option<String>,
-    pub expires_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PrepareTransferRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
     pub amount: u64,
+    /// Receiver account id inside this rgb-service daemon.
     pub recipient: String,
     pub fee_rate_sat_vb: Option<u64>,
     pub unsigned_anchor_psbt: Option<String>,
@@ -199,59 +199,6 @@ pub struct CommitTransferRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommitTransferResponse {
     pub transfer_id: TransferId,
-    pub operation_id: OperationId,
-    pub status: OperationStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SendConsignmentRequest {
-    pub account_id: AccountId,
-    pub transfer_id: TransferId,
-    pub asset_id: AssetId,
-    pub txid: Txid,
-    pub recipient_vout: Option<u32>,
-    pub transport: ConsignmentTransport,
-    pub asset_authorization: AssetSpendAuthorization,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SendConsignmentResponse {
-    pub transfer_id: TransferId,
-    pub operation_id: OperationId,
-    pub status: OperationStatus,
-    pub delivery: ConsignmentDelivery,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ConsignmentTransport {
-    pub account_id: AccountId,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ConsignmentDelivery {
-    pub account_id: AccountId,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsignmentDeliveryStatus {
-    Pending,
-    Sent,
-    Delivered,
-    Accepted,
-    Failed,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReceiveConsignmentRequest {
-    pub account_id: AccountId,
-    pub txid: Txid,
-    pub consignment_hex: String,
-    pub source_transfer_id: Option<TransferId>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReceiveConsignmentResponse {
     pub operation_id: OperationId,
     pub status: OperationStatus,
 }
@@ -498,11 +445,8 @@ account_scoped!(
     ListAssetsRequest,
     BalanceRequest,
     BalanceBreakdownRequest,
-    CreateInvoiceRequest,
     PrepareTransferRequest,
     CommitTransferRequest,
-    SendConsignmentRequest,
-    ReceiveConsignmentRequest,
     LnChannelOpenPrepareRequest,
     LnCommitmentComposeRequest,
     LnClosingComposeRequest,
@@ -521,12 +465,6 @@ impl AssetSpendAuthorized for PrepareTransferRequest {
 }
 
 impl AssetSpendAuthorized for CommitTransferRequest {
-    fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
-        Some(&self.asset_authorization)
-    }
-}
-
-impl AssetSpendAuthorized for SendConsignmentRequest {
     fn asset_spend_authorization(&self) -> Option<&AssetSpendAuthorization> {
         Some(&self.asset_authorization)
     }
