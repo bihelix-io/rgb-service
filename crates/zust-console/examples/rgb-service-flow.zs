@@ -30,5 +30,5 @@ let daemon_test = rgb::test({
   issue: issue,
   assets: assets,
   daemon_test: daemon_test,
-  ln: ln::status({}),
+  ln: ln::status(),
 }

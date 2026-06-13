@@ -51,7 +51,7 @@ fn print_help() {
         r#"examples:
   cargo run -p zust-console -- crates/zust-console/start.zs
   cargo run -p zust-console -- --once crates/zust-console/start.zs
-  cargo run -p zust-console -- -e 'ln::status({})'"#
+  cargo run -p zust-console -- -e 'ln::status()'"#
     );
 }
 

@@ -65,3 +65,6 @@ rgb-service-api = { version = "0.11.1-rc.10", path = "crates/rgb-service-api" }
 rgb-schemas = { version = "0.11.1-rc.10", path = "crates/rgb-schemas" }
 rgbstd = { package = "rgb-ops", version = "0.11.1-rc.10", path = "crates/rgb-ops" }
 root = { package = "zust-root", version = "0.9.6" }
+
+[patch.crates-io]
+lightning = { path = "crates/ln-rgb-lightning" }

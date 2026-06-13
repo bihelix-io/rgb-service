@@ -13,7 +13,7 @@ For one-shot execution:
 
 ```bash
 cargo run -p zust-console -- --once crates/zust-console/start.zs
-cargo run -p zust-console -- -e 'ln::status({})'
+cargo run -p zust-console -- -e 'ln::status()'
 ```
 
 Runtime config belongs in the script through `root::add`:
@@ -63,7 +63,7 @@ let lightning = ln::node_address({
   low_water_sats: 100000,
 });
 root::add("local/lightning", lightning);
-ln::start({})
+ln::start()
 ```
 
 The scanner thread is wired for L1/L2 incoming payment handling, but real chain

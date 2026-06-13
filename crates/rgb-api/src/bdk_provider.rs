@@ -17,10 +17,11 @@
 // limitations under the License.
 
 use std::convert::Infallible;
+use std::str::FromStr;
 
 use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey as BdkPropKey;
 use bdk_wallet::bitcoin::psbt::{Output as BdkOutput, Psbt as BdkPsbt};
-use bdk_wallet::bitcoin::{Amount, ScriptBuf};
+use bdk_wallet::bitcoin::{Address, Amount, ScriptBuf};
 use bdk_wallet::{PersistedWallet, TxOrdering};
 use psrgbt::{RgbPsbtExt, Terminal};
 use rgbstd::containers::Transfer;
@@ -143,5 +144,118 @@ impl<D> WalletProvider for PersistedWallet<D> {
         };
 
         Ok((psbt, meta))
+    }
+
+    fn create_psbt_no_beneficiary(
+        &mut self,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError> {
+        if matches!(close_method, CloseMethod::TapretFirst) {
+            return Err(CompositionError::UnsupportedCloseMethod(
+                "BDK does not support Tapret commitment method".to_string(),
+            ));
+        }
+
+        let mut tx_builder = self.build_tx();
+        tx_builder
+            .ordering(TxOrdering::Untouched)
+            .add_data(&[0; 32]);
+
+        for outpoint in prev_outpoints {
+            tx_builder
+                .add_utxo(outpoint)
+                .map_err(|e| CompositionError::Unexpected(e.to_string()))?;
+        }
+
+        tx_builder.fee_absolute(Amount::from_sat(params.tx.fee_sats));
+
+        let mut psbt = tx_builder
+            .finish()
+            .map_err(|e| CompositionError::Unexpected(e.to_string()))?;
+
+        let change_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_, output)| self.is_mine(output.script_pubkey.clone()))
+            .map(|(idx, _)| idx as u32);
+
+        psbt.set_opret_host();
+
+        Ok((
+            psbt,
+            PsbtMeta {
+                beneficiary_vout: None,
+                change_vout,
+            },
+        ))
+    }
+
+    fn create_psbt_with_address(
+        &mut self,
+        beneficiary_address: &str,
+        close_method: CloseMethod,
+        prev_outpoints: impl IntoIterator<Item = Outpoint>,
+        params: TransferParams,
+    ) -> Result<(Self::Psbt, PsbtMeta), CompositionError> {
+        if matches!(close_method, CloseMethod::TapretFirst) {
+            return Err(CompositionError::UnsupportedCloseMethod(
+                "BDK does not support Tapret commitment method".to_string(),
+            ));
+        }
+
+        let address = Address::from_str(beneficiary_address)
+            .map_err(|e| CompositionError::Unexpected(format!("invalid address: {e}")))?
+            .assume_checked();
+        let beneficiary_script = address.script_pubkey();
+
+        let mut tx_builder = self.build_tx();
+        tx_builder
+            .ordering(TxOrdering::Untouched)
+            .add_data(&[0; 32])
+            .add_recipient(beneficiary_script.clone(), Amount::from_sat(params.min_amount));
+
+        for outpoint in prev_outpoints {
+            tx_builder
+                .add_utxo(outpoint)
+                .map_err(|e| CompositionError::Unexpected(e.to_string()))?;
+        }
+
+        tx_builder.fee_absolute(Amount::from_sat(params.tx.fee_sats));
+
+        let mut psbt = tx_builder
+            .finish()
+            .map_err(|e| CompositionError::Unexpected(e.to_string()))?;
+
+        let beneficiary_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == beneficiary_script)
+            .map(|i| i as u32);
+
+        let change_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(idx, output)| {
+                self.is_mine(output.script_pubkey.clone())
+                    && (beneficiary_vout != Some(*idx as u32))
+            })
+            .map(|(idx, _)| idx as u32);
+
+        psbt.set_opret_host();
+
+        Ok((
+            psbt,
+            PsbtMeta {
+                beneficiary_vout,
+                change_vout,
+            },
+        ))
     }
 }

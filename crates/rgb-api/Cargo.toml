@@ -21,7 +21,7 @@ amplify = { workspace = true }
 nonasync = { workspace = true }
 baid64 = { workspace = true }
 rgb-strict-types = { workspace = true }
-bdk_wallet = { version = "=2.0.0", default-features = false, optional = true, features = [
+bdk_wallet = { version = "=2.2.0", default-features = false, optional = true, features = [
     "file_store",
     "keys-bip39",
     "std",

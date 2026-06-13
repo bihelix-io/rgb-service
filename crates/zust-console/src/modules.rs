@@ -4,19 +4,22 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
+use bip39::{Language as Bip39Language, Mnemonic as Bip39Mnemonic};
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
+use lightning::ln::msgs::SocketAddress;
 use lightning::rgb::{
     init_rgb_ln_tx_composer, ContractId as LnContractId, RequestSignature as LnRequestSignature,
     RgbAssetAmount, RgbChannelContext, RgbDaemonLnTxComposer, RgbLnTxComposer, RgbServiceClient,
     RgbServiceClientError, RgbServiceSigner,
 };
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use vm::Vm;
@@ -33,14 +36,138 @@ const LN_NODE_DEFAULT_PATH: &str = ".zust-console/ln-node.json";
 const LN_DATA_DIR_DEFAULT: &str = ".zust-console/lightning";
 const LN_LDK_DATA_DIR_DEFAULT: &str = ".zust-console/lightning/ldk";
 const LN_LISTEN_DEFAULT: &str = "0.0.0.0:9736";
-const LN_ESPLORA_DEFAULT: &str = "https://mempool.space/api";
+const LN_ESPLORA_DEFAULT: &str = "https://blockstream.info/api";
 const LN_LOW_WATER_SATS: u64 = 100_000;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static LN_RGB_COMPOSER: OnceLock<Arc<RgbDaemonLnTxComposer>> = OnceLock::new();
+static LN_LDK_NODE: OnceLock<Mutex<Option<Arc<ConsoleLdkNode>>>> = OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleLdkNode {
+    node: Arc<ldk_node::Node>,
+    events: Arc<Mutex<std::collections::VecDeque<String>>>,
+    stop_events: Arc<AtomicBool>,
+    event_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    storage_dir: String,
+    network: String,
+}
+
+impl ConsoleLdkNode {
+    fn start(config: ConsoleLdkConfig) -> Result<Arc<Self>> {
+        let mut ldk_config = ldk_node::config::Config {
+            network: config.network,
+            storage_dir_path: config.storage_dir.clone(),
+            ..ldk_node::config::Config::default()
+        };
+        ldk_config.trusted_peers_0conf = config
+            .trusted_peers_0conf
+            .iter()
+            .map(|peer| {
+                ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer)
+                    .with_context(|| format!("invalid 0-conf peer: {peer}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut builder = ldk_node::Builder::from_config(ldk_config);
+        let mnemonic = Bip39Mnemonic::parse_in_normalized(Bip39Language::English, &config.mnemonic)
+            .context("invalid LN node mnemonic")?;
+        builder.set_entropy_bip39_mnemonic(mnemonic, None);
+        if let Some(listen) = config.listen.as_deref() {
+            let listen_addr = SocketAddress::from_str(listen)
+                .map_err(|_| anyhow::anyhow!("invalid LDK listen address: {listen}"))?;
+            builder
+                .set_listening_addresses(vec![listen_addr])
+                .map_err(|err| anyhow::anyhow!("invalid LDK listening address: {err:?}"))?;
+        }
+        builder.set_chain_source_esplora(config.esplora.clone(), None);
+        builder.set_gossip_source_p2p();
+        let node = Arc::new(builder.build().with_context(|| {
+            format!(
+                "failed to build LDK node at {}; use a fresh ldk_data_dir if it was initialized with another seed",
+                config.storage_dir
+            )
+        })?);
+        node.start().context("start LDK node")?;
+
+        let events = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        events
+            .lock()
+            .expect("LN event lock poisoned")
+            .push_back("ldk-node runtime started".to_string());
+        let stop_events = Arc::new(AtomicBool::new(false));
+        let thread_node = Arc::clone(&node);
+        let thread_events = Arc::clone(&events);
+        let thread_stop = Arc::clone(&stop_events);
+        let event_thread = thread::Builder::new()
+            .name("zust-ln-ldk-event-pump".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    if let Some(event) = thread_node.next_event() {
+                        let debug = format!("{event:?}");
+                        thread_events
+                            .lock()
+                            .expect("LN event lock poisoned")
+                            .push_back(debug);
+                        if let Err(err) = thread_node.event_handled() {
+                            thread_events
+                                .lock()
+                                .expect("LN event lock poisoned")
+                                .push_back(format!("ldk-node event_handled failed: {err:?}"));
+                        }
+                    } else {
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            })
+            .context("spawn LDK event pump")?;
+
+        Ok(Arc::new(Self {
+            node,
+            events,
+            stop_events,
+            event_thread: Mutex::new(Some(event_thread)),
+            storage_dir: config.storage_dir,
+            network: config.network_name,
+        }))
+    }
+
+    fn stop(&self) -> Result<()> {
+        self.stop_events.store(true, Ordering::SeqCst);
+        if let Some(handle) = self
+            .event_thread
+            .lock()
+            .expect("LN event thread lock poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
+        self.node.stop().context("stop LDK node")?;
+        self.events
+            .lock()
+            .expect("LN event lock poisoned")
+            .push_back("ldk-node runtime stopped".to_string());
+        Ok(())
+    }
+}
+
+impl Drop for ConsoleLdkNode {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+struct ConsoleLdkConfig {
+    network: ldk_node::bitcoin::Network,
+    network_name: String,
+    storage_dir: String,
+    esplora: String,
+    listen: Option<String>,
+    mnemonic: String,
+    trusted_peers_0conf: Vec<String>,
+}
 
 struct ConsoleRgbServiceSigner;
 
@@ -260,31 +387,59 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
         Type::Any,
         ln_spawn_scanner as *const u8,
     )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "start",
-        &[Type::Any],
-        Type::Any,
-        ln_start as *const u8,
-    )?;
+    jit.add_native_module_ptr("ln", "start", &[], Type::Any, ln_start as *const u8)?;
+    jit.add_native_module_ptr("ln", "stop", &[], Type::Any, ln_stop as *const u8)?;
     jit.add_native_module_ptr(
         "ln",
         "scanner_status",
-        &[Type::Any],
+        &[],
         Type::Any,
         ln_scanner_status as *const u8,
     )?;
+    jit.add_native_module_ptr("ln", "status", &[], Type::Any, ln_status as *const u8)?;
+    jit.add_native_module_ptr("ln", "events", &[], Type::Any, ln_events as *const u8)?;
     jit.add_native_module_ptr(
         "ln",
-        "status",
-        &[Type::Any],
+        "get_node_id",
+        &[],
         Type::Any,
-        ln_status as *const u8,
+        ln_get_node_id as *const u8,
+    )?;
+    jit.add_native_module_ptr("ln", "get_addr", &[], Type::Any, ln_get_addr as *const u8)?;
+    jit.add_native_module_ptr("ln", "get_peers", &[], Type::Any, ln_get_peers as *const u8)?;
+    jit.add_native_module_ptr(
+        "ln",
+        "get_channels",
+        &[],
+        Type::Any,
+        ln_get_channels as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln",
-        "token_list",
+        "connect",
         &[Type::Any],
+        Type::Any,
+        ln_connect as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "open_channel",
+        &[Type::Any],
+        Type::Any,
+        ln_open_channel as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
+        "invoice",
+        &[Type::Any],
+        Type::Any,
+        ln_invoice as *const u8,
+    )?;
+    jit.add_native_module_ptr("ln", "pay", &[Type::Any], Type::Any, ln_pay as *const u8)?;
+    jit.add_native_module_ptr(
+        "ln",
+        "token_list",
+        &[],
         Type::Any,
         ln_token_list as *const u8,
     )?;
@@ -476,8 +631,31 @@ extern "C" fn rgb_test(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/test/rgb")
 }
 
-extern "C" fn ln_status(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |_input| {
+extern "C" fn ln_status() -> *const Dynamic {
+    native_result(|| {
+        let node = current_ln_node();
+        let (node_id, status, peers, channels, balances, storage_dir, network) =
+            if let Some(node) = node.as_ref() {
+                (
+                    node.node.node_id().to_string(),
+                    format!("{:?}", node.node.status()),
+                    node.node.list_peers().len(),
+                    node.node.list_channels().len(),
+                    Some(node.node.list_balances()),
+                    node.storage_dir.clone(),
+                    node.network.clone(),
+                )
+            } else {
+                (
+                    String::new(),
+                    "stopped".to_string(),
+                    0,
+                    0,
+                    None,
+                    String::new(),
+                    String::new(),
+                )
+            };
         Ok(ok(json!({
             "module": "ln",
             "enabled": true,
@@ -487,13 +665,28 @@ extern "C" fn ln_status(input: *const Dynamic) -> *const Dynamic {
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "layers": ["l1", "l2"],
             "mode": "hot_wallet",
-            "backend": "ln-rgb-lightning"
+            "backend": "ldk-node",
+            "rgb_backend": "ln-rgb-lightning",
+            "node_id": node_id,
+            "status": status,
+            "network": network,
+            "storage_dir": storage_dir,
+            "peer_count": peers,
+            "channel_count": channels,
+            "balances": balances.map(|balance| json!({
+                "total_onchain_balance_sats": balance.total_onchain_balance_sats,
+                "spendable_onchain_balance_sats": balance.spendable_onchain_balance_sats,
+                "total_anchor_channels_reserve_sats": balance.total_anchor_channels_reserve_sats,
+                "total_lightning_balance_sats": balance.total_lightning_balance_sats,
+                "lightning_balances": format!("{:?}", balance.lightning_balances),
+                "pending_channel_closure_sweeps": format!("{:?}", balance.pending_balances_from_channel_closures)
+            }))
         })))
     })
 }
 
-extern "C" fn ln_token_list(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |_input| {
+extern "C" fn ln_token_list() -> *const Dynamic {
+    native_result(|| {
         let signer: Arc<dyn RgbServiceSigner + Send + Sync> = Arc::new(ConsoleRgbServiceSigner);
         let client =
             RgbServiceClient::new(daemon_url()?, signer).map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -523,26 +716,32 @@ extern "C" fn ln_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let lightning = if is_null_or_empty_object(input) {
-            local_dynamic("lightning").context(
-                "missing root value `local/lightning`; run ln::node_address and root::add first",
-            )?
-        } else {
-            input.clone()
-        };
-        let node = dynamic_to_json(&lightning);
-        let address = find_string_field(&node, &["address", "btc_address"]).unwrap_or_default();
-        let low_water_sats = value_u64(&node, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
-        let config = normalized_ln_config(ln_config_from_value(&node), low_water_sats);
+extern "C" fn ln_start() -> *const Dynamic {
+    native_result(|| {
+        let lightning = local_dynamic("lightning").context(
+            "missing root value `local/lightning`; run ln::node_address and root::add first",
+        )?;
+        let requested = dynamic_to_json(&lightning);
+        let path = find_string_field(&requested, &["path"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ln_node_path(&lightning));
+        let mut stored = read_json_file(&path)
+            .with_context(|| format!("read LN node state {}", path.display()))?;
+        let address = find_string_field(&stored, &["address", "btc_address"]).unwrap_or_default();
+        let low_water_sats = value_u64(&stored, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
+        let config = normalized_ln_config(ln_config_from_value(&stored), low_water_sats);
+        let mnemonic = ensure_ln_entropy_mnemonic(&mut stored)?;
+        write_private_json_file(&path, &stored)
+            .with_context(|| format!("write LN node state {}", path.display()))?;
         let composer_bound = bind_ln_rgb_composer()?;
         let interval_ms = optional_u64(&lightning, "interval_ms")
-            .or_else(|| value_u64(&node, "interval_ms"))
+            .or_else(|| value_u64(&stored, "interval_ms"))
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
         let interval = Duration::from_millis(interval_ms.max(1000));
+        let ldk_config = console_ldk_config(&config, mnemonic)?;
 
         if LN_STARTED.swap(true, Ordering::SeqCst) {
+            let node = current_ln_node();
             return Ok(ok(json!({
                 "module": "ln",
                 "started": true,
@@ -550,18 +749,33 @@ extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
                 "address": address,
                 "config": config,
                 "source": "local/lightning",
-                "backend": "ln-rgb-lightning",
+                "backend": "ldk-node",
+                "rgb_backend": "ln-rgb-lightning",
                 "ln_rgb_composer_bound": composer_bound,
+                "node_id": node.as_ref().map(|node| node.node.node_id().to_string()).unwrap_or_default(),
                 "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
                 "scan_enabled": false
             })));
         }
 
-        let thread_node = node.clone();
+        let node_handle = match ConsoleLdkNode::start(ldk_config) {
+            Ok(node) => node,
+            Err(err) => {
+                LN_STARTED.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+        };
+        let node_id = node_handle.node.node_id().to_string();
+        *ln_node_slot().lock().expect("LN node slot lock poisoned") =
+            Some(Arc::clone(&node_handle));
+
+        let thread_node = stored.clone();
         if let Err(err) = thread::Builder::new()
             .name("zust-ln-inbound-listener".to_string())
             .spawn(move || ln_inbound_loop(thread_node, interval))
         {
+            let _ = node_handle.stop();
+            *ln_node_slot().lock().expect("LN node slot lock poisoned") = None;
             LN_STARTED.store(false, Ordering::SeqCst);
             return Err(err).context("spawn LN inbound listener thread");
         }
@@ -573,11 +787,210 @@ extern "C" fn ln_start(input: *const Dynamic) -> *const Dynamic {
             "address": address,
             "config": config,
             "source": "local/lightning",
-            "backend": "ln-rgb-lightning",
+            "backend": "ldk-node",
+            "rgb_backend": "ln-rgb-lightning",
             "ln_rgb_composer_bound": composer_bound,
+            "node_id": node_id,
             "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
             "scan_enabled": false,
-            "note": "LN inbound listener is running with ln-rgb-lightning RGB daemon composer; real L1/L2 scanning is intentionally disabled"
+            "note": "LDK node runtime is running with ln-rgb-lightning RGB daemon composer; L1/L2 event pump is active"
+        })))
+    })
+}
+
+extern "C" fn ln_stop() -> *const Dynamic {
+    native_result(|| {
+        let node = ln_node_slot()
+            .lock()
+            .expect("LN node slot lock poisoned")
+            .take();
+        if let Some(node) = node {
+            node.stop()?;
+        }
+        LN_STARTED.store(false, Ordering::SeqCst);
+        Ok(ok(json!({
+            "module": "ln",
+            "stopped": true,
+            "backend": "ldk-node"
+        })))
+    })
+}
+
+extern "C" fn ln_events() -> *const Dynamic {
+    native_result(|| ln_events_with_limit(100))
+}
+
+fn ln_events_with_limit(limit: usize) -> Result<Dynamic> {
+    let node = running_ln_node()?;
+    let mut events = node.events.lock().expect("LN event lock poisoned");
+    let mut out = Vec::new();
+    for _ in 0..limit {
+        let Some(event) = events.pop_front() else {
+            break;
+        };
+        out.push(json!(event));
+    }
+    Ok(ok(json!({
+        "module": "ln",
+        "events": out
+    })))
+}
+
+extern "C" fn ln_get_node_id() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        Ok(ok(json!({
+            "module": "ln",
+            "node_id": node.node.node_id().to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_get_addr() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        let address = node
+            .node
+            .onchain_payment()
+            .new_address()
+            .context("create LDK on-chain address")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "address": address.to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_get_peers() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        let peers = node
+            .node
+            .list_peers()
+            .into_iter()
+            .map(|peer| {
+                json!({
+                    "node_id": peer.node_id.to_string(),
+                    "address": peer.address.to_string(),
+                    "persisted": peer.is_persisted,
+                    "connected": peer.is_connected
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(ok(json!({
+            "module": "ln",
+            "peers": peers
+        })))
+    })
+}
+
+extern "C" fn ln_get_channels() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        let channels = node
+            .node
+            .list_channels()
+            .into_iter()
+            .map(|channel| {
+                json!({
+                    "user_channel_id": format!("{:?}", channel.user_channel_id),
+                    "counterparty_node_id": channel.counterparty_node_id.to_string(),
+                    "channel_value_sats": channel.channel_value_sats,
+                    "is_outbound": channel.is_outbound,
+                    "is_channel_ready": channel.is_channel_ready,
+                    "is_usable": channel.is_usable,
+                    "channel_id": format!("{:?}", channel.channel_id),
+                    "outbound_capacity_msat": channel.outbound_capacity_msat,
+                    "next_outbound_htlc_limit_msat": channel.next_outbound_htlc_limit_msat,
+                    "inbound_capacity_msat": channel.inbound_capacity_msat,
+                    "funding_txo": channel.funding_txo.map(|funding_txo| format!("{funding_txo:?}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(ok(json!({
+            "module": "ln",
+            "channels": channels
+        })))
+    })
+}
+
+extern "C" fn ln_connect(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
+        let address = SocketAddress::from_str(&required_string(input, "address")?)
+            .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
+        let persist = optional_bool(input, "persist").unwrap_or(true);
+        node.node
+            .connect(peer_node_id, address.clone(), persist)
+            .context("connect LDK peer")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "connected": true,
+            "node_id": peer_node_id.to_string(),
+            "address": address.to_string(),
+            "persist": persist
+        })))
+    })
+}
+
+extern "C" fn ln_open_channel(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
+        let address = SocketAddress::from_str(&required_string(input, "address")?)
+            .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
+        let amount_sats = required_u64(input, "amount_sats")?;
+        let push_msat = optional_u64(input, "push_msat");
+        let user_channel_id = node
+            .node
+            .open_channel(peer_node_id, address.clone(), amount_sats, push_msat, None)
+            .context("open LDK channel")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "channel_open_submitted": true,
+            "user_channel_id": format!("{user_channel_id:?}"),
+            "node_id": peer_node_id.to_string(),
+            "address": address.to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let amount_msat = required_u64(input, "amount_msat")?;
+        let description = optional_string(input, "description")
+            .unwrap_or_else(|| "BiHelix LN invoice".to_string());
+        let expiry_secs = optional_u64(input, "expiry_secs").unwrap_or(3600) as u32;
+        let description = Bolt11InvoiceDescription::Direct(
+            Description::new(description).map_err(|err| anyhow::anyhow!("{err:?}"))?,
+        );
+        let invoice = node
+            .node
+            .bolt11_payment()
+            .receive(amount_msat, &description, expiry_secs)
+            .context("create BOLT11 invoice")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "invoice": invoice.to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let invoice = Bolt11Invoice::from_str(&required_string(input, "invoice")?)
+            .context("parse BOLT11 invoice")?;
+        let payment_id = node
+            .node
+            .bolt11_payment()
+            .send(&invoice, None)
+            .context("send BOLT11 payment")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "payment_id": format!("{payment_id:?}")
         })))
     })
 }
@@ -635,6 +1048,7 @@ extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
             let mut stored = read_json_file(&path)
                 .with_context(|| format!("read LN node state {}", path.display()))?;
             update_ln_node_config(&mut stored, config, low_water_sats);
+            ensure_ln_entropy_mnemonic(&mut stored)?;
             write_private_json_file(&path, &stored)
                 .with_context(|| format!("write LN node state {}", path.display()))?;
             return Ok(ok(redacted_ln_node_response(stored, &path, false)));
@@ -658,6 +1072,8 @@ extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
             "config": config,
             "signer_response": signer_response
         });
+        let mut stored = stored;
+        ensure_ln_entropy_mnemonic(&mut stored)?;
         write_private_json_file(&path, &stored)
             .with_context(|| format!("write LN node state {}", path.display()))?;
         Ok(ok(redacted_ln_node_response(stored, &path, true)))
@@ -681,8 +1097,121 @@ fn bind_ln_rgb_composer() -> Result<bool> {
     Ok(LN_RGB_COMPOSER.get().is_some())
 }
 
-extern "C" fn ln_scanner_status(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |_input| {
+fn ln_node_slot() -> &'static Mutex<Option<Arc<ConsoleLdkNode>>> {
+    LN_LDK_NODE.get_or_init(|| Mutex::new(None))
+}
+
+fn current_ln_node() -> Option<Arc<ConsoleLdkNode>> {
+    ln_node_slot()
+        .lock()
+        .expect("LN node slot lock poisoned")
+        .as_ref()
+        .cloned()
+}
+
+fn running_ln_node() -> Result<Arc<ConsoleLdkNode>> {
+    current_ln_node().context("LDK node is not running; call ln::start() first")
+}
+
+fn console_ldk_config(config: &Value, mnemonic: String) -> Result<ConsoleLdkConfig> {
+    let network_name = config
+        .get("network")
+        .and_then(Value::as_str)
+        .unwrap_or("bitcoin")
+        .to_string();
+    let network = parse_ldk_network(&network_name)?;
+    let storage_dir = config
+        .get("ldk_data_dir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(LN_LDK_DATA_DIR_DEFAULT)
+        .to_string();
+    let listen = config
+        .get("listen")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let trusted_peers_0conf = value_string_list(config, "trusted_peers_0conf")?;
+    let esplora = config
+        .get("chain_source")
+        .and_then(|chain_source| {
+            chain_source
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    chain_source
+                        .get("urls")
+                        .and_then(Value::as_array)
+                        .and_then(|values| values.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| LN_ESPLORA_DEFAULT.to_string());
+    Ok(ConsoleLdkConfig {
+        network,
+        network_name,
+        storage_dir,
+        esplora,
+        listen,
+        mnemonic,
+        trusted_peers_0conf,
+    })
+}
+
+fn parse_ldk_network(value: &str) -> Result<ldk_node::bitcoin::Network> {
+    match value {
+        "bitcoin" | "mainnet" => Ok(ldk_node::bitcoin::Network::Bitcoin),
+        "testnet" => Ok(ldk_node::bitcoin::Network::Testnet),
+        "testnet4" => Ok(ldk_node::bitcoin::Network::Testnet4),
+        "signet" => Ok(ldk_node::bitcoin::Network::Signet),
+        "regtest" => Ok(ldk_node::bitcoin::Network::Regtest),
+        _ => bail!("unsupported LN network `{value}`"),
+    }
+}
+
+fn ldk_public_key(value: &str) -> Result<ldk_node::bitcoin::secp256k1::PublicKey> {
+    ldk_node::bitcoin::secp256k1::PublicKey::from_str(value)
+        .with_context(|| format!("invalid LN node id: {value}"))
+}
+
+fn ensure_ln_entropy_mnemonic(stored: &mut Value) -> Result<String> {
+    if let Some(mnemonic) = find_string_field(stored, &["entropy_mnemonic", "mnemonic"])
+        .filter(|value| value != "<persisted>")
+    {
+        return Ok(mnemonic);
+    }
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).context("generate LN node entropy")?;
+    let mnemonic = Bip39Mnemonic::from_entropy_in(Bip39Language::English, &entropy)
+        .context("create LN node mnemonic")?
+        .to_string();
+    if let Value::Object(object) = stored {
+        object.insert("entropy_mnemonic".to_string(), json!(mnemonic.clone()));
+    }
+    Ok(mnemonic)
+}
+
+fn value_string_list(value: &Value, key: &str) -> Result<Vec<String>> {
+    match value.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("{key} entries must be strings"))
+            })
+            .collect(),
+        Some(Value::String(item)) if !item.trim().is_empty() => Ok(vec![item.clone()]),
+        Some(Value::Null) | None => Ok(Vec::new()),
+        _ => bail!("{key} must be a string list"),
+    }
+}
+
+extern "C" fn ln_scanner_status() -> *const Dynamic {
+    native_result(|| {
         Ok(ok(json!({
             "module": "ln",
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
@@ -693,13 +1222,13 @@ extern "C" fn ln_scanner_status(input: *const Dynamic) -> *const Dynamic {
 }
 
 fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) {
-    loop {
+    while LN_SCANNER_STARTED.load(Ordering::SeqCst) {
         thread::sleep(interval);
     }
 }
 
 fn ln_inbound_loop(_node: Value, interval: Duration) {
-    loop {
+    while LN_STARTED.load(Ordering::SeqCst) {
         thread::sleep(interval);
     }
 }
@@ -1156,13 +1685,6 @@ fn msgpack_to_dynamic(bytes: &[u8]) -> Result<Dynamic> {
         "trailing data after Zust Dynamic msgpack payload"
     );
     Ok(dynamic)
-}
-
-fn is_null_or_empty_object(value: &Dynamic) -> bool {
-    if matches!(value, Dynamic::Null) {
-        return true;
-    }
-    matches!(dynamic_to_json(value), Value::Object(object) if object.is_empty())
 }
 
 fn ln_node_path(input: &Dynamic) -> PathBuf {

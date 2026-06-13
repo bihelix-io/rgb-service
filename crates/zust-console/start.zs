@@ -6,7 +6,7 @@ let ln_node_config = {
   network: "bitcoin",
   chain_source: {
     kind: "esplora",
-    url: "https://mempool.space/api"
+    url: "https://blockstream.info/api"
   },
   data_dir: ".zust-console/lightning",
   ldk_data_dir: ".zust-console/lightning/ldk",
@@ -37,6 +37,6 @@ root::add("local/lightning/node", lightning.config);
     operation: "btc",
   }),
   lightning: root::get("local/lightning"),
-  ln_start: ln::start({}),
-  ln: ln::status({}),
+  ln_start: ln::start(),
+  ln: ln::status(),
 }
