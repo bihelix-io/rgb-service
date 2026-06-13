@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;
-use rgbstd::{containers::ValidTransfer, ContractId};
+use lightning::rgb::RgbFundingRef;
+use rgbstd::ContractId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ChannelId(pub [u8; 32]);
@@ -31,7 +32,7 @@ pub struct RgbFundingTransfer {
     pub temporary_channel_id: ChannelId,
     pub peer_node_id: PublicKey,
     pub funding_outpoint: OutPoint,
-    pub transfer: ValidTransfer,
+    pub funding_ref: RgbFundingRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

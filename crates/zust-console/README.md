@@ -37,6 +37,43 @@ Signer requests are sent to the configured signer App over iroh as Dynamic msgpa
 [path, body]
 ```
 
+BTC deposit address pool uses this signer request:
+
+```text
+path = "/v1/signer/address/batch"
+body = {
+  account_id: "<wallet btc address>",
+  network: "bitcoin",
+  purpose: "low_water_refill" | "manual_refill",
+  count: 20,
+  timestamp_ms: 1780000000000,
+}
+```
+
+The signer response must be:
+
+```text
+{
+  account_id: "<wallet btc address>",
+  network: "bitcoin",
+  count: 20,
+  addresses: [
+    {
+      address: "bc1...",
+      derivation_path: "m/84'/0'/0'/0/12",
+      index: 12,
+      script_pubkey: "...",
+    },
+  ],
+}
+```
+
+`addresses.length` must equal `count`, and every item must contain a non-empty
+`address`. `zust-console` persists these records in the local address pool, and
+`btc::get_deposit_address("...")` consumes one local pooled address
+without asking the signer again. The scanner refills when the pool drops below
+the low-water mark.
+
 Inside the REPL, admin/debug code is executed directly:
 
 ```zs
@@ -45,6 +82,10 @@ btc::balance()
 btc::utxos()
 btc::assets()
 btc::status()
+btc::address_pool_status()
+btc::refill_address_pool(20)
+btc::get_deposit_address("alice")
+btc::scan_deposits()
 
 rgb::assets()
 rgb::token_list()
@@ -60,9 +101,9 @@ ln::spawn_scanner({
 ```
 
 `ln::node_address` loads `.zust-console/ln-node.json` if it exists. If it does
-not exist, it asks the signer App for `/v1/signer/address/new` and persists the
-full signer response locally with file mode `0600`. Console output redacts
-private key, seed, mnemonic, WIF, and xprv fields.
+not exist, it creates a local LN hot-wallet mnemonic, derives a spendable BDK
+wallet address, and persists the node state locally with file mode `0600`.
+Console output redacts private key, seed, mnemonic, WIF, and xprv fields.
 
 `start.zs` stores the returned node object in `local/lightning` and starts LN:
 
@@ -75,8 +116,8 @@ root::add("local/lightning", lightning);
 ln::start()
 ```
 
-The scanner thread is wired for L1/L2 incoming payment handling, but real chain
-scanning is intentionally disabled for now.
+The scanner thread maintains the BTC deposit address pool and scans stored
+deposit addresses through Esplora, persisting discovered outpoints locally.
 
 BTC module scope:
 
@@ -84,9 +125,13 @@ BTC module scope:
 btc::balance()
 btc::utxos()
 btc::assets()
-btc::tx_status({ txid: "..." })
-btc::sign_psbt({ psbt: "..." })
-btc::broadcast({ tx_hex: "..." })
+btc::address_pool_status()
+btc::refill_address_pool(20)
+btc::get_deposit_address("alice")
+btc::scan_deposits()
+btc::tx_status("...")
+btc::sign_psbt("...")
+btc::broadcast("...")
 ```
 
 `btc::assets()` and `rgb::assets()` read `local/btc-addr`, fetch its current

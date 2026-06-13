@@ -2,20 +2,21 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use fjall::{
     KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace,
 };
-use rgbstd::persistence::fjall::FjallBinStore;
+use serde_json::Value;
 
 const LOCAL_STORE_DIR: &str = "local-store";
-const RGB_STOCK_PARTITION: &str = "rgb_stock";
-const RGB_PENDING_OPS_PARTITION: &str = "rgb_pending_ops";
 const IDENT_BTC_ADDRESS_PARTITION: &str = "ident_btc_address";
 const WALLET_BTC_ADDRESS_PARTITION: &str = "wallet_btc_address";
+const BTC_DEPOSIT_RECORDS_PARTITION: &str = "btc_deposit_records";
+const BTC_ADDRESS_POOL_PARTITION: &str = "btc_address_pool_available";
+const BTC_ADDRESS_POOL_USED_PARTITION: &str = "btc_address_pool_used";
 const DEFAULT_WALLET_BTC_ADDRESS_KEY: &str = "default";
 const IDENT_LN_INVOICE_PARTITION: &str = "ident_ln_invoice";
 const LN_PAYMENT_HASH_IDENT_PARTITION: &str = "ln_payment_hash_ident";
@@ -30,7 +31,6 @@ pub struct LocalNodeStore {
 struct LocalNodeStoreInner {
     path: PathBuf,
     db: SingleWriterTxDatabase,
-    rgb_stock_lock: RwLock<()>,
 }
 
 impl LocalNodeStore {
@@ -58,7 +58,6 @@ impl LocalNodeStore {
         let inner = Arc::new(LocalNodeStoreInner {
             path: path.clone(),
             db,
-            rgb_stock_lock: RwLock::new(()),
         });
         stores.insert(path, Arc::clone(&inner));
         Ok(Self { inner })
@@ -66,23 +65,6 @@ impl LocalNodeStore {
 
     pub fn path(&self) -> &Path {
         &self.inner.path
-    }
-
-    pub fn rgb_stock_store(&self) -> Result<FjallBinStore> {
-        self.rgb_stock_store_for_partition(RGB_STOCK_PARTITION)
-    }
-
-    pub fn rgb_stock_has_data(&self) -> Result<bool> {
-        self.rgb_stock_partition_has_data(RGB_STOCK_PARTITION)
-    }
-
-    pub fn with_rgb_stock_write_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _guard = self
-            .inner
-            .rgb_stock_lock
-            .write()
-            .map_err(|err| anyhow!("local RGB stock write lock poisoned: {err}"))?;
-        f()
     }
 
     pub fn persist(&self) -> Result<()> {
@@ -127,6 +109,91 @@ impl LocalNodeStore {
         )
     }
 
+    pub fn put_btc_deposit_record(&self, outpoint: &str, record: &Value) -> Result<()> {
+        let bytes = serde_json::to_vec(record).context("encode BTC deposit record")?;
+        self.put_bytes(BTC_DEPOSIT_RECORDS_PARTITION, outpoint, &bytes)
+    }
+
+    pub fn list_btc_deposit_records(&self) -> Result<Vec<(String, Value)>> {
+        let keyspace = self.keyspace(BTC_DEPOSIT_RECORDS_PARTITION)?;
+        self.inner
+            .db
+            .read_tx()
+            .iter(&keyspace)
+            .map(|item| {
+                let (key, value) = item.into_inner().with_context(|| {
+                    format!("iterate local Fjall partition `{BTC_DEPOSIT_RECORDS_PARTITION}`")
+                })?;
+                let key = String::from_utf8(key.as_ref().to_vec()).with_context(|| {
+                    format!("decode local Fjall key from `{BTC_DEPOSIT_RECORDS_PARTITION}`")
+                })?;
+                let value = serde_json::from_slice(value.as_ref())
+                    .with_context(|| format!("decode BTC deposit record `{key}`"))?;
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    pub fn put_btc_address_pool_record(&self, address: &str, record: &Value) -> Result<()> {
+        let bytes = serde_json::to_vec(record).context("encode BTC address pool record")?;
+        self.put_bytes(BTC_ADDRESS_POOL_PARTITION, address, &bytes)
+    }
+
+    pub fn list_btc_address_pool_records(&self) -> Result<Vec<(String, Value)>> {
+        let keyspace = self.keyspace(BTC_ADDRESS_POOL_PARTITION)?;
+        self.inner
+            .db
+            .read_tx()
+            .iter(&keyspace)
+            .map(|item| {
+                let (key, value) = item.into_inner().with_context(|| {
+                    format!("iterate local Fjall partition `{BTC_ADDRESS_POOL_PARTITION}`")
+                })?;
+                let key = String::from_utf8(key.as_ref().to_vec()).with_context(|| {
+                    format!("decode local Fjall key from `{BTC_ADDRESS_POOL_PARTITION}`")
+                })?;
+                let value = serde_json::from_slice(value.as_ref())
+                    .with_context(|| format!("decode BTC address pool record `{key}`"))?;
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    pub fn remove_btc_address_pool_record(&self, address: &str) -> Result<()> {
+        let keyspace = self.keyspace(BTC_ADDRESS_POOL_PARTITION)?;
+        let mut tx = self.inner.db.write_tx();
+        tx.remove(&keyspace, address.as_bytes());
+        tx.commit().with_context(|| {
+            format!("remove local Fjall key `{address}` from `{BTC_ADDRESS_POOL_PARTITION}`")
+        })?;
+        self.persist()
+    }
+
+    pub fn put_used_btc_address_pool_record(&self, address: &str, record: &Value) -> Result<()> {
+        let bytes = serde_json::to_vec(record).context("encode used BTC address pool record")?;
+        self.put_bytes(BTC_ADDRESS_POOL_USED_PARTITION, address, &bytes)
+    }
+
+    pub fn list_used_btc_address_pool_records(&self) -> Result<Vec<(String, Value)>> {
+        let keyspace = self.keyspace(BTC_ADDRESS_POOL_USED_PARTITION)?;
+        self.inner
+            .db
+            .read_tx()
+            .iter(&keyspace)
+            .map(|item| {
+                let (key, value) = item.into_inner().with_context(|| {
+                    format!("iterate local Fjall partition `{BTC_ADDRESS_POOL_USED_PARTITION}`")
+                })?;
+                let key = String::from_utf8(key.as_ref().to_vec()).with_context(|| {
+                    format!("decode local Fjall key from `{BTC_ADDRESS_POOL_USED_PARTITION}`")
+                })?;
+                let value = serde_json::from_slice(value.as_ref())
+                    .with_context(|| format!("decode used BTC address pool record `{key}`"))?;
+                Ok((key, value))
+            })
+            .collect()
+    }
+
     pub fn get_ident_ln_invoice(&self, ident: &str) -> Result<Option<String>> {
         self.get_string(IDENT_LN_INVOICE_PARTITION, ident)
     }
@@ -141,30 +208,6 @@ impl LocalNodeStore {
 
     pub fn put_ln_payment_hash_ident(&self, payment_hash: &str, ident: &str) -> Result<()> {
         self.put_string(LN_PAYMENT_HASH_IDENT_PARTITION, payment_hash, ident)
-    }
-
-    pub fn get_rgb_pending_op(&self, txid: impl std::fmt::Display) -> Result<Option<Vec<u8>>> {
-        self.get_bytes(RGB_PENDING_OPS_PARTITION, &txid.to_string())
-    }
-
-    pub fn put_rgb_pending_op(&self, txid: impl std::fmt::Display, op: &[u8]) -> Result<()> {
-        self.put_bytes(RGB_PENDING_OPS_PARTITION, &txid.to_string(), op)
-    }
-
-    pub fn remove_rgb_pending_op(&self, txid: impl std::fmt::Display) -> Result<()> {
-        let keyspace = self.keyspace(RGB_PENDING_OPS_PARTITION)?;
-        let mut tx = self.inner.db.write_tx();
-        tx.remove(&keyspace, txid.to_string().as_bytes());
-        tx.commit()
-            .with_context(|| format!("remove RGB pending op {txid}"))?;
-        self.persist()
-    }
-
-    fn rgb_stock_store_for_partition(&self, partition: &str) -> Result<FjallBinStore> {
-        Ok(
-            FjallBinStore::with_database(self.inner.path.clone(), self.inner.db.clone(), partition)
-                .with_context(|| format!("open RGB stock partition `{partition}`"))?,
-        )
     }
 
     fn keyspace(&self, partition: &str) -> Result<SingleWriterTxKeyspace> {
@@ -222,12 +265,6 @@ impl LocalNodeStore {
         tx.commit()
             .with_context(|| format!("commit local Fjall key `{key}` into `{partition}`"))?;
         self.persist()
-    }
-
-    fn rgb_stock_partition_has_data(&self, partition: &str) -> Result<bool> {
-        self.rgb_stock_store_for_partition(partition)?
-            .has_data()
-            .map_err(|err| anyhow!("check RGB stock partition `{partition}`: {err:?}"))
     }
 }
 

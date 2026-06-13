@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use bitcoin::{secp256k1::PublicKey, Network};
-use iroh::EndpointAddr;
 use lightning::ln::msgs::SocketAddress;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription};
 
@@ -104,18 +103,12 @@ pub struct BtcLnRuntimeConfig {
     pub esplora: String,
     pub esplora_urls: Vec<String>,
     pub esplora_api_key: Option<String>,
+    pub rgb_service_url: String,
+    pub account_id: String,
     pub listen: Option<String>,
     pub entropy_mnemonic: Option<String>,
     pub trusted_peers_0conf: Vec<String>,
     pub accept_inbound_channels: bool,
-    pub accept_inbound_rgb_transfers: bool,
-    pub iroh_tunnel_peers: Vec<IrohTunnelPeerConfig>,
-}
-
-#[derive(Clone, Debug)]
-pub struct IrohTunnelPeerConfig {
-    pub node_id: PublicKey,
-    pub endpoint_addr: EndpointAddr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,7 +142,6 @@ pub trait BtcLnNode {
     fn next_btc_ln_event(&self) -> Option<BtcLnEvent>;
     fn event_handled(&self) -> Result<()>;
 
-    fn new_onchain_address(&self) -> Result<String>;
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot;
     fn peer_snapshots(&self) -> Vec<BtcLnPeerSnapshot>;
     fn channel_snapshots(&self) -> Vec<BtcLnChannelSnapshot>;
@@ -200,10 +192,6 @@ where
 
     fn event_handled(&self) -> Result<()> {
         (**self).event_handled()
-    }
-
-    fn new_onchain_address(&self) -> Result<String> {
-        (**self).new_onchain_address()
     }
 
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot {
@@ -281,10 +269,6 @@ where
 
     fn event_handled(&self) -> Result<()> {
         (**self).event_handled()
-    }
-
-    fn new_onchain_address(&self) -> Result<String> {
-        (**self).new_onchain_address()
     }
 
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot {

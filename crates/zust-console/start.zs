@@ -15,7 +15,6 @@ let ln_node_config = {
   peers: [],
   trusted_peers_0conf: [],
   accept_inbound_channels: true,
-  accept_inbound_rgb_transfers: true,
   low_water_sats: 100000,
   interval_ms: 30000,
 };
@@ -38,5 +37,8 @@ root::add("local/lightning/node", lightning.config);
   }),
   lightning: root::get("local/lightning"),
   ln_start: ln::start(),
+  ln_scanner: ln::spawn_scanner({
+    interval_ms: 30000,
+  }),
   ln: ln::status(),
 }

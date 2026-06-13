@@ -8,7 +8,7 @@ use bdk_wallet::keys::bip39::{Language as BdkLanguage, Mnemonic as BdkMnemonic};
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::msgs::SocketAddress;
 
-use crate::btc_ln::{BtcLnBackendKind, BtcLnRuntimeConfig, IrohTunnelPeerConfig};
+use crate::btc_ln::{BtcLnBackendKind, BtcLnRuntimeConfig};
 use crate::ln_rgb_btc_ln_backend::LnRgbBtcLnBackend;
 use crate::local_wallet::{EsploraConfig, LocalWallet};
 
@@ -20,14 +20,14 @@ pub struct LightningNodeConfig {
     pub esplora: String,
     pub esplora_urls: Vec<String>,
     pub esplora_api_key: Option<String>,
+    pub rgb_service_url: String,
+    pub account_id: String,
     pub mnemonic: String,
     pub ln_backend: BtcLnBackendKind,
     pub listen: Option<String>,
     pub peers: Vec<LightningPeerConfig>,
-    pub iroh_tunnel_peers: Vec<IrohTunnelPeerConfig>,
     pub trusted_peers_0conf: Vec<String>,
     pub accept_inbound_channels: bool,
-    pub accept_inbound_rgb_transfers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -63,12 +63,12 @@ fn btc_ln_runtime_config(config: &LightningNodeConfig) -> BtcLnRuntimeConfig {
         esplora: config.esplora.clone(),
         esplora_urls: config.esplora_urls.clone(),
         esplora_api_key: config.esplora_api_key.clone(),
+        rgb_service_url: config.rgb_service_url.clone(),
+        account_id: config.account_id.clone(),
         listen: config.listen.clone(),
         entropy_mnemonic: Some(config.mnemonic.clone()),
         trusted_peers_0conf: config.trusted_peers_0conf.clone(),
         accept_inbound_channels: config.accept_inbound_channels,
-        accept_inbound_rgb_transfers: config.accept_inbound_rgb_transfers,
-        iroh_tunnel_peers: config.iroh_tunnel_peers.clone(),
     }
 }
 

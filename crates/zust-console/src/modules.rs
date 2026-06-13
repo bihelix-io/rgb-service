@@ -11,14 +11,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::btc_ln::{
     BtcLnBackendKind, BtcLnBolt11InvoiceRequest, BtcLnBolt11PaymentRequest,
-    BtcLnChannelOpenRequest, BtcLnNode, BtcLnRuntimeConfig,
+    BtcLnChannelCloseRequest, BtcLnChannelOpenRequest, BtcLnNode, BtcLnRuntimeConfig,
 };
 use crate::ln_rgb_btc_ln_backend::LnRgbBtcLnBackend;
 use crate::lnnode::{
     PaymentId as WalletPaymentId, RgbAssetAmount as WalletRgbAssetAmount, RgbChannelOpenRequest,
     RgbLnNode, RgbPaymentRequest,
 };
+use crate::local_wallet::LocalWallet;
+use crate::node_store::LocalNodeStore;
 use anyhow::{bail, ensure, Context, Result};
+use bdk_wallet::keys::bip39::{Language as BdkLanguage, Mnemonic as BdkMnemonic};
+use bdk_wallet::KeychainKind;
 use bip39::{Language as Bip39Language, Mnemonic as Bip39Mnemonic};
 use bitcoin::{secp256k1::PublicKey, Network};
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
@@ -37,7 +41,7 @@ use vm::Vm;
 const SIGNER_ALPN: &[u8] = b"bihelix/signer/1";
 const SIGNER_REQUEST_SIGNATURE_PATH: &str = "/v1/signer/request-signature";
 const SIGNER_ASSET_AUTHORIZATION_PATH: &str = "/v1/signer/asset-authorization";
-const SIGNER_ADDRESS_NEW_PATH: &str = "/v1/signer/address/new";
+const SIGNER_ADDRESS_BATCH_PATH: &str = "/v1/signer/address/batch";
 const SIGNER_PSBT_SIGN_PATH: &str = "/v1/signer/psbt/sign";
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNER_ATTEMPTS: usize = 3;
@@ -49,6 +53,8 @@ const LN_LDK_DATA_DIR_DEFAULT: &str = ".zust-console/lightning/ldk";
 const LN_LISTEN_DEFAULT: &str = "0.0.0.0:9736";
 const LN_ESPLORA_DEFAULT: &str = "https://blockstream.info/api";
 const LN_LOW_WATER_SATS: u64 = 100_000;
+const BTC_ADDRESS_POOL_LOW_WATER: usize = 5;
+const BTC_ADDRESS_POOL_TARGET: usize = 20;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -79,7 +85,7 @@ impl RgbServiceSigner for ConsoleRgbServiceSigner {
     }
 }
 
-fn daemon_url() -> Result<String> {
+pub(crate) fn daemon_url() -> Result<String> {
     let daemon_url =
         local_string("rgb-service").context("missing root value `local/rgb-service`")?;
     ensure!(
@@ -164,6 +170,48 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr("btc", "status", &[], Type::Any, btc_status as *const u8)?;
     jit.add_native_module_ptr("btc", "utxos", &[], Type::Any, btc_utxos as *const u8)?;
     jit.add_native_module_ptr("btc", "assets", &[], Type::Any, btc_assets as *const u8)?;
+    jit.add_native_module_ptr(
+        "btc",
+        "get_deposit_address",
+        &[Type::Any],
+        Type::Any,
+        btc_get_deposit_address as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "lookup_address_ident",
+        &[Type::Any],
+        Type::Any,
+        btc_lookup_address_ident as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "scan_deposits",
+        &[],
+        Type::Any,
+        btc_scan_deposits as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "scan_ident_deposits",
+        &[Type::Any],
+        Type::Any,
+        btc_scan_ident_deposits as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "address_pool_status",
+        &[],
+        Type::Any,
+        btc_address_pool_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "refill_address_pool",
+        &[Type::Any],
+        Type::Any,
+        btc_refill_address_pool as *const u8,
+    )?;
     jit.add_native_module_ptr(
         "btc",
         "sign_psbt",
@@ -351,6 +399,13 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "ln",
+        "close_channel",
+        &[Type::Any],
+        Type::Any,
+        ln_close_channel as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln",
         "invoice",
         &[Type::Any],
         Type::Any,
@@ -457,6 +512,13 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
+        "close_channel",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_close_channel as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
         "invoice",
         &[Type::Any],
         Type::Any,
@@ -489,34 +551,6 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         ln_rgb_send_rgb_payment as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln_rgb",
-        "get_endpoint",
-        &[],
-        Type::Any,
-        ln_rgb_get_endpoint as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln_rgb",
-        "is_peer_online",
-        &[Type::Any],
-        Type::Any,
-        ln_rgb_is_peer_online as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln_rgb",
-        "transfer_rgb20",
-        &[Type::Any],
-        Type::Any,
-        ln_rgb_transfer_rgb20 as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln_rgb",
-        "send_rgb_funding",
-        &[Type::Any],
-        Type::Any,
-        ln_rgb_send_rgb_funding as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
@@ -598,6 +632,652 @@ extern "C" fn btc_get_wallet_address() -> *const Dynamic {
     native_result(|| Ok(Dynamic::from(default_account_id()?)))
 }
 
+extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        ensure!(
+            input.is_str(),
+            "btc::get_deposit_address expects ident string"
+        );
+        let ident = input.as_str().to_string();
+        ensure!(!ident.trim().is_empty(), "ident must not be empty");
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        if let Some(address) = store.get_ident_btc_address(&ident)? {
+            return Ok(ok(json!({
+                "module": "btc",
+                "ident": ident,
+                "address": address,
+                "created": false,
+                "persisted": true
+            })));
+        }
+        let available = store.list_btc_address_pool_records()?.len();
+        if available < BTC_ADDRESS_POOL_LOW_WATER {
+            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
+            if count > 0 {
+                let body = json!({
+                    "account_id": default_account_id()?,
+                    "network": "bitcoin",
+                    "purpose": "low_water_refill",
+                    "count": count,
+                    "timestamp_ms": now_ms()
+                });
+                let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
+                let addresses = response
+                    .get("addresses")
+                    .and_then(Value::as_array)
+                    .with_context(|| {
+                        format!("signer batch address response missing `addresses`: {response}")
+                    })?;
+                ensure!(
+                    addresses.len() == count,
+                    "signer batch address response count mismatch: requested={count}, returned={}",
+                    addresses.len()
+                );
+                let existing = store
+                    .list_btc_address_pool_records()?
+                    .into_iter()
+                    .map(|(address, _)| address)
+                    .chain(
+                        store
+                            .list_used_btc_address_pool_records()?
+                            .into_iter()
+                            .map(|(address, _)| address),
+                    )
+                    .chain(
+                        store
+                            .list_ident_btc_addresses()?
+                            .into_iter()
+                            .map(|(_, address)| address),
+                    )
+                    .collect::<std::collections::BTreeSet<_>>();
+                for response in addresses {
+                    let address = response
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .filter(|address| !address.trim().is_empty())
+                        .with_context(|| {
+                            format!(
+                                "signer batch address item missing non-empty `address`: {response}"
+                            )
+                        })?;
+                    if existing.contains(address) {
+                        continue;
+                    }
+                    store.put_btc_address_pool_record(
+                        address,
+                        &json!({
+                            "address": address,
+                            "created_at_ms": now_ms(),
+                            "purpose": "low_water_refill",
+                            "signer_response": response
+                        }),
+                    )?;
+                }
+            }
+        }
+        let mut available = store.list_btc_address_pool_records()?;
+        available.sort_by_key(|(_, record)| {
+            record
+                .get("created_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+        let (address, mut pool_record) = available
+            .into_iter()
+            .next()
+            .context("BTC address pool is empty after refill")?;
+        if let Value::Object(object) = &mut pool_record {
+            object.insert("used_at_ms".to_string(), json!(now_ms()));
+            object.insert("ident".to_string(), json!(ident));
+        }
+        store.remove_btc_address_pool_record(&address)?;
+        store.put_used_btc_address_pool_record(&address, &pool_record)?;
+        store.put_ident_btc_address(&ident, &address)?;
+        let available = store.list_btc_address_pool_records()?.len();
+        if available < BTC_ADDRESS_POOL_LOW_WATER {
+            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
+            if count > 0 {
+                let body = json!({
+                    "account_id": default_account_id()?,
+                    "network": "bitcoin",
+                    "purpose": "low_water_refill",
+                    "count": count,
+                    "timestamp_ms": now_ms()
+                });
+                let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
+                let addresses = response
+                    .get("addresses")
+                    .and_then(Value::as_array)
+                    .with_context(|| {
+                        format!("signer batch address response missing `addresses`: {response}")
+                    })?;
+                ensure!(
+                    addresses.len() == count,
+                    "signer batch address response count mismatch: requested={count}, returned={}",
+                    addresses.len()
+                );
+                let existing = store
+                    .list_btc_address_pool_records()?
+                    .into_iter()
+                    .map(|(address, _)| address)
+                    .chain(
+                        store
+                            .list_used_btc_address_pool_records()?
+                            .into_iter()
+                            .map(|(address, _)| address),
+                    )
+                    .chain(
+                        store
+                            .list_ident_btc_addresses()?
+                            .into_iter()
+                            .map(|(_, address)| address),
+                    )
+                    .collect::<std::collections::BTreeSet<_>>();
+                for response in addresses {
+                    let address = response
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .filter(|address| !address.trim().is_empty())
+                        .with_context(|| {
+                            format!(
+                                "signer batch address item missing non-empty `address`: {response}"
+                            )
+                        })?;
+                    if existing.contains(address) {
+                        continue;
+                    }
+                    store.put_btc_address_pool_record(
+                        address,
+                        &json!({
+                            "address": address,
+                            "created_at_ms": now_ms(),
+                            "purpose": "low_water_refill",
+                            "signer_response": response
+                        }),
+                    )?;
+                }
+            }
+        }
+        Ok(ok(json!({
+            "module": "btc",
+            "ident": ident,
+            "address": address,
+            "created": true,
+            "persisted": true,
+            "source": "local_address_pool",
+            "pool_record": pool_record
+        })))
+    })
+}
+
+extern "C" fn btc_lookup_address_ident(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        ensure!(
+            input.is_str(),
+            "btc::lookup_address_ident expects address string"
+        );
+        let address = input.as_str().to_string();
+        ensure!(!address.trim().is_empty(), "address must not be empty");
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        Ok(ok(json!({
+            "module": "btc",
+            "address": address,
+            "ident": store.lookup_ident_by_btc_address(&address)?,
+        })))
+    })
+}
+
+extern "C" fn btc_scan_deposits() -> *const Dynamic {
+    native_result(|| {
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        store.put_wallet_btc_address(&default_account_id()?)?;
+        let esplora = btc_esplora_url();
+        let tip_url = format!("{}/blocks/tip/height", esplora.trim_end_matches('/'));
+        let tip_height = attohttpc::get(&tip_url)
+            .send()
+            .ok()
+            .and_then(|response| response.text().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        let mut deposits = Vec::new();
+        let mut persisted = 0usize;
+        let mut address_mappings = Vec::new();
+        if let Some(address) = store.get_wallet_btc_address()? {
+            address_mappings.push((
+                "wallet".to_string(),
+                "default".to_string(),
+                String::new(),
+                address,
+            ));
+        }
+        for (ident, address) in store.list_ident_btc_addresses()? {
+            address_mappings.push(("ident".to_string(), String::new(), ident, address));
+        }
+        for (owner_type, owner_label, ident, address) in address_mappings {
+            let mut seen = std::collections::BTreeSet::new();
+            let txs = esplora_get_json(&format!(
+                "{}/address/{address}/txs",
+                esplora.trim_end_matches('/')
+            ))
+            .with_context(|| format!("fetch BTC deposit transactions for {address}"))?;
+            for tx in txs.as_array().cloned().unwrap_or_default() {
+                let txid = tx
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for output in tx
+                    .get("vout")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let output_address = output
+                        .get("scriptpubkey_address")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if output_address != address {
+                        continue;
+                    }
+                    let vout = output.get("n").and_then(Value::as_u64).unwrap_or_default();
+                    let outpoint = format!("{txid}:{vout}");
+                    seen.insert(outpoint.clone());
+                    let amount_sat = output
+                        .get("value")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let status = tx.get("status").unwrap_or(&Value::Null);
+                    let confirmed = status
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let block_height = status.get("block_height").and_then(Value::as_u64);
+                    let confirmations = block_height
+                        .filter(|_| confirmed)
+                        .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                        .unwrap_or_default();
+                    let record = json!({
+                        "owner_type": owner_type,
+                        "owner_label": owner_label,
+                        "ident": ident,
+                        "wallet_owner": owner_type == "wallet",
+                        "address": address,
+                        "txid": txid,
+                        "vout": vout,
+                        "outpoint": outpoint,
+                        "amount_sat": amount_sat,
+                        "confirmed": confirmed,
+                        "confirmations": confirmations,
+                        "block_height": block_height,
+                        "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                        "updated_at_ms": now_ms()
+                    });
+                    store.put_btc_deposit_record(
+                        record
+                            .get("outpoint")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        &record,
+                    )?;
+                    persisted += 1;
+                    deposits.push(record);
+                }
+            }
+            let utxos = btc_address_utxos_json(&address, &esplora)?;
+            for utxo in utxos.as_array().cloned().unwrap_or_default() {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let vout = utxo.get("vout").and_then(Value::as_u64).unwrap_or_default();
+                let outpoint = format!("{txid}:{vout}");
+                if seen.contains(&outpoint) {
+                    continue;
+                }
+                let amount_sat = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let status = utxo.get("status").unwrap_or(&Value::Null);
+                let confirmed = status
+                    .get("confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let block_height = status.get("block_height").and_then(Value::as_u64);
+                let confirmations = block_height
+                    .filter(|_| confirmed)
+                    .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                    .unwrap_or_default();
+                let record = json!({
+                    "owner_type": owner_type,
+                    "owner_label": owner_label,
+                    "ident": ident,
+                    "wallet_owner": owner_type == "wallet",
+                    "address": address,
+                    "txid": txid,
+                    "vout": vout,
+                    "outpoint": outpoint,
+                    "amount_sat": amount_sat,
+                    "confirmed": confirmed,
+                    "confirmations": confirmations,
+                    "block_height": block_height,
+                    "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                    "updated_at_ms": now_ms()
+                });
+                store.put_btc_deposit_record(
+                    record
+                        .get("outpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    &record,
+                )?;
+                persisted += 1;
+                deposits.push(record);
+            }
+        }
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "network": "bitcoin",
+            "esplora": esplora,
+            "tip_height": tip_height,
+            "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
+            "persisted": persisted,
+            "deposits": deposits,
+            "stored_deposits": store
+                .list_btc_deposit_records()?
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>()
+        })))
+    })
+}
+
+extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        ensure!(
+            input.is_str(),
+            "btc::scan_ident_deposits expects ident string"
+        );
+        let ident_filter = input.as_str().to_string();
+        ensure!(!ident_filter.trim().is_empty(), "ident must not be empty");
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        store.put_wallet_btc_address(&default_account_id()?)?;
+        let esplora = btc_esplora_url();
+        let tip_url = format!("{}/blocks/tip/height", esplora.trim_end_matches('/'));
+        let tip_height = attohttpc::get(&tip_url)
+            .send()
+            .ok()
+            .and_then(|response| response.text().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        let mut deposits = Vec::new();
+        let mut persisted = 0usize;
+        for (ident, address) in store.list_ident_btc_addresses()? {
+            if ident != ident_filter {
+                continue;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let txs = esplora_get_json(&format!(
+                "{}/address/{address}/txs",
+                esplora.trim_end_matches('/')
+            ))
+            .with_context(|| format!("fetch BTC deposit transactions for {address}"))?;
+            for tx in txs.as_array().cloned().unwrap_or_default() {
+                let txid = tx
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for output in tx
+                    .get("vout")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let output_address = output
+                        .get("scriptpubkey_address")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if output_address != address {
+                        continue;
+                    }
+                    let vout = output.get("n").and_then(Value::as_u64).unwrap_or_default();
+                    let outpoint = format!("{txid}:{vout}");
+                    seen.insert(outpoint.clone());
+                    let amount_sat = output
+                        .get("value")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let status = tx.get("status").unwrap_or(&Value::Null);
+                    let confirmed = status
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let block_height = status.get("block_height").and_then(Value::as_u64);
+                    let confirmations = block_height
+                        .filter(|_| confirmed)
+                        .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                        .unwrap_or_default();
+                    let record = json!({
+                        "owner_type": "ident",
+                        "owner_label": "",
+                        "ident": ident,
+                        "wallet_owner": false,
+                        "address": address,
+                        "txid": txid,
+                        "vout": vout,
+                        "outpoint": outpoint,
+                        "amount_sat": amount_sat,
+                        "confirmed": confirmed,
+                        "confirmations": confirmations,
+                        "block_height": block_height,
+                        "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                        "updated_at_ms": now_ms()
+                    });
+                    store.put_btc_deposit_record(
+                        record
+                            .get("outpoint")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        &record,
+                    )?;
+                    persisted += 1;
+                    deposits.push(record);
+                }
+            }
+            let utxos = btc_address_utxos_json(&address, &esplora)?;
+            for utxo in utxos.as_array().cloned().unwrap_or_default() {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let vout = utxo.get("vout").and_then(Value::as_u64).unwrap_or_default();
+                let outpoint = format!("{txid}:{vout}");
+                if seen.contains(&outpoint) {
+                    continue;
+                }
+                let amount_sat = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let status = utxo.get("status").unwrap_or(&Value::Null);
+                let confirmed = status
+                    .get("confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let block_height = status.get("block_height").and_then(Value::as_u64);
+                let confirmations = block_height
+                    .filter(|_| confirmed)
+                    .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                    .unwrap_or_default();
+                let record = json!({
+                    "owner_type": "ident",
+                    "owner_label": "",
+                    "ident": ident,
+                    "wallet_owner": false,
+                    "address": address,
+                    "txid": txid,
+                    "vout": vout,
+                    "outpoint": outpoint,
+                    "amount_sat": amount_sat,
+                    "confirmed": confirmed,
+                    "confirmations": confirmations,
+                    "block_height": block_height,
+                    "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                    "updated_at_ms": now_ms()
+                });
+                store.put_btc_deposit_record(
+                    record
+                        .get("outpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    &record,
+                )?;
+                persisted += 1;
+                deposits.push(record);
+            }
+        }
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "network": "bitcoin",
+            "esplora": esplora,
+            "tip_height": tip_height,
+            "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
+            "persisted": persisted,
+            "deposits": deposits,
+            "stored_deposits": store
+                .list_btc_deposit_records()?
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>()
+        })))
+    })
+}
+
+extern "C" fn btc_address_pool_status() -> *const Dynamic {
+    native_result(|| {
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let available = store.list_btc_address_pool_records()?;
+        let used = store.list_used_btc_address_pool_records()?;
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "address_pool": {
+                "available": available.len(),
+                "used": used.len(),
+                "low_water": BTC_ADDRESS_POOL_LOW_WATER,
+                "target": BTC_ADDRESS_POOL_TARGET,
+                "added": 0,
+                "addresses": available
+                    .into_iter()
+                    .map(|(_, record)| record)
+                    .collect::<Vec<_>>()
+            }
+        })))
+    })
+}
+
+extern "C" fn btc_refill_address_pool(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let count = match input {
+            Dynamic::Null => BTC_ADDRESS_POOL_TARGET as u64,
+            Dynamic::U8(value) => *value as u64,
+            Dynamic::I8(value) => u64::try_from(*value).context("count must be unsigned")?,
+            Dynamic::U16(value) => *value as u64,
+            Dynamic::I16(value) => u64::try_from(*value).context("count must be unsigned")?,
+            Dynamic::U32(value) => *value as u64,
+            Dynamic::I32(value) => u64::try_from(*value).context("count must be unsigned")?,
+            Dynamic::U64(value) => *value,
+            Dynamic::I64(value) => u64::try_from(*value).context("count must be unsigned")?,
+            value if value.is_str() => value.as_str().parse::<u64>().context("parse count")?,
+            _ => bail!("btc::refill_address_pool expects count number"),
+        } as usize;
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let mut added = 0usize;
+        if count > 0 {
+            let body = json!({
+                "account_id": default_account_id()?,
+                "network": "bitcoin",
+                "purpose": "manual_refill",
+                "count": count,
+                "timestamp_ms": now_ms()
+            });
+            let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
+            let addresses = response
+                .get("addresses")
+                .and_then(Value::as_array)
+                .with_context(|| {
+                    format!("signer batch address response missing `addresses`: {response}")
+                })?;
+            ensure!(
+                addresses.len() == count,
+                "signer batch address response count mismatch: requested={count}, returned={}",
+                addresses.len()
+            );
+            let existing = store
+                .list_btc_address_pool_records()?
+                .into_iter()
+                .map(|(address, _)| address)
+                .chain(
+                    store
+                        .list_used_btc_address_pool_records()?
+                        .into_iter()
+                        .map(|(address, _)| address),
+                )
+                .chain(
+                    store
+                        .list_ident_btc_addresses()?
+                        .into_iter()
+                        .map(|(_, address)| address),
+                )
+                .collect::<std::collections::BTreeSet<_>>();
+            for response in addresses {
+                let address = response
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .filter(|address| !address.trim().is_empty())
+                    .with_context(|| {
+                        format!("signer batch address item missing non-empty `address`: {response}")
+                    })?;
+                if existing.contains(address) {
+                    continue;
+                }
+                store.put_btc_address_pool_record(
+                    address,
+                    &json!({
+                        "address": address,
+                        "created_at_ms": now_ms(),
+                        "purpose": "manual_refill",
+                        "signer_response": response
+                    }),
+                )?;
+                added += 1;
+            }
+        }
+        let available = store.list_btc_address_pool_records()?;
+        let used = store.list_used_btc_address_pool_records()?;
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "address_pool": {
+                "available": available.len(),
+                "used": used.len(),
+                "low_water": BTC_ADDRESS_POOL_LOW_WATER,
+                "target": BTC_ADDRESS_POOL_TARGET,
+                "added": added,
+                "addresses": available
+                    .into_iter()
+                    .map(|(_, record)| record)
+                    .collect::<Vec<_>>()
+            }
+        })))
+    })
+}
+
 extern "C" fn btc_status() -> *const Dynamic {
     native_result(|| {
         let balance = btc_balance_json()?;
@@ -641,13 +1321,15 @@ extern "C" fn btc_assets() -> *const Dynamic {
 
 extern "C" fn btc_sign_psbt(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
-        let psbt = required_string(input, "psbt")?;
+        ensure!(input.is_str(), "btc::sign_psbt expects PSBT string");
+        let psbt = input.as_str().to_string();
+        ensure!(!psbt.trim().is_empty(), "psbt must not be empty");
         let body = json!({
             "account_id": default_account_id()?,
-            "domain": optional_string(input, "domain").unwrap_or_else(|| "bihelix-btc-wallet".to_string()),
+            "domain": "bihelix-btc-wallet",
             "psbt": psbt,
-            "policy": dynamic_field_json(input, "policy").unwrap_or_else(|| json!({})),
-            "expires_at_ms": optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000),
+            "policy": {},
+            "expires_at_ms": now_ms() + 300000,
             "timestamp_ms": now_ms()
         });
         let response = signer_request(SIGNER_PSBT_SIGN_PATH, &body)?;
@@ -657,14 +1339,24 @@ extern "C" fn btc_sign_psbt(input: *const Dynamic) -> *const Dynamic {
 
 extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
-        let tx_hex = required_string(input, "tx_hex")?;
+        ensure!(input.is_str(), "btc::broadcast expects tx hex string");
+        let tx_hex = input.as_str().to_string();
+        ensure!(!tx_hex.trim().is_empty(), "tx_hex must not be empty");
         let esplora = btc_esplora_url();
-        let txid = esplora_post_text(
-            &format!("{}/tx", esplora.trim_end_matches('/')),
-            "text/plain",
-            &tx_hex,
-        )
-        .context("broadcast BTC transaction through Esplora")?;
+        let url = format!("{}/tx", esplora.trim_end_matches('/'));
+        let response = attohttpc::post(&url)
+            .header("content-type", "text/plain")
+            .text(tx_hex)
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let txid = response
+            .text()
+            .with_context(|| format!("read Esplora response body from {url}"))?;
+        ensure!(
+            (200..300).contains(&status.as_u16()),
+            "Esplora POST {url} failed with HTTP {status}: {txid}"
+        );
         Ok(ok(json!({
             "module": "btc",
             "broadcast": true,
@@ -677,7 +1369,9 @@ extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
 
 extern "C" fn btc_tx_status(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
-        let txid = required_string(input, "txid")?;
+        ensure!(input.is_str(), "btc::tx_status expects txid string");
+        let txid = input.as_str().to_string();
+        ensure!(!txid.trim().is_empty(), "txid must not be empty");
         let esplora = btc_esplora_url();
         let status = esplora_get_json(&format!(
             "{}/tx/{txid}/status",
@@ -1147,6 +1841,32 @@ extern "C" fn ln_open_channel(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
+extern "C" fn ln_close_channel(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let channel_id = required_string(input, "channel_id")?;
+        let counterparty_node_id = required_string(input, "counterparty_node_id")
+            .or_else(|_| required_string(input, "node_id"))?;
+        let counterparty_node_id = ldk_public_key(&counterparty_node_id)?;
+        let force = optional_bool(input, "force").unwrap_or(false);
+        let reason = optional_string(input, "reason");
+        node.close_channel(BtcLnChannelCloseRequest {
+            channel_id: channel_id.clone(),
+            counterparty_node_id,
+            force,
+            reason,
+        })
+        .context("close LN channel")?;
+        Ok(ok(json!({
+            "module": "ln",
+            "channel_close_submitted": true,
+            "channel_id": channel_id,
+            "counterparty_node_id": counterparty_node_id.to_string(),
+            "force": force
+        })))
+    })
+}
+
 extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
         let node = running_ln_node()?;
@@ -1174,7 +1894,8 @@ extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
 extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
         let node = running_ln_node()?;
-        let invoice = Bolt11Invoice::from_str(&required_string(input, "invoice")?)
+        ensure!(input.is_str(), "ln::pay expects BOLT11 invoice string");
+        let invoice = Bolt11Invoice::from_str(input.as_str())
             .map_err(|err| anyhow::anyhow!("parse BOLT11 invoice: {err:?}"))?;
         let payment_hash = node
             .pay_bolt11(BtcLnBolt11PaymentRequest { invoice })
@@ -1243,6 +1964,10 @@ extern "C" fn ln_rgb_connect(input: *const Dynamic) -> *const Dynamic {
 
 extern "C" fn ln_rgb_open_channel(input: *const Dynamic) -> *const Dynamic {
     ln_open_channel(input)
+}
+
+extern "C" fn ln_rgb_close_channel(input: *const Dynamic) -> *const Dynamic {
+    ln_close_channel(input)
 }
 
 extern "C" fn ln_rgb_invoice(input: *const Dynamic) -> *const Dynamic {
@@ -1314,53 +2039,6 @@ extern "C" fn ln_rgb_send_rgb_payment(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_get_endpoint() -> *const Dynamic {
-    native_result(|| {
-        let node = running_ln_node()?;
-        let addr = node.iroh_endpoint_addr()?;
-        Ok(ok(json!({
-            "module": "ln_rgb",
-            "endpoint": serde_json::to_string(&addr)?,
-            "endpoint_id": addr.id.to_string(),
-            "node_id": node.node_id().to_string()
-        })))
-    })
-}
-
-extern "C" fn ln_rgb_is_peer_online(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let node = running_ln_node()?;
-        let endpoint = required_string(input, "endpoint")?;
-        let remote_addr: EndpointAddr =
-            serde_json::from_str(&endpoint).context("decode Iroh endpoint addr")?;
-        let timeout = Duration::from_secs(optional_u64(input, "timeout_secs").unwrap_or(8));
-        let result = node.probe_iroh_peer(remote_addr.clone(), timeout);
-        let online = result.is_ok();
-        Ok(ok(json!({
-            "module": "ln_rgb",
-            "endpoint_id": remote_addr.id.to_string(),
-            "online": online,
-            "error": result.err().map(|err| format!("{err:#}"))
-        })))
-    })
-}
-
-extern "C" fn ln_rgb_transfer_rgb20(_input: *const Dynamic) -> *const Dynamic {
-    native_result(|| {
-        bail!(
-            "ln_rgb::transfer_rgb20 belongs to btc-local-wallet's local RGB stock flow; zust-console uses rgb-service daemon direct-transfer APIs"
-        )
-    })
-}
-
-extern "C" fn ln_rgb_send_rgb_funding(_input: *const Dynamic) -> *const Dynamic {
-    native_result(|| {
-        bail!(
-            "ln_rgb::send_rgb_funding needs the receiver Iroh endpoint and generated funding transfer delivery flow; RGB channel open and RGB payment runtime are already backed by LnRgbBtcLnBackend"
-        )
-    })
-}
-
 extern "C" fn ln_rgb_get_info() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
@@ -1373,7 +2051,6 @@ extern "C" fn ln_rgb_get_info() -> *const Dynamic {
             "rgb_backend": "ln-rgb-lightning",
             "runtime": "LnRgbBtcLnBackend",
             "node_id": node.node_id().to_string(),
-            "endpoint": node.iroh_endpoint_addr().ok().and_then(|addr| serde_json::to_string(&addr).ok()),
             "status": node.status_summary(),
             "network": ln_rgb_network_name(),
             "storage_dir": ln_rgb_storage_dir().to_string_lossy().to_string(),
@@ -1398,6 +2075,20 @@ extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
         let interval_ms = optional_u64(input, "interval_ms")
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
         let interval = Duration::from_millis(interval_ms.max(1000));
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let available = store.list_btc_address_pool_records()?;
+        let used = store.list_used_btc_address_pool_records()?;
+        let address_pool = json!({
+            "available": available.len(),
+            "used": used.len(),
+            "low_water": BTC_ADDRESS_POOL_LOW_WATER,
+            "target": BTC_ADDRESS_POOL_TARGET,
+            "added": 0,
+            "addresses": available
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>()
+        });
 
         if LN_SCANNER_STARTED.swap(true, Ordering::SeqCst) {
             return Ok(ok(json!({
@@ -1407,7 +2098,8 @@ extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
                 "btc_addr": btc_addr,
                 "rgb_service": rgb_service,
                 "layers": ["l1", "l2"],
-                "scan_enabled": false
+                "scan_enabled": true,
+                "address_pool": address_pool
             })));
         }
 
@@ -1429,8 +2121,8 @@ extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
             "rgb_service": rgb_service,
             "layers": ["l1", "l2"],
             "accepts": ["l1_onchain_deposit", "l2_ln_deposit"],
-            "scan_enabled": false,
-            "note": "scanner thread is started, but real chain scanning is intentionally disabled"
+            "scan_enabled": true,
+            "address_pool": address_pool
         })))
     })
 }
@@ -1444,32 +2136,84 @@ extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
             let mut stored = read_json_file(&path)
                 .with_context(|| format!("read LN node state {}", path.display()))?;
             update_ln_node_config(&mut stored, config, low_water_sats);
-            ensure_ln_entropy_mnemonic(&mut stored)?;
+            let mnemonic = ensure_ln_entropy_mnemonic(&mut stored)?;
+            let config = stored
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| normalized_ln_config(Value::Object(Map::new()), low_water_sats));
+            let network_name = config
+                .get("network")
+                .and_then(Value::as_str)
+                .unwrap_or("bitcoin");
+            let network = parse_ln_network(network_name)?;
+            let data_dir = PathBuf::from(
+                config
+                    .get("data_dir")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(LN_DATA_DIR_DEFAULT),
+            );
+            let address_source = stored
+                .get("address_source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let address = find_string_field(&stored, &["address", "btc_address"]);
+            if address_source != "ln_hot_wallet" || address.is_none() {
+                let mnemonic = BdkMnemonic::parse_in_normalized(BdkLanguage::English, &mnemonic)
+                    .context("invalid LN hot wallet mnemonic")?;
+                let mut wallet = LocalWallet::open_with_mnemonic(&data_dir, network, &mnemonic)?;
+                let address = wallet.wallet.reveal_next_address(KeychainKind::External);
+                wallet.persist()?;
+                if let Value::Object(object) = &mut stored {
+                    object.insert("address".to_string(), json!(address.address.to_string()));
+                    object.remove("btc_address");
+                    object.remove("signer_response");
+                    object.remove("signer_node");
+                    object.insert("address_source".to_string(), json!("ln_hot_wallet"));
+                    object.insert("wallet_can_sign".to_string(), json!(true));
+                    object.insert("updated_at_ms".to_string(), json!(now_ms()));
+                }
+            }
             write_private_json_file(&path, &stored)
                 .with_context(|| format!("write LN node state {}", path.display()))?;
             return Ok(ok(redacted_ln_node_response(stored, &path, false)));
         }
 
-        let body = json!({
-            "account_id": default_account_id()?,
-            "network": optional_string(input, "network").unwrap_or_else(|| "bitcoin".to_string()),
-            "purpose": "ln_node_hot_wallet",
-            "low_water_sats": low_water_sats,
-            "timestamp_ms": now_ms()
-        });
-        let signer_response = signer_request(SIGNER_ADDRESS_NEW_PATH, &body)?;
         let stored = json!({
             "version": 1,
             "kind": "ln_node_hot_wallet",
             "created_at_ms": now_ms(),
-            "account_id": default_account_id()?,
-            "signer_node": signer_node_id()?,
             "low_water_sats": low_water_sats,
-            "config": config,
-            "signer_response": signer_response
+            "config": config
         });
         let mut stored = stored;
-        ensure_ln_entropy_mnemonic(&mut stored)?;
+        let mnemonic = ensure_ln_entropy_mnemonic(&mut stored)?;
+        let config = stored
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| normalized_ln_config(Value::Object(Map::new()), low_water_sats));
+        let network_name = config
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or("bitcoin");
+        let network = parse_ln_network(network_name)?;
+        let data_dir = PathBuf::from(
+            config
+                .get("data_dir")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(LN_DATA_DIR_DEFAULT),
+        );
+        let mnemonic = BdkMnemonic::parse_in_normalized(BdkLanguage::English, &mnemonic)
+            .context("invalid LN hot wallet mnemonic")?;
+        let mut wallet = LocalWallet::open_with_mnemonic(&data_dir, network, &mnemonic)?;
+        let address = wallet.wallet.reveal_next_address(KeychainKind::External);
+        wallet.persist()?;
+        if let Value::Object(object) = &mut stored {
+            object.insert("address".to_string(), json!(address.address.to_string()));
+            object.insert("address_source".to_string(), json!("ln_hot_wallet"));
+            object.insert("wallet_can_sign".to_string(), json!(true));
+        }
         write_private_json_file(&path, &stored)
             .with_context(|| format!("write LN node state {}", path.display()))?;
         Ok(ok(redacted_ln_node_response(stored, &path, true)))
@@ -1581,6 +2325,8 @@ fn console_ln_rgb_config(config: &Value, mnemonic: String) -> Result<BtcLnRuntim
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|value| !value.trim().is_empty()),
+        rgb_service_url: daemon_url()?,
+        account_id: default_account_id()?,
         listen,
         entropy_mnemonic: Some(mnemonic),
         trusted_peers_0conf,
@@ -1588,11 +2334,6 @@ fn console_ln_rgb_config(config: &Value, mnemonic: String) -> Result<BtcLnRuntim
             .get("accept_inbound_channels")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        accept_inbound_rgb_transfers: config
-            .get("accept_inbound_rgb_transfers")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        iroh_tunnel_peers: Vec::new(),
     })
 }
 
@@ -1646,23 +2387,233 @@ fn value_string_list(value: &Value, key: &str) -> Result<Vec<String>> {
 
 extern "C" fn ln_scanner_status() -> *const Dynamic {
     native_result(|| {
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let available = store.list_btc_address_pool_records()?;
+        let used = store.list_used_btc_address_pool_records()?;
         Ok(ok(json!({
             "module": "ln",
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "layers": ["l1", "l2"],
-            "scan_enabled": false
+            "scan_enabled": true,
+            "address_pool": {
+                "available": available.len(),
+                "used": used.len(),
+                "low_water": BTC_ADDRESS_POOL_LOW_WATER,
+                "target": BTC_ADDRESS_POOL_TARGET,
+                "added": 0,
+                "addresses": available
+                    .into_iter()
+                    .map(|(_, record)| record)
+                    .collect::<Vec<_>>()
+            }
         })))
     })
 }
 
 fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) {
     while LN_SCANNER_STARTED.load(Ordering::SeqCst) {
+        let _ = (|| -> Result<()> {
+            let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+            let available = store.list_btc_address_pool_records()?.len();
+            if available < BTC_ADDRESS_POOL_LOW_WATER {
+                let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
+                if count > 0 {
+                    let response = signer_request(
+                        SIGNER_ADDRESS_BATCH_PATH,
+                        &json!({
+                            "account_id": default_account_id()?,
+                            "network": "bitcoin",
+                            "purpose": "low_water_refill",
+                            "count": count,
+                            "timestamp_ms": now_ms()
+                        }),
+                    )?;
+                    let addresses = response
+                        .get("addresses")
+                        .and_then(Value::as_array)
+                        .with_context(|| {
+                            format!("signer batch address response missing `addresses`: {response}")
+                        })?;
+                    ensure!(
+                        addresses.len() == count,
+                        "signer batch address response count mismatch: requested={count}, returned={}",
+                        addresses.len()
+                    );
+                    let existing = store
+                        .list_btc_address_pool_records()?
+                        .into_iter()
+                        .map(|(address, _)| address)
+                        .chain(
+                            store
+                                .list_used_btc_address_pool_records()?
+                                .into_iter()
+                                .map(|(address, _)| address),
+                        )
+                        .chain(
+                            store
+                                .list_ident_btc_addresses()?
+                                .into_iter()
+                                .map(|(_, address)| address),
+                        )
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for response in addresses {
+                        let address = response
+                            .get("address")
+                            .and_then(Value::as_str)
+                            .filter(|address| !address.trim().is_empty())
+                            .with_context(|| {
+                                format!(
+                                    "signer batch address item missing non-empty `address`: {response}"
+                                )
+                            })?;
+                        if existing.contains(address) {
+                            continue;
+                        }
+                        store.put_btc_address_pool_record(
+                            address,
+                            &json!({
+                                "address": address,
+                                "created_at_ms": now_ms(),
+                                "purpose": "low_water_refill",
+                                "signer_response": response
+                            }),
+                        )?;
+                    }
+                }
+            }
+
+            store.put_wallet_btc_address(&default_account_id()?)?;
+            let esplora = btc_esplora_url();
+            let mut addresses = Vec::new();
+            if let Some(address) = store.get_wallet_btc_address()? {
+                addresses.push((
+                    "wallet".to_string(),
+                    "default".to_string(),
+                    String::new(),
+                    address,
+                ));
+            }
+            for (ident, address) in store.list_ident_btc_addresses()? {
+                addresses.push(("ident".to_string(), String::new(), ident, address));
+            }
+            for (owner_type, owner_label, ident, address) in addresses {
+                let utxos = btc_address_utxos_json(&address, &esplora)?;
+                for utxo in utxos.as_array().cloned().unwrap_or_default() {
+                    let txid = utxo
+                        .get("txid")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let vout = utxo.get("vout").and_then(Value::as_u64).unwrap_or_default();
+                    let status = utxo.get("status").unwrap_or(&Value::Null);
+                    let confirmed = status
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let record = json!({
+                        "owner_type": owner_type,
+                        "owner_label": owner_label,
+                        "ident": ident,
+                        "wallet_owner": owner_type == "wallet",
+                        "address": address,
+                        "txid": txid,
+                        "vout": vout,
+                        "outpoint": format!("{txid}:{vout}"),
+                        "amount_sat": utxo.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                        "confirmed": confirmed,
+                        "confirmations": 0,
+                        "block_height": status.get("block_height").and_then(Value::as_u64),
+                        "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                        "updated_at_ms": now_ms()
+                    });
+                    store.put_btc_deposit_record(
+                        record
+                            .get("outpoint")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        &record,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
         thread::sleep(interval);
     }
 }
 
 fn ln_inbound_loop(_node: Value, interval: Duration) {
     while LN_STARTED.load(Ordering::SeqCst) {
+        let _ = (|| -> Result<()> {
+            let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+            let available = store.list_btc_address_pool_records()?.len();
+            if available >= BTC_ADDRESS_POOL_LOW_WATER {
+                return Ok(());
+            }
+            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
+            if count == 0 {
+                return Ok(());
+            }
+            let response = signer_request(
+                SIGNER_ADDRESS_BATCH_PATH,
+                &json!({
+                    "account_id": default_account_id()?,
+                    "network": "bitcoin",
+                    "purpose": "low_water_refill",
+                    "count": count,
+                    "timestamp_ms": now_ms()
+                }),
+            )?;
+            let addresses = response
+                .get("addresses")
+                .and_then(Value::as_array)
+                .with_context(|| {
+                    format!("signer batch address response missing `addresses`: {response}")
+                })?;
+            ensure!(
+                addresses.len() == count,
+                "signer batch address response count mismatch: requested={count}, returned={}",
+                addresses.len()
+            );
+            let existing = store
+                .list_btc_address_pool_records()?
+                .into_iter()
+                .map(|(address, _)| address)
+                .chain(
+                    store
+                        .list_used_btc_address_pool_records()?
+                        .into_iter()
+                        .map(|(address, _)| address),
+                )
+                .chain(
+                    store
+                        .list_ident_btc_addresses()?
+                        .into_iter()
+                        .map(|(_, address)| address),
+                )
+                .collect::<std::collections::BTreeSet<_>>();
+            for response in addresses {
+                let address = response
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .filter(|address| !address.trim().is_empty())
+                    .with_context(|| {
+                        format!("signer batch address item missing non-empty `address`: {response}")
+                    })?;
+                if existing.contains(address) {
+                    continue;
+                }
+                store.put_btc_address_pool_record(
+                    address,
+                    &json!({
+                        "address": address,
+                        "created_at_ms": now_ms(),
+                        "purpose": "low_water_refill",
+                        "signer_response": response
+                    }),
+                )?;
+            }
+            Ok(())
+        })();
         thread::sleep(interval);
     }
 }
@@ -1850,22 +2801,6 @@ fn esplora_get_json(url: &str) -> Result<Value> {
     Ok(json)
 }
 
-fn esplora_post_text(url: &str, content_type: &str, body: &str) -> Result<String> {
-    let response = attohttpc::post(url)
-        .header("content-type", content_type)
-        .text(body.to_string())
-        .send()
-        .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .with_context(|| format!("read Esplora response body from {url}"))?;
-    if !(200..300).contains(&status.as_u16()) {
-        bail!("Esplora POST {url} failed with HTTP {status}: {text}");
-    }
-    Ok(text)
-}
-
 fn parse_http_json_response(path: &str, response: Vec<u8>) -> Result<Value> {
     let response = String::from_utf8(response).context("RGB service response is not UTF-8")?;
     let (head, body) = response
@@ -1980,7 +2915,7 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
     Ok(Value::Object(object))
 }
 
-fn default_account_id() -> Result<String> {
+pub(crate) fn default_account_id() -> Result<String> {
     local_string("btc-addr").context("missing root value `local/btc-addr`")
 }
 
@@ -2003,7 +2938,7 @@ fn btc_esplora_url() -> String {
         .unwrap_or_else(|| LN_ESPLORA_DEFAULT.to_string())
 }
 
-fn request_signature(path: &str, body: &Value) -> Result<Value> {
+pub(crate) fn request_signature(path: &str, body: &Value) -> Result<Value> {
     let response = signer_request(path, body)?;
     response
         .get("signature")
@@ -2443,9 +3378,6 @@ fn normalized_ln_config(input: Value, low_water_sats: u64) -> Value {
         .or_insert_with(|| json!([]));
     config
         .entry("accept_inbound_channels".to_string())
-        .or_insert_with(|| json!(true));
-    config
-        .entry("accept_inbound_rgb_transfers".to_string())
         .or_insert_with(|| json!(true));
     config
         .entry("low_water_sats".to_string())
