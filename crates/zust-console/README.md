@@ -40,6 +40,15 @@ Signer requests are sent to the configured signer App over iroh as Dynamic msgpa
 Inside the REPL, admin/debug code is executed directly:
 
 ```zs
+btc::get_wallet_address()
+btc::balance()
+btc::utxos()
+btc::assets()
+btc::status()
+
+rgb::assets()
+rgb::token_list()
+
 ln::node_address({
   network: "bitcoin",
   low_water_sats: 100000,
@@ -68,6 +77,22 @@ ln::start()
 
 The scanner thread is wired for L1/L2 incoming payment handling, but real chain
 scanning is intentionally disabled for now.
+
+BTC module scope:
+
+```zs
+btc::balance()
+btc::utxos()
+btc::assets()
+btc::tx_status({ txid: "..." })
+btc::sign_psbt({ psbt: "..." })
+btc::broadcast({ tx_hex: "..." })
+```
+
+`btc::assets()` and `rgb::assets()` read `local/btc-addr`, fetch its current
+L1 UTXOs from Esplora, and send those outpoints to the RGB daemon. Direct BTC
+send is not exposed until the signer App implements `/v1/signer/psbt/sign`;
+`btc::sign_psbt()` calls that path directly and returns the real signer result.
 
 Useful REPL commands:
 

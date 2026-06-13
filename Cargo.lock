@@ -465,8 +465,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "http 1.4.2",
  "log",
+ "native-tls",
  "url",
 ]
 
@@ -9529,6 +9531,7 @@ name = "zust-console"
 version = "0.11.1-rc.10"
 dependencies = [
  "anyhow",
+ "attohttpc",
  "bip39",
  "getrandom 0.3.4",
  "iroh",

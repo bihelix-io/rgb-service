@@ -28,6 +28,7 @@ const SIGNER_ALPN: &[u8] = b"bihelix/signer/1";
 const SIGNER_REQUEST_SIGNATURE_PATH: &str = "/v1/signer/request-signature";
 const SIGNER_ASSET_AUTHORIZATION_PATH: &str = "/v1/signer/asset-authorization";
 const SIGNER_ADDRESS_NEW_PATH: &str = "/v1/signer/address/new";
+const SIGNER_PSBT_SIGN_PATH: &str = "/v1/signer/psbt/sign";
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNER_ATTEMPTS: usize = 3;
 const SIGNER_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -217,6 +218,7 @@ fn local_dynamic(name: &str) -> Option<Dynamic> {
 pub fn register_console_modules(vm: &Vm) -> Result<()> {
     register_env_module(vm)?;
     register_bdk_module(vm)?;
+    register_btc_module(vm)?;
     register_rgb_module(vm)?;
     register_ln_module(vm)?;
     Ok(())
@@ -257,6 +259,43 @@ fn register_bdk_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         bdk_external_anchor as *const u8,
+    )?;
+    Ok(())
+}
+
+fn register_btc_module(vm: &Vm) -> Result<()> {
+    let mut jit = vm.jit.write().unwrap();
+    jit.add_native_module_ptr(
+        "btc",
+        "get_wallet_address",
+        &[],
+        Type::Str,
+        btc_get_wallet_address as *const u8,
+    )?;
+    jit.add_native_module_ptr("btc", "balance", &[], Type::Any, btc_balance as *const u8)?;
+    jit.add_native_module_ptr("btc", "status", &[], Type::Any, btc_status as *const u8)?;
+    jit.add_native_module_ptr("btc", "utxos", &[], Type::Any, btc_utxos as *const u8)?;
+    jit.add_native_module_ptr("btc", "assets", &[], Type::Any, btc_assets as *const u8)?;
+    jit.add_native_module_ptr(
+        "btc",
+        "sign_psbt",
+        &[Type::Any],
+        Type::Any,
+        btc_sign_psbt as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "broadcast",
+        &[Type::Any],
+        Type::Any,
+        btc_broadcast as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "tx_status",
+        &[Type::Any],
+        Type::Any,
+        btc_tx_status as *const u8,
     )?;
     Ok(())
 }
@@ -312,13 +351,7 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
         Type::Any,
         rgb_issue as *const u8,
     )?;
-    jit.add_native_module_ptr(
-        "rgb",
-        "assets",
-        &[Type::Any],
-        Type::Any,
-        rgb_assets as *const u8,
-    )?;
+    jit.add_native_module_ptr("rgb", "assets", &[], Type::Any, rgb_assets as *const u8)?;
     jit.add_native_module_ptr(
         "rgb",
         "token_list",
@@ -519,6 +552,106 @@ extern "C" fn bdk_external_anchor(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
+extern "C" fn btc_get_wallet_address() -> *const Dynamic {
+    native_result(|| Ok(Dynamic::from(default_account_id()?)))
+}
+
+extern "C" fn btc_status() -> *const Dynamic {
+    native_result(|| {
+        let balance = btc_balance_json()?;
+        let assets = btc_assets_json().unwrap_or_else(|err| {
+            json!({
+                "error": format!("{err:#}")
+            })
+        });
+        Ok(ok(json!({
+            "module": "btc",
+            "address": default_account_id()?,
+            "network": "bitcoin",
+            "balance": balance,
+            "assets": assets
+        })))
+    })
+}
+
+extern "C" fn btc_balance() -> *const Dynamic {
+    native_result(|| Ok(ok(btc_balance_json()?)))
+}
+
+extern "C" fn btc_utxos() -> *const Dynamic {
+    native_result(|| {
+        let address = default_account_id()?;
+        let esplora = btc_esplora_url();
+        let utxos = btc_address_utxos_json(&address, &esplora)?;
+        Ok(ok(json!({
+            "module": "btc",
+            "address": address,
+            "network": "bitcoin",
+            "esplora": esplora,
+            "utxos": utxos
+        })))
+    })
+}
+
+extern "C" fn btc_assets() -> *const Dynamic {
+    native_result(|| Ok(json_to_dynamic(&btc_assets_json()?)))
+}
+
+extern "C" fn btc_sign_psbt(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let psbt = required_string(input, "psbt")?;
+        let body = json!({
+            "account_id": default_account_id()?,
+            "domain": optional_string(input, "domain").unwrap_or_else(|| "bihelix-btc-wallet".to_string()),
+            "psbt": psbt,
+            "policy": dynamic_field_json(input, "policy").unwrap_or_else(|| json!({})),
+            "expires_at_ms": optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000),
+            "timestamp_ms": now_ms()
+        });
+        let response = signer_request(SIGNER_PSBT_SIGN_PATH, &body)?;
+        Ok(json_to_dynamic(&response))
+    })
+}
+
+extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let tx_hex = required_string(input, "tx_hex")?;
+        let esplora = btc_esplora_url();
+        let txid = esplora_post_text(
+            &format!("{}/tx", esplora.trim_end_matches('/')),
+            "text/plain",
+            &tx_hex,
+        )
+        .context("broadcast BTC transaction through Esplora")?;
+        Ok(ok(json!({
+            "module": "btc",
+            "broadcast": true,
+            "network": "bitcoin",
+            "esplora": esplora,
+            "txid": txid.trim()
+        })))
+    })
+}
+
+extern "C" fn btc_tx_status(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let txid = required_string(input, "txid")?;
+        let esplora = btc_esplora_url();
+        let status = esplora_get_json(&format!(
+            "{}/tx/{txid}/status",
+            esplora.trim_end_matches('/')
+        ))
+        .with_context(|| format!("fetch BTC tx status {txid}"))?;
+        Ok(ok(json!({
+            "module": "btc",
+            "txid": txid,
+            "network": "bitcoin",
+            "esplora": esplora,
+            "status": status
+        })))
+    })
+}
+
 extern "C" fn rgb_signed(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| signed_request(input, ""))
 }
@@ -600,8 +733,8 @@ extern "C" fn rgb_rna_balance() -> *const Dynamic {
 extern "C" fn rgb_issue(input: *const Dynamic) -> *const Dynamic {
     rgb_route(input, "/v1/assets/issue")
 }
-extern "C" fn rgb_assets(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/assets/list")
+extern "C" fn rgb_assets() -> *const Dynamic {
+    native_result(|| rgb_post_dynamic(&Dynamic::Null, "/v1/assets/list"))
 }
 extern "C" fn rgb_token_list() -> *const Dynamic {
     native_result(|| {
@@ -1320,6 +1453,118 @@ fn http_get_json(url: &str) -> Result<Value> {
     parse_http_json_response(&path, response)
 }
 
+fn btc_balance_json() -> Result<Value> {
+    let address = default_account_id()?;
+    let esplora = btc_esplora_url();
+    let stats = esplora_get_json(&format!(
+        "{}/address/{address}",
+        esplora.trim_end_matches('/')
+    ))
+    .with_context(|| format!("fetch BTC L1 balance for {address}"))?;
+    let utxos = btc_address_utxos_json(&address, &esplora)?;
+    let chain_funded = value_path_u64(&stats, &["chain_stats", "funded_txo_sum"]);
+    let chain_spent = value_path_u64(&stats, &["chain_stats", "spent_txo_sum"]);
+    let mempool_funded = value_path_u64(&stats, &["mempool_stats", "funded_txo_sum"]);
+    let mempool_spent = value_path_u64(&stats, &["mempool_stats", "spent_txo_sum"]);
+    let confirmed_sats = chain_funded.saturating_sub(chain_spent);
+    let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
+    Ok(json!({
+        "module": "btc",
+        "address": address,
+        "network": "bitcoin",
+        "esplora": esplora,
+        "confirmed_sats": confirmed_sats,
+        "mempool_sats": mempool_sats,
+        "total_sats": confirmed_sats + mempool_sats,
+        "chain_stats": stats.get("chain_stats").cloned().unwrap_or(Value::Null),
+        "mempool_stats": stats.get("mempool_stats").cloned().unwrap_or(Value::Null),
+        "utxos": utxos
+    }))
+}
+
+fn btc_assets_json() -> Result<Value> {
+    let payload = json!({
+        "account_id": default_account_id()?,
+        "tracked_utxos": tracked_utxos_json()?
+    });
+    Ok(dynamic_to_json(&rgb_post_dynamic(
+        &json_to_dynamic(&payload),
+        "/v1/assets/list",
+    )?))
+}
+
+fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
+    esplora_get_json(&format!(
+        "{}/address/{address}/utxo",
+        esplora.trim_end_matches('/')
+    ))
+    .with_context(|| format!("fetch BTC L1 UTXOs for {address}"))
+}
+
+fn tracked_utxos_json() -> Result<Value> {
+    let address = default_account_id()?;
+    let esplora = btc_esplora_url();
+    let utxos = btc_address_utxos_json(&address, &esplora)?;
+    let tracked = utxos
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|utxo| {
+            let txid = utxo.get("txid")?.as_str()?;
+            let vout = utxo.get("vout")?.as_u64()?;
+            let confirmed = utxo
+                .get("status")
+                .and_then(|status| status.get("confirmed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(json!({
+                "outpoint": format!("{txid}:{vout}"),
+                "address": address,
+                "confirmed": confirmed
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(tracked))
+}
+
+fn esplora_get_json(url: &str) -> Result<Value> {
+    let response = attohttpc::get(url)
+        .header("accept", "application/json")
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .with_context(|| format!("read Esplora response body from {url}"))?;
+    let json = if body.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body)
+            .with_context(|| format!("decode Esplora JSON body from {url}: {body}"))?
+    };
+    if !(200..300).contains(&status.as_u16()) {
+        bail!("Esplora GET {url} failed with HTTP {status}: {json}");
+    }
+    Ok(json)
+}
+
+fn esplora_post_text(url: &str, content_type: &str, body: &str) -> Result<String> {
+    let response = attohttpc::post(url)
+        .header("content-type", content_type)
+        .text(body.to_string())
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .with_context(|| format!("read Esplora response body from {url}"))?;
+    if !(200..300).contains(&status.as_u16()) {
+        bail!("Esplora POST {url} failed with HTTP {status}: {text}");
+    }
+    Ok(text)
+}
+
 fn parse_http_json_response(path: &str, response: Vec<u8>) -> Result<Value> {
     let response = String::from_utf8(response).context("RGB service response is not UTF-8")?;
     let (head, body) = response
@@ -1408,6 +1653,17 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
     object
         .entry("account_id".to_string())
         .or_insert(json!(default_account_id()?));
+    if matches!(
+        route,
+        "/v1/assets/list" | "/v1/balance" | "/v1/balance/breakdown"
+    ) {
+        object
+            .entry("tracked_utxos".to_string())
+            .or_insert(tracked_utxos_json()?);
+    }
+    if route == "/v1/balance" {
+        object.entry("scope".to_string()).or_insert(json!("all"));
+    }
     if route == "/v1/iroh-nodes/register" {
         object
             .entry("btc_address".to_string())
@@ -1429,6 +1685,21 @@ fn default_account_id() -> Result<String> {
 
 fn signer_node_id() -> Result<String> {
     local_string("signer-node").context("missing root value `local/signer-node`")
+}
+
+fn btc_esplora_url() -> String {
+    local_dynamic("lightning")
+        .map(|lightning| dynamic_to_json(&lightning))
+        .and_then(|lightning| {
+            lightning
+                .get("config")
+                .and_then(|config| config.get("chain_source"))
+                .and_then(|chain_source| chain_source.get("url"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| LN_ESPLORA_DEFAULT.to_string())
 }
 
 fn request_signature(path: &str, body: &Value) -> Result<Value> {
@@ -1641,6 +1912,10 @@ fn optional_bool(input: &Dynamic, key: &str) -> Option<bool> {
     })
 }
 
+fn dynamic_field_json(input: &Dynamic, key: &str) -> Option<Value> {
+    input.get_dynamic(key).map(|value| dynamic_to_json(&value))
+}
+
 fn parse_ln_contract_id(value: &str) -> Result<LnContractId> {
     let value = value.trim();
     ensure!(value.len() == 64, "contract_id must be 32-byte hex");
@@ -1851,6 +2126,21 @@ fn value_u64(value: &Value, key: &str) -> Option<u64> {
             _ => None,
         }),
         _ => None,
+    }
+}
+
+fn value_path_u64(value: &Value, path: &[&str]) -> u64 {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return 0;
+        };
+        current = next;
+    }
+    match current {
+        Value::Number(number) => number.as_u64().unwrap_or(0),
+        Value::String(value) => value.parse().unwrap_or(0),
+        _ => 0,
     }
 }
 
