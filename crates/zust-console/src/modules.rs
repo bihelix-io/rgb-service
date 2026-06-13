@@ -9,15 +9,25 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::btc_ln::{
+    BtcLnBackendKind, BtcLnBolt11InvoiceRequest, BtcLnBolt11PaymentRequest,
+    BtcLnChannelOpenRequest, BtcLnNode, BtcLnRuntimeConfig,
+};
+use crate::ln_rgb_btc_ln_backend::LnRgbBtcLnBackend;
+use crate::lnnode::{
+    PaymentId as WalletPaymentId, RgbAssetAmount as WalletRgbAssetAmount, RgbChannelOpenRequest,
+    RgbLnNode, RgbPaymentRequest,
+};
 use anyhow::{bail, ensure, Context, Result};
 use bip39::{Language as Bip39Language, Mnemonic as Bip39Mnemonic};
+use bitcoin::{secp256k1::PublicKey, Network};
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use lightning::ln::msgs::SocketAddress;
 use lightning::rgb::{
     init_rgb_ln_tx_composer, ContractId as LnContractId, RequestSignature as LnRequestSignature,
-    RgbAssetAmount, RgbChannelContext, RgbDaemonLnTxComposer, RgbLnTxComposer, RgbServiceClient,
-    RgbServiceClientError, RgbServiceSigner,
+    RgbAssetAmount as LdkRgbAssetAmount, RgbChannelContext, RgbDaemonLnTxComposer, RgbLnTxComposer,
+    RgbServiceClient, RgbServiceClientError, RgbServiceSigner,
 };
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde_json::{json, Map, Value};
@@ -43,132 +53,9 @@ static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static LN_RGB_COMPOSER: OnceLock<Arc<RgbDaemonLnTxComposer>> = OnceLock::new();
-static LN_LDK_NODE: OnceLock<Mutex<Option<Arc<ConsoleLdkNode>>>> = OnceLock::new();
+static LN_RGB_NODE: OnceLock<Mutex<Option<Arc<LnRgbBtcLnBackend>>>> = OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
-
-struct ConsoleLdkNode {
-    node: Arc<ldk_node::Node>,
-    events: Arc<Mutex<std::collections::VecDeque<String>>>,
-    stop_events: Arc<AtomicBool>,
-    event_thread: Mutex<Option<thread::JoinHandle<()>>>,
-    storage_dir: String,
-    network: String,
-}
-
-impl ConsoleLdkNode {
-    fn start(config: ConsoleLdkConfig) -> Result<Arc<Self>> {
-        let mut ldk_config = ldk_node::config::Config {
-            network: config.network,
-            storage_dir_path: config.storage_dir.clone(),
-            ..ldk_node::config::Config::default()
-        };
-        ldk_config.trusted_peers_0conf = config
-            .trusted_peers_0conf
-            .iter()
-            .map(|peer| {
-                ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer)
-                    .with_context(|| format!("invalid 0-conf peer: {peer}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut builder = ldk_node::Builder::from_config(ldk_config);
-        let mnemonic = Bip39Mnemonic::parse_in_normalized(Bip39Language::English, &config.mnemonic)
-            .context("invalid LN node mnemonic")?;
-        builder.set_entropy_bip39_mnemonic(mnemonic, None);
-        if let Some(listen) = config.listen.as_deref() {
-            let listen_addr = SocketAddress::from_str(listen)
-                .map_err(|_| anyhow::anyhow!("invalid LDK listen address: {listen}"))?;
-            builder
-                .set_listening_addresses(vec![listen_addr])
-                .map_err(|err| anyhow::anyhow!("invalid LDK listening address: {err:?}"))?;
-        }
-        builder.set_chain_source_esplora(config.esplora.clone(), None);
-        builder.set_gossip_source_p2p();
-        let node = Arc::new(builder.build().with_context(|| {
-            format!(
-                "failed to build LDK node at {}; use a fresh ldk_data_dir if it was initialized with another seed",
-                config.storage_dir
-            )
-        })?);
-        node.start().context("start LDK node")?;
-
-        let events = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        events
-            .lock()
-            .expect("LN event lock poisoned")
-            .push_back("ldk-node runtime started".to_string());
-        let stop_events = Arc::new(AtomicBool::new(false));
-        let thread_node = Arc::clone(&node);
-        let thread_events = Arc::clone(&events);
-        let thread_stop = Arc::clone(&stop_events);
-        let event_thread = thread::Builder::new()
-            .name("zust-ln-ldk-event-pump".to_string())
-            .spawn(move || {
-                while !thread_stop.load(Ordering::SeqCst) {
-                    if let Some(event) = thread_node.next_event() {
-                        let debug = format!("{event:?}");
-                        thread_events
-                            .lock()
-                            .expect("LN event lock poisoned")
-                            .push_back(debug);
-                        if let Err(err) = thread_node.event_handled() {
-                            thread_events
-                                .lock()
-                                .expect("LN event lock poisoned")
-                                .push_back(format!("ldk-node event_handled failed: {err:?}"));
-                        }
-                    } else {
-                        thread::sleep(Duration::from_millis(250));
-                    }
-                }
-            })
-            .context("spawn LDK event pump")?;
-
-        Ok(Arc::new(Self {
-            node,
-            events,
-            stop_events,
-            event_thread: Mutex::new(Some(event_thread)),
-            storage_dir: config.storage_dir,
-            network: config.network_name,
-        }))
-    }
-
-    fn stop(&self) -> Result<()> {
-        self.stop_events.store(true, Ordering::SeqCst);
-        if let Some(handle) = self
-            .event_thread
-            .lock()
-            .expect("LN event thread lock poisoned")
-            .take()
-        {
-            let _ = handle.join();
-        }
-        self.node.stop().context("stop LDK node")?;
-        self.events
-            .lock()
-            .expect("LN event lock poisoned")
-            .push_back("ldk-node runtime stopped".to_string());
-        Ok(())
-    }
-}
-
-impl Drop for ConsoleLdkNode {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-struct ConsoleLdkConfig {
-    network: ldk_node::bitcoin::Network,
-    network_name: String,
-    storage_dir: String,
-    esplora: String,
-    listen: Option<String>,
-    mnemonic: String,
-    trusted_peers_0conf: Vec<String>,
-}
 
 struct ConsoleRgbServiceSigner;
 
@@ -221,6 +108,7 @@ pub fn register_console_modules(vm: &Vm) -> Result<()> {
     register_btc_module(vm)?;
     register_rgb_module(vm)?;
     register_ln_module(vm)?;
+    register_ln_rgb_module(vm)?;
     Ok(())
 }
 
@@ -489,6 +377,160 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         ln_node_address as *const u8,
+    )?;
+    Ok(())
+}
+
+fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
+    let mut jit = vm.jit.write().unwrap();
+    jit.add_native_module_ptr("ln_rgb", "start", &[], Type::Any, ln_rgb_start as *const u8)?;
+    jit.add_native_module_ptr("ln_rgb", "stop", &[], Type::Any, ln_rgb_stop as *const u8)?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "status",
+        &[],
+        Type::Any,
+        ln_rgb_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_node_id",
+        &[],
+        Type::Any,
+        ln_rgb_get_node_id as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_addr",
+        &[],
+        Type::Any,
+        ln_rgb_get_addr as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "amount",
+        &[],
+        Type::Any,
+        ln_rgb_amount as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "btc_amount",
+        &[],
+        Type::Any,
+        ln_rgb_btc_amount as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "ln_amount",
+        &[],
+        Type::Any,
+        ln_rgb_ln_amount as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_peers",
+        &[],
+        Type::Any,
+        ln_rgb_get_peers as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_channels",
+        &[],
+        Type::Any,
+        ln_rgb_get_channels as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "connect",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_connect as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "open_channel",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_open_channel as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "invoice",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_invoice as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "pay",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_pay as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "events",
+        &[],
+        Type::Any,
+        ln_rgb_events as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "open_rgb_channel",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_open_rgb_channel as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "send_rgb_payment",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_send_rgb_payment as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_endpoint",
+        &[],
+        Type::Any,
+        ln_rgb_get_endpoint as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "is_peer_online",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_is_peer_online as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "transfer_rgb20",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_transfer_rgb20 as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "send_rgb_funding",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_send_rgb_funding as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "get_info",
+        &[],
+        Type::Any,
+        ln_rgb_get_info as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "rgb_channel_context",
+        &[Type::Any],
+        Type::Any,
+        ln_rgb_rgb_channel_context as *const u8,
     )?;
     Ok(())
 }
@@ -769,14 +811,15 @@ extern "C" fn ln_status() -> *const Dynamic {
         let node = current_ln_node();
         let (node_id, status, peers, channels, balances, storage_dir, network) =
             if let Some(node) = node.as_ref() {
+                let balance = node.balance_snapshot();
                 (
-                    node.node.node_id().to_string(),
-                    format!("{:?}", node.node.status()),
-                    node.node.list_peers().len(),
-                    node.node.list_channels().len(),
-                    Some(node.node.list_balances()),
-                    node.storage_dir.clone(),
-                    node.network.clone(),
+                    node.node_id().to_string(),
+                    node.status_summary(),
+                    node.peer_snapshots().len(),
+                    node.channel_snapshots().len(),
+                    Some(balance),
+                    ln_rgb_storage_dir().to_string_lossy().to_string(),
+                    ln_rgb_network_name(),
                 )
             } else {
                 (
@@ -798,7 +841,7 @@ extern "C" fn ln_status() -> *const Dynamic {
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "layers": ["l1", "l2"],
             "mode": "hot_wallet",
-            "backend": "ldk-node",
+            "backend": "ln-rgb",
             "rgb_backend": "ln-rgb-lightning",
             "node_id": node_id,
             "status": status,
@@ -811,8 +854,8 @@ extern "C" fn ln_status() -> *const Dynamic {
                 "spendable_onchain_balance_sats": balance.spendable_onchain_balance_sats,
                 "total_anchor_channels_reserve_sats": balance.total_anchor_channels_reserve_sats,
                 "total_lightning_balance_sats": balance.total_lightning_balance_sats,
-                "lightning_balances": format!("{:?}", balance.lightning_balances),
-                "pending_channel_closure_sweeps": format!("{:?}", balance.pending_balances_from_channel_closures)
+                "lightning_balances": balance.lightning_balances,
+                "pending_channel_closure_sweeps": balance.pending_channel_closure_sweeps
             }))
         })))
     })
@@ -835,7 +878,7 @@ extern "C" fn ln_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
         let contract_id = parse_ln_contract_id(&required_string(input, "contract_id")?)?;
         let amount = required_u64(input, "amount")?;
         let outbound = optional_bool(input, "outbound").unwrap_or(true);
-        let asset = RgbAssetAmount::new(contract_id, amount);
+        let asset = LdkRgbAssetAmount::new(contract_id, amount);
         let context = RgbChannelContext::new(asset).into_rgb_context(outbound);
         Ok(ok(json!({
             "module": "ln",
@@ -871,7 +914,7 @@ extern "C" fn ln_start() -> *const Dynamic {
             .or_else(|| value_u64(&stored, "interval_ms"))
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
         let interval = Duration::from_millis(interval_ms.max(1000));
-        let ldk_config = console_ldk_config(&config, mnemonic)?;
+        let ln_config = console_ln_rgb_config(&config, mnemonic)?;
 
         if LN_STARTED.swap(true, Ordering::SeqCst) {
             let node = current_ln_node();
@@ -882,23 +925,21 @@ extern "C" fn ln_start() -> *const Dynamic {
                 "address": address,
                 "config": config,
                 "source": "local/lightning",
-                "backend": "ldk-node",
+                "backend": "ln-rgb",
                 "rgb_backend": "ln-rgb-lightning",
                 "ln_rgb_composer_bound": composer_bound,
-                "node_id": node.as_ref().map(|node| node.node.node_id().to_string()).unwrap_or_default(),
+                "node_id": node.as_ref().map(|node| node.node_id().to_string()).unwrap_or_default(),
                 "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
                 "scan_enabled": false
             })));
         }
 
-        let node_handle = match ConsoleLdkNode::start(ldk_config) {
-            Ok(node) => node,
-            Err(err) => {
-                LN_STARTED.store(false, Ordering::SeqCst);
-                return Err(err);
-            }
-        };
-        let node_id = node_handle.node.node_id().to_string();
+        let node_handle = LnRgbBtcLnBackend::new_arc(ln_config);
+        if let Err(err) = node_handle.start() {
+            LN_STARTED.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+        let node_id = node_handle.node_id().to_string();
         *ln_node_slot().lock().expect("LN node slot lock poisoned") =
             Some(Arc::clone(&node_handle));
 
@@ -907,9 +948,14 @@ extern "C" fn ln_start() -> *const Dynamic {
             .name("zust-ln-inbound-listener".to_string())
             .spawn(move || ln_inbound_loop(thread_node, interval))
         {
-            let _ = node_handle.stop();
+            let stop_result = node_handle.stop();
             *ln_node_slot().lock().expect("LN node slot lock poisoned") = None;
             LN_STARTED.store(false, Ordering::SeqCst);
+            if let Err(stop_err) = stop_result {
+                return Err(err)
+                    .context("spawn LN inbound listener thread")
+                    .context(stop_err);
+            }
             return Err(err).context("spawn LN inbound listener thread");
         }
 
@@ -920,13 +966,13 @@ extern "C" fn ln_start() -> *const Dynamic {
             "address": address,
             "config": config,
             "source": "local/lightning",
-            "backend": "ldk-node",
+            "backend": "ln-rgb",
             "rgb_backend": "ln-rgb-lightning",
             "ln_rgb_composer_bound": composer_bound,
             "node_id": node_id,
             "listeners": ["l1_onchain_deposit", "l2_ln_deposit"],
             "scan_enabled": false,
-            "note": "LDK node runtime is running with ln-rgb-lightning RGB daemon composer; L1/L2 event pump is active"
+            "note": "LnRgbBtcLnBackend is running with patched ln-rgb-lightning ChannelManager"
         })))
     })
 }
@@ -944,7 +990,7 @@ extern "C" fn ln_stop() -> *const Dynamic {
         Ok(ok(json!({
             "module": "ln",
             "stopped": true,
-            "backend": "ldk-node"
+            "backend": "ln-rgb"
         })))
     })
 }
@@ -955,17 +1001,34 @@ extern "C" fn ln_events() -> *const Dynamic {
 
 fn ln_events_with_limit(limit: usize) -> Result<Dynamic> {
     let node = running_ln_node()?;
-    let mut events = node.events.lock().expect("LN event lock poisoned");
     let mut out = Vec::new();
     for _ in 0..limit {
-        let Some(event) = events.pop_front() else {
+        let Some(event) = node.next_event_debug() else {
             break;
         };
         out.push(json!(event));
+        node.event_handled()?;
     }
     Ok(ok(json!({
         "module": "ln",
         "events": out
+    })))
+}
+
+fn ln_rgb_amount_snapshot(kind: &str) -> Result<Dynamic> {
+    let node = running_ln_node()?;
+    let balances = node.balance_snapshot();
+    let amount = match kind {
+        "btc" => balances.spendable_onchain_balance_sats,
+        "ln" => balances.total_lightning_balance_sats,
+        _ => balances
+            .spendable_onchain_balance_sats
+            .saturating_add(balances.total_lightning_balance_sats),
+    };
+    Ok(ok(json!({
+        "module": "ln_rgb",
+        "kind": kind,
+        "amount_sats": amount
     })))
 }
 
@@ -974,22 +1037,16 @@ extern "C" fn ln_get_node_id() -> *const Dynamic {
         let node = running_ln_node()?;
         Ok(ok(json!({
             "module": "ln",
-            "node_id": node.node.node_id().to_string()
+            "node_id": node.node_id().to_string()
         })))
     })
 }
 
 extern "C" fn ln_get_addr() -> *const Dynamic {
     native_result(|| {
-        let node = running_ln_node()?;
-        let address = node
-            .node
-            .onchain_payment()
-            .new_address()
-            .context("create LDK on-chain address")?;
         Ok(ok(json!({
             "module": "ln",
-            "address": address.to_string()
+            "address": current_ln_hot_address()?
         })))
     })
 }
@@ -998,8 +1055,7 @@ extern "C" fn ln_get_peers() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         let peers = node
-            .node
-            .list_peers()
+            .peer_snapshots()
             .into_iter()
             .map(|peer| {
                 json!({
@@ -1021,22 +1077,21 @@ extern "C" fn ln_get_channels() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         let channels = node
-            .node
-            .list_channels()
+            .channel_snapshots()
             .into_iter()
             .map(|channel| {
                 json!({
-                    "user_channel_id": format!("{:?}", channel.user_channel_id),
+                    "user_channel_id": channel.user_channel_id,
                     "counterparty_node_id": channel.counterparty_node_id.to_string(),
                     "channel_value_sats": channel.channel_value_sats,
                     "is_outbound": channel.is_outbound,
                     "is_channel_ready": channel.is_channel_ready,
                     "is_usable": channel.is_usable,
-                    "channel_id": format!("{:?}", channel.channel_id),
+                    "channel_id": channel.channel_id,
                     "outbound_capacity_msat": channel.outbound_capacity_msat,
                     "next_outbound_htlc_limit_msat": channel.next_outbound_htlc_limit_msat,
                     "inbound_capacity_msat": channel.inbound_capacity_msat,
-                    "funding_txo": channel.funding_txo.map(|funding_txo| format!("{funding_txo:?}"))
+                    "funding_txo": channel.funding_txo
                 })
             })
             .collect::<Vec<_>>();
@@ -1054,9 +1109,8 @@ extern "C" fn ln_connect(input: *const Dynamic) -> *const Dynamic {
         let address = SocketAddress::from_str(&required_string(input, "address")?)
             .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
         let persist = optional_bool(input, "persist").unwrap_or(true);
-        node.node
-            .connect(peer_node_id, address.clone(), persist)
-            .context("connect LDK peer")?;
+        node.connect(peer_node_id, address.clone(), persist)
+            .context("connect LN peer")?;
         Ok(ok(json!({
             "module": "ln",
             "connected": true,
@@ -1075,14 +1129,18 @@ extern "C" fn ln_open_channel(input: *const Dynamic) -> *const Dynamic {
             .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
         let amount_sats = required_u64(input, "amount_sats")?;
         let push_msat = optional_u64(input, "push_msat");
-        let user_channel_id = node
-            .node
-            .open_channel(peer_node_id, address.clone(), amount_sats, push_msat, None)
-            .context("open LDK channel")?;
+        let channel_id = node
+            .open_channel(BtcLnChannelOpenRequest {
+                peer_node_id,
+                address: address.clone(),
+                amount_sats,
+                push_msat,
+            })
+            .context("open LN channel")?;
         Ok(ok(json!({
             "module": "ln",
             "channel_open_submitted": true,
-            "user_channel_id": format!("{user_channel_id:?}"),
+            "channel_id": channel_id,
             "node_id": peer_node_id.to_string(),
             "address": address.to_string()
         })))
@@ -1100,9 +1158,11 @@ extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
             Description::new(description).map_err(|err| anyhow::anyhow!("{err:?}"))?,
         );
         let invoice = node
-            .node
-            .bolt11_payment()
-            .receive(amount_msat, &description, expiry_secs)
+            .receive_bolt11(BtcLnBolt11InvoiceRequest {
+                amount_msat,
+                description,
+                expiry_secs,
+            })
             .context("create BOLT11 invoice")?;
         Ok(ok(json!({
             "module": "ln",
@@ -1115,17 +1175,220 @@ extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
         let node = running_ln_node()?;
         let invoice = Bolt11Invoice::from_str(&required_string(input, "invoice")?)
-            .context("parse BOLT11 invoice")?;
-        let payment_id = node
-            .node
-            .bolt11_payment()
-            .send(&invoice, None)
+            .map_err(|err| anyhow::anyhow!("parse BOLT11 invoice: {err:?}"))?;
+        let payment_hash = node
+            .pay_bolt11(BtcLnBolt11PaymentRequest { invoice })
             .context("send BOLT11 payment")?;
         Ok(ok(json!({
             "module": "ln",
-            "payment_id": format!("{payment_id:?}")
+            "payment_hash": payment_hash
         })))
     })
+}
+
+extern "C" fn ln_rgb_start() -> *const Dynamic {
+    ln_start()
+}
+
+extern "C" fn ln_rgb_stop() -> *const Dynamic {
+    ln_stop()
+}
+
+extern "C" fn ln_rgb_status() -> *const Dynamic {
+    ln_status()
+}
+
+extern "C" fn ln_rgb_get_node_id() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "node_id": node.node_id().to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_get_addr() -> *const Dynamic {
+    native_result(|| {
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "address": current_ln_hot_address()?
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_amount() -> *const Dynamic {
+    native_result(|| ln_rgb_amount_snapshot("total"))
+}
+
+extern "C" fn ln_rgb_btc_amount() -> *const Dynamic {
+    native_result(|| ln_rgb_amount_snapshot("btc"))
+}
+
+extern "C" fn ln_rgb_ln_amount() -> *const Dynamic {
+    native_result(|| ln_rgb_amount_snapshot("ln"))
+}
+
+extern "C" fn ln_rgb_get_peers() -> *const Dynamic {
+    ln_get_peers()
+}
+
+extern "C" fn ln_rgb_get_channels() -> *const Dynamic {
+    ln_get_channels()
+}
+
+extern "C" fn ln_rgb_connect(input: *const Dynamic) -> *const Dynamic {
+    ln_connect(input)
+}
+
+extern "C" fn ln_rgb_open_channel(input: *const Dynamic) -> *const Dynamic {
+    ln_open_channel(input)
+}
+
+extern "C" fn ln_rgb_invoice(input: *const Dynamic) -> *const Dynamic {
+    ln_invoice(input)
+}
+
+extern "C" fn ln_rgb_pay(input: *const Dynamic) -> *const Dynamic {
+    ln_pay(input)
+}
+
+extern "C" fn ln_rgb_events() -> *const Dynamic {
+    ln_events()
+}
+
+extern "C" fn ln_rgb_open_rgb_channel(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
+        if let Some(address) = optional_string(input, "address") {
+            let address = SocketAddress::from_str(&address)
+                .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
+            node.connect(peer_node_id, address, true)?;
+        }
+        let capacity_sat = optional_u64(input, "capacity_sat")
+            .or_else(|| optional_u64(input, "amount_sats"))
+            .context("missing `capacity_sat` or `amount_sats`")?;
+        let push_msat = optional_u64(input, "push_msat").unwrap_or(0);
+        let user_channel_id = optional_u128(input, "user_channel_id").unwrap_or_else(now_ms_u128);
+        let asset = wallet_rgb_asset_from_input(input)?;
+        let channel_id = node.open_rgb_channel(RgbChannelOpenRequest {
+            peer_node_id,
+            capacity_sat,
+            push_msat,
+            user_channel_id,
+            asset,
+        })?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "channel_id": bytes_to_hex(&channel_id.0),
+            "peer_node_id": peer_node_id.to_string(),
+            "capacity_sat": capacity_sat,
+            "push_msat": push_msat,
+            "user_channel_id": user_channel_id
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_send_rgb_payment(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let recipient_node_id = required_string(input, "node_id")
+            .or_else(|_| required_string(input, "recipient_node_id"))?;
+        let recipient_node_id = ldk_public_key(&recipient_node_id)?;
+        let amount_msat = required_u64(input, "amount_msat")?;
+        let payment_id = ln_rgb_payment_id(input)?;
+        let asset = wallet_rgb_asset_from_input(input)?;
+        node.send_rgb_payment(RgbPaymentRequest {
+            recipient_node_id,
+            amount_msat,
+            payment_id: WalletPaymentId(payment_id),
+            asset,
+        })?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "payment_id": bytes_to_hex(&payment_id),
+            "recipient_node_id": recipient_node_id.to_string(),
+            "amount_msat": amount_msat
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_get_endpoint() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        let addr = node.iroh_endpoint_addr()?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "endpoint": serde_json::to_string(&addr)?,
+            "endpoint_id": addr.id.to_string(),
+            "node_id": node.node_id().to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_is_peer_online(input: *const Dynamic) -> *const Dynamic {
+    native_dynamic_result(input, |input| {
+        let node = running_ln_node()?;
+        let endpoint = required_string(input, "endpoint")?;
+        let remote_addr: EndpointAddr =
+            serde_json::from_str(&endpoint).context("decode Iroh endpoint addr")?;
+        let timeout = Duration::from_secs(optional_u64(input, "timeout_secs").unwrap_or(8));
+        let result = node.probe_iroh_peer(remote_addr.clone(), timeout);
+        let online = result.is_ok();
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "endpoint_id": remote_addr.id.to_string(),
+            "online": online,
+            "error": result.err().map(|err| format!("{err:#}"))
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_transfer_rgb20(_input: *const Dynamic) -> *const Dynamic {
+    native_result(|| {
+        bail!(
+            "ln_rgb::transfer_rgb20 belongs to btc-local-wallet's local RGB stock flow; zust-console uses rgb-service daemon direct-transfer APIs"
+        )
+    })
+}
+
+extern "C" fn ln_rgb_send_rgb_funding(_input: *const Dynamic) -> *const Dynamic {
+    native_result(|| {
+        bail!(
+            "ln_rgb::send_rgb_funding needs the receiver Iroh endpoint and generated funding transfer delivery flow; RGB channel open and RGB payment runtime are already backed by LnRgbBtcLnBackend"
+        )
+    })
+}
+
+extern "C" fn ln_rgb_get_info() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        let balances = node.balance_snapshot();
+        let peers = node.peer_snapshots();
+        let channels = node.channel_snapshots();
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "backend": "ln-rgb",
+            "rgb_backend": "ln-rgb-lightning",
+            "runtime": "LnRgbBtcLnBackend",
+            "node_id": node.node_id().to_string(),
+            "endpoint": node.iroh_endpoint_addr().ok().and_then(|addr| serde_json::to_string(&addr).ok()),
+            "status": node.status_summary(),
+            "network": ln_rgb_network_name(),
+            "storage_dir": ln_rgb_storage_dir().to_string_lossy().to_string(),
+            "peer_count": peers.len(),
+            "channel_count": channels.len(),
+            "total_onchain_balance_sats": balances.total_onchain_balance_sats,
+            "spendable_onchain_balance_sats": balances.spendable_onchain_balance_sats,
+            "total_lightning_balance_sats": balances.total_lightning_balance_sats,
+            "rgb_channel_methods_available": true
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
+    ln_rgb_channel_context(input)
 }
 
 extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
@@ -1230,11 +1493,11 @@ fn bind_ln_rgb_composer() -> Result<bool> {
     Ok(LN_RGB_COMPOSER.get().is_some())
 }
 
-fn ln_node_slot() -> &'static Mutex<Option<Arc<ConsoleLdkNode>>> {
-    LN_LDK_NODE.get_or_init(|| Mutex::new(None))
+fn ln_node_slot() -> &'static Mutex<Option<Arc<LnRgbBtcLnBackend>>> {
+    LN_RGB_NODE.get_or_init(|| Mutex::new(None))
 }
 
-fn current_ln_node() -> Option<Arc<ConsoleLdkNode>> {
+fn current_ln_node() -> Option<Arc<LnRgbBtcLnBackend>> {
     ln_node_slot()
         .lock()
         .expect("LN node slot lock poisoned")
@@ -1242,23 +1505,31 @@ fn current_ln_node() -> Option<Arc<ConsoleLdkNode>> {
         .cloned()
 }
 
-fn running_ln_node() -> Result<Arc<ConsoleLdkNode>> {
-    current_ln_node().context("LDK node is not running; call ln::start() first")
+fn running_ln_node() -> Result<Arc<LnRgbBtcLnBackend>> {
+    current_ln_node().context("LN RGB node is not running; call ln::start() first")
 }
 
-fn console_ldk_config(config: &Value, mnemonic: String) -> Result<ConsoleLdkConfig> {
+fn console_ln_rgb_config(config: &Value, mnemonic: String) -> Result<BtcLnRuntimeConfig> {
     let network_name = config
         .get("network")
         .and_then(Value::as_str)
         .unwrap_or("bitcoin")
         .to_string();
-    let network = parse_ldk_network(&network_name)?;
-    let storage_dir = config
-        .get("ldk_data_dir")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(LN_LDK_DATA_DIR_DEFAULT)
-        .to_string();
+    let network = parse_ln_network(&network_name)?;
+    let l1_data_dir = PathBuf::from(
+        config
+            .get("data_dir")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(LN_DATA_DIR_DEFAULT),
+    );
+    let storage_dir = PathBuf::from(
+        config
+            .get("ldk_data_dir")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(LN_LDK_DATA_DIR_DEFAULT),
+    );
     let listen = config
         .get("listen")
         .and_then(Value::as_str)
@@ -1283,31 +1554,61 @@ fn console_ldk_config(config: &Value, mnemonic: String) -> Result<ConsoleLdkConf
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| LN_ESPLORA_DEFAULT.to_string());
-    Ok(ConsoleLdkConfig {
+    let esplora_urls = config
+        .get("chain_source")
+        .and_then(|chain_source| chain_source.get("urls"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![esplora.clone()]);
+    Ok(BtcLnRuntimeConfig {
+        backend: BtcLnBackendKind::LnRgb,
         network,
-        network_name,
+        l1_data_dir,
         storage_dir,
         esplora,
+        esplora_urls,
+        esplora_api_key: config
+            .get("chain_source")
+            .and_then(|chain_source| chain_source.get("api_key"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty()),
         listen,
-        mnemonic,
+        entropy_mnemonic: Some(mnemonic),
         trusted_peers_0conf,
+        accept_inbound_channels: config
+            .get("accept_inbound_channels")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        accept_inbound_rgb_transfers: config
+            .get("accept_inbound_rgb_transfers")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        iroh_tunnel_peers: Vec::new(),
     })
 }
 
-fn parse_ldk_network(value: &str) -> Result<ldk_node::bitcoin::Network> {
+fn parse_ln_network(value: &str) -> Result<Network> {
     match value {
-        "bitcoin" | "mainnet" => Ok(ldk_node::bitcoin::Network::Bitcoin),
-        "testnet" => Ok(ldk_node::bitcoin::Network::Testnet),
-        "testnet4" => Ok(ldk_node::bitcoin::Network::Testnet4),
-        "signet" => Ok(ldk_node::bitcoin::Network::Signet),
-        "regtest" => Ok(ldk_node::bitcoin::Network::Regtest),
+        "bitcoin" | "mainnet" => Ok(Network::Bitcoin),
+        "testnet" => Ok(Network::Testnet),
+        "testnet4" => Ok(Network::Testnet4),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
         _ => bail!("unsupported LN network `{value}`"),
     }
 }
 
-fn ldk_public_key(value: &str) -> Result<ldk_node::bitcoin::secp256k1::PublicKey> {
-    ldk_node::bitcoin::secp256k1::PublicKey::from_str(value)
-        .with_context(|| format!("invalid LN node id: {value}"))
+fn ldk_public_key(value: &str) -> Result<PublicKey> {
+    PublicKey::from_str(value).with_context(|| format!("invalid LN node id: {value}"))
 }
 
 fn ensure_ln_entropy_mnemonic(stored: &mut Value) -> Result<String> {
@@ -1900,6 +2201,21 @@ fn optional_u64(input: &Dynamic, key: &str) -> Option<u64> {
     })
 }
 
+fn optional_u128(input: &Dynamic, key: &str) -> Option<u128> {
+    input.get_dynamic(key).and_then(|value| match value {
+        Dynamic::U8(value) => Some(value as u128),
+        Dynamic::I8(value) => u128::try_from(value).ok(),
+        Dynamic::U16(value) => Some(value as u128),
+        Dynamic::I16(value) => u128::try_from(value).ok(),
+        Dynamic::U32(value) => Some(value as u128),
+        Dynamic::I32(value) => u128::try_from(value).ok(),
+        Dynamic::U64(value) => Some(value as u128),
+        Dynamic::I64(value) => u128::try_from(value).ok(),
+        value if value.is_str() => value.as_str().parse::<u128>().ok(),
+        _ => None,
+    })
+}
+
 fn optional_bool(input: &Dynamic, key: &str) -> Option<bool> {
     input.get_dynamic(key).and_then(|value| match value {
         Dynamic::Bool(value) => Some(value),
@@ -1926,6 +2242,121 @@ fn parse_ln_contract_id(value: &str) -> Result<LnContractId> {
             .with_context(|| format!("invalid contract_id hex at byte {index}"))?;
     }
     Ok(LnContractId::from(bytes))
+}
+
+fn ln_rgb_asset_from_input(input: &Dynamic) -> Result<(LnContractId, u64)> {
+    let contract_id = required_string(input, "contract_id")
+        .or_else(|_| required_string(input, "asset_id"))
+        .context("missing `contract_id` or `asset_id`")?;
+    let amount = optional_u64(input, "amount")
+        .or_else(|| optional_u64(input, "rgb_amount"))
+        .or_else(|| optional_u64(input, "funding_rgb"))
+        .context("missing `amount`, `rgb_amount`, or `funding_rgb`")?;
+    Ok((parse_ln_contract_id(&contract_id)?, amount))
+}
+
+fn wallet_rgb_asset_from_input(input: &Dynamic) -> Result<WalletRgbAssetAmount> {
+    let contract_id = required_string(input, "contract_id")
+        .or_else(|_| required_string(input, "asset_id"))
+        .context("missing `contract_id` or `asset_id`")?;
+    let amount = optional_u64(input, "amount")
+        .or_else(|| optional_u64(input, "rgb_amount"))
+        .or_else(|| optional_u64(input, "funding_rgb"))
+        .context("missing `amount`, `rgb_amount`, or `funding_rgb`")?;
+    Ok(WalletRgbAssetAmount {
+        contract_id: rgbstd::ContractId::from_str(&contract_id)
+            .with_context(|| format!("invalid RGB contract_id: {contract_id}"))?,
+        amount,
+    })
+}
+
+fn ln_rgb_payment_id(input: &Dynamic) -> Result<[u8; 32]> {
+    if let Some(payment_id) = optional_string(input, "payment_id") {
+        return hex32_to_bytes(&payment_id);
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).context("generate RGB-LN payment_id")?;
+    Ok(bytes)
+}
+
+fn hex32_to_bytes(value: &str) -> Result<[u8; 32]> {
+    let value = value.trim();
+    ensure!(value.len() == 64, "expected 32-byte hex string");
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .with_context(|| format!("invalid hex at byte {index}"))?;
+    }
+    Ok(bytes)
+}
+
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn now_ms_u128() -> u128 {
+    now_ms() as u128
+}
+
+fn current_ln_hot_address() -> Result<String> {
+    let lightning = local_dynamic("lightning").context("missing root value `local/lightning`")?;
+    let requested = dynamic_to_json(&lightning);
+    let path = find_string_field(&requested, &["path"])
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ln_node_path(&lightning));
+    let stored =
+        read_json_file(&path).with_context(|| format!("read LN node state {}", path.display()))?;
+    find_string_field(&stored, &["address", "btc_address"]).with_context(|| {
+        format!(
+            "LN node state {} has no signer address; run ln::node_address first",
+            path.display()
+        )
+    })
+}
+
+fn ln_rgb_storage_dir() -> PathBuf {
+    local_dynamic("lightning")
+        .map(|value| dynamic_to_json(&value))
+        .and_then(|value| {
+            value
+                .get("config")
+                .and_then(|config| config.get("ldk_data_dir"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("ldk_data_dir").and_then(Value::as_str))
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from(LN_LDK_DATA_DIR_DEFAULT))
+}
+
+fn ln_rgb_network_name() -> String {
+    local_dynamic("lightning")
+        .map(|value| dynamic_to_json(&value))
+        .and_then(|value| {
+            value
+                .get("config")
+                .and_then(|config| config.get("network"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("network").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bitcoin".to_string())
+}
+
+fn ln_listen_address() -> String {
+    local_dynamic("lightning")
+        .map(|value| dynamic_to_json(&value))
+        .and_then(|value| {
+            value
+                .get("config")
+                .and_then(|config| config.get("listen"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("listen").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| LN_LISTEN_DEFAULT.to_string())
 }
 
 fn json_to_dynamic(value: &Value) -> Dynamic {

@@ -1,4 +1,13 @@
+mod btc_ln;
+mod iroh_transport;
+mod ln_rgb_btc_ln_backend;
+mod lnnode;
+mod local_wallet;
 mod modules;
+mod node_config;
+mod node_store;
+mod rgb20;
+mod rgb_ln;
 
 use std::{
     env, fs,

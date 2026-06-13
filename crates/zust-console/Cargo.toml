@@ -18,15 +18,34 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+amplify = { workspace = true }
 attohttpc = "0.30"
+bdk_bitcoind_rpc = "0.22.0"
+bdk_esplora = { version = "0.22.2", features = ["blocking"] }
+bdk_wallet = { version = "=2.2.0", features = ["file_store", "keys-bip39"] }
 bip39 = "2"
+bitcoin = { version = "0.32.7", features = ["base64", "serde", "secp-recovery"] }
 dynamic = { package = "zust-dynamic", version = "0.9.12" }
+fjall = { workspace = true }
 getrandom = "0.3"
 iroh = "1.0.0-rc.0"
-ldk-node = "0.7.0"
 lightning = { path = "../ln-rgb-lightning" }
+lightning-background-processor = "0.2.0"
 lightning-invoice = "0.34.0"
+lightning-net-tokio = "0.2.0"
+lightning-persister = "0.2.0"
+lightning-transaction-sync = { version = "0.2.1", features = ["esplora-blocking"] }
+nonasync = { workspace = true }
+psrgbt = { package = "rgb-psbt-utils", path = "../rgb-api/psbt", default-features = false }
+rgb = { package = "rgb-api", path = "../rgb-api", default-features = false, features = ["fs", "serde", "esplora_blocking"] }
+rgb-consensus = { path = "../rgb-consensus" }
+rgb-invoice = { package = "rgb-invoicing", path = "../rgb-ops/invoice", default-features = false }
+rgb-schemata = { package = "rgb-schemas", path = "../rgb-schemas", default-features = false }
+rgbstd = { package = "rgb-ops", path = "../rgb-ops", default-features = false, features = ["serde", "esplora_blocking", "fjall"] }
 root = { package = "zust-root", version = "0.9.6" }
+serde = { package = "serde", version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
+strict_types = { package = "rgb-strict-types", version = "~1.0.1", features = ["serde"] }
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "time"] }
 vm = { package = "zust-vm", version = "0.9.66" }
