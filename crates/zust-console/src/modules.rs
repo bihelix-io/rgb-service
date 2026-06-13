@@ -162,14 +162,38 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "get_wallet_address",
-        &[],
-        Type::Str,
+        &[Type::Str],
+        Type::Any,
         btc_get_wallet_address as *const u8,
     )?;
-    jit.add_native_module_ptr("btc", "balance", &[], Type::Any, btc_balance as *const u8)?;
-    jit.add_native_module_ptr("btc", "status", &[], Type::Any, btc_status as *const u8)?;
-    jit.add_native_module_ptr("btc", "utxos", &[], Type::Any, btc_utxos as *const u8)?;
-    jit.add_native_module_ptr("btc", "assets", &[], Type::Any, btc_assets as *const u8)?;
+    jit.add_native_module_ptr(
+        "btc",
+        "balance",
+        &[Type::Str],
+        Type::Any,
+        btc_balance as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "status",
+        &[Type::Str],
+        Type::Any,
+        btc_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "utxos",
+        &[Type::Str],
+        Type::Any,
+        btc_utxos as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "assets",
+        &[Type::Str],
+        Type::Any,
+        btc_assets as *const u8,
+    )?;
     jit.add_native_module_ptr(
         "btc",
         "get_deposit_address",
@@ -187,7 +211,7 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "scan_deposits",
-        &[],
+        &[Type::Str],
         Type::Any,
         btc_scan_deposits as *const u8,
     )?;
@@ -215,7 +239,7 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "sign_psbt",
-        &[Type::Any],
+        &[Type::Str, Type::Str],
         Type::Any,
         btc_sign_psbt as *const u8,
     )?;
@@ -621,8 +645,19 @@ extern "C" fn bdk_external_anchor(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn btc_get_wallet_address() -> *const Dynamic {
-    native_result(|| Ok(Dynamic::from(default_account_id()?)))
+extern "C" fn btc_get_wallet_address(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident| {
+        let account = btc_account_for_ident(ident)?;
+        Ok(ok(json!({
+            "module": "btc",
+            "ident": ident,
+            "address": account
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "account": account
+        })))
+    })
 }
 
 extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
@@ -632,6 +667,16 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
             "btc::get_deposit_address expects ident string"
         );
         let ident = input.as_str().to_string();
+        if ident.trim().is_empty() {
+            return Ok(ok(json!({
+                "module": "btc",
+                "ident": "",
+                "address": default_account_id()?,
+                "created": false,
+                "persisted": false,
+                "source": "default_account"
+            })));
+        }
         ensure!(!ident.trim().is_empty(), "ident must not be empty");
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         if let Some(address) = store.get_ident_btc_address(&ident)? {
@@ -820,8 +865,8 @@ extern "C" fn btc_lookup_address_ident(input: *const Dynamic) -> *const Dynamic 
     })
 }
 
-extern "C" fn btc_scan_deposits() -> *const Dynamic {
-    native_result(|| {
+extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident_filter| {
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         store.put_wallet_btc_address(&default_account_id()?)?;
         let esplora = btc_esplora_url();
@@ -835,16 +880,25 @@ extern "C" fn btc_scan_deposits() -> *const Dynamic {
         let mut deposits = Vec::new();
         let mut persisted = 0usize;
         let mut address_mappings = Vec::new();
-        if let Some(address) = store.get_wallet_btc_address()? {
+        if ident_filter.trim().is_empty() {
+            let address = store
+                .get_wallet_btc_address()?
+                .unwrap_or(default_account_id()?);
             address_mappings.push((
                 "wallet".to_string(),
                 "default".to_string(),
                 String::new(),
                 address,
             ));
-        }
-        for (ident, address) in store.list_ident_btc_addresses()? {
-            address_mappings.push(("ident".to_string(), String::new(), ident, address));
+        } else if let Some(address) = store.get_ident_btc_address(ident_filter)? {
+            address_mappings.push((
+                "ident".to_string(),
+                String::new(),
+                ident_filter.to_string(),
+                address,
+            ));
+        } else {
+            bail!("unknown BTC ident `{ident_filter}`; call btc::get_deposit_address first");
         }
         for (owner_type, owner_label, ident, address) in address_mappings {
             let mut seen = std::collections::BTreeSet::new();
@@ -1271,17 +1325,24 @@ extern "C" fn btc_refill_address_pool(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn btc_status() -> *const Dynamic {
-    native_result(|| {
-        let balance = btc_balance_json()?;
-        let assets = btc_assets_json().unwrap_or_else(|err| {
+extern "C" fn btc_status(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident| {
+        let account = btc_account_for_ident(ident)?;
+        let address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let balance = btc_balance_json(ident)?;
+        let assets = btc_assets_json(ident).unwrap_or_else(|err| {
             json!({
                 "error": format!("{err:#}")
             })
         });
         Ok(ok(json!({
             "module": "btc",
-            "address": default_account_id()?,
+            "ident": ident,
+            "address": address,
+            "account": account,
             "network": "bitcoin",
             "balance": balance,
             "assets": assets
@@ -1289,18 +1350,24 @@ extern "C" fn btc_status() -> *const Dynamic {
     })
 }
 
-extern "C" fn btc_balance() -> *const Dynamic {
-    native_result(|| Ok(ok(btc_balance_json()?)))
+extern "C" fn btc_balance(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident| Ok(ok(btc_balance_json(ident)?)))
 }
 
-extern "C" fn btc_utxos() -> *const Dynamic {
-    native_result(|| {
-        let address = default_account_id()?;
+extern "C" fn btc_utxos(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident| {
+        let account = btc_account_for_ident(ident)?;
+        let address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let esplora = btc_esplora_url();
         let utxos = btc_address_utxos_json(&address, &esplora)?;
         Ok(ok(json!({
             "module": "btc",
+            "ident": ident,
             "address": address,
+            "account": account,
             "network": "bitcoin",
             "esplora": esplora,
             "utxos": utxos
@@ -1308,19 +1375,20 @@ extern "C" fn btc_utxos() -> *const Dynamic {
     })
 }
 
-extern "C" fn btc_assets() -> *const Dynamic {
-    native_result(|| Ok(json_to_dynamic(&btc_assets_json()?)))
+extern "C" fn btc_assets(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |ident| Ok(json_to_dynamic(&btc_assets_json(ident)?)))
 }
 
-extern "C" fn btc_sign_psbt(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(input.is_str(), "btc::sign_psbt expects PSBT string");
-        let psbt = input.as_str().to_string();
+extern "C" fn btc_sign_psbt(psbt: *const Dynamic, ident: *const Dynamic) -> *const Dynamic {
+    native_two_string_dynamic_result(psbt, ident, |psbt, ident| {
         ensure!(!psbt.trim().is_empty(), "psbt must not be empty");
+        let signing_account = btc_account_for_ident(ident)?;
         let body = json!({
             "account_id": default_account_id()?,
+            "ident": ident,
             "domain": "bihelix-btc-wallet",
             "psbt": psbt,
+            "signing_accounts": [signing_account],
             "policy": {},
             "expires_at_ms": now_ms() + 300000,
             "timestamp_ms": now_ms()
@@ -2695,8 +2763,61 @@ fn http_get_json(url: &str) -> Result<Value> {
     parse_http_json_response(&path, response)
 }
 
-fn btc_balance_json() -> Result<Value> {
-    let address = default_account_id()?;
+fn btc_account_for_ident(ident: &str) -> Result<Value> {
+    let ident = ident.trim();
+    let root_account_id = default_account_id()?;
+    if ident.is_empty() {
+        return Ok(json!({
+            "kind": "default",
+            "ident": "",
+            "account_id": root_account_id.clone(),
+            "address": root_account_id,
+            "source": "local/btc-addr",
+            "signer_response": Value::Null
+        }));
+    }
+    let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+    let address = store.get_ident_btc_address(ident)?.with_context(|| {
+        format!("unknown BTC ident `{ident}`; call btc::get_deposit_address first")
+    })?;
+    let pool_record = store
+        .list_used_btc_address_pool_records()?
+        .into_iter()
+        .find_map(|(candidate, record)| (candidate == address).then_some(record))
+        .unwrap_or(Value::Null);
+    let signer_response = pool_record
+        .get("signer_response")
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "kind": "derived",
+        "ident": ident,
+        "account_id": root_account_id,
+        "address": address,
+        "source": "local_address_pool",
+        "derivation_path": signer_response
+            .get("derivation_path")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "index": signer_response
+            .get("index")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "script_pubkey": signer_response
+            .get("script_pubkey")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "signer_response": signer_response
+    }))
+}
+
+fn btc_balance_json(ident: &str) -> Result<Value> {
+    let account = btc_account_for_ident(ident)?;
+    let address = account
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let esplora = btc_esplora_url();
     let stats = esplora_get_json(&format!(
         "{}/address/{address}",
@@ -2712,7 +2833,9 @@ fn btc_balance_json() -> Result<Value> {
     let mempool_sats = mempool_funded.saturating_sub(mempool_spent);
     Ok(json!({
         "module": "btc",
+        "ident": ident,
         "address": address,
+        "account": account,
         "network": "bitcoin",
         "esplora": esplora,
         "confirmed_sats": confirmed_sats,
@@ -2724,10 +2847,18 @@ fn btc_balance_json() -> Result<Value> {
     }))
 }
 
-fn btc_assets_json() -> Result<Value> {
+fn btc_assets_json(ident: &str) -> Result<Value> {
+    let account = btc_account_for_ident(ident)?;
+    let address = account
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let payload = json!({
-        "account_id": default_account_id()?,
-        "tracked_utxos": tracked_utxos_json()?
+        "account_id": address,
+        "ident": ident,
+        "account": account,
+        "tracked_utxos": tracked_utxos_json(&address)?
     });
     Ok(dynamic_to_json(&rgb_post_dynamic(
         &json_to_dynamic(&payload),
@@ -2743,10 +2874,9 @@ fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
     .with_context(|| format!("fetch BTC L1 UTXOs for {address}"))
 }
 
-fn tracked_utxos_json() -> Result<Value> {
-    let address = default_account_id()?;
+fn tracked_utxos_json(address: &str) -> Result<Value> {
     let esplora = btc_esplora_url();
-    let utxos = btc_address_utxos_json(&address, &esplora)?;
+    let utxos = btc_address_utxos_json(address, &esplora)?;
     let tracked = utxos
         .as_array()
         .cloned()
@@ -2885,7 +3015,7 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
     ) {
         object
             .entry("tracked_utxos".to_string())
-            .or_insert(tracked_utxos_json()?);
+            .or_insert(tracked_utxos_json(&default_account_id()?)?);
     }
     if route == "/v1/balance" {
         object.entry("scope".to_string()).or_insert(json!("all"));
@@ -3085,6 +3215,31 @@ fn native_string_result(
         Ok(value) => Box::into_raw(Box::new(Dynamic::from(value))),
         Err(_) => Box::into_raw(Box::new(Dynamic::from(""))),
     }
+}
+
+fn native_string_dynamic_result(
+    input: *const Dynamic,
+    f: impl FnOnce(&str) -> Result<Dynamic>,
+) -> *const Dynamic {
+    let input = unsafe { &*input };
+    native_result(|| {
+        ensure!(input.is_str(), "expected string argument");
+        f(input.as_str())
+    })
+}
+
+fn native_two_string_dynamic_result(
+    first: *const Dynamic,
+    second: *const Dynamic,
+    f: impl FnOnce(&str, &str) -> Result<Dynamic>,
+) -> *const Dynamic {
+    let first = unsafe { &*first };
+    let second = unsafe { &*second };
+    native_result(|| {
+        ensure!(first.is_str(), "first argument must be string");
+        ensure!(second.is_str(), "second argument must be string");
+        f(first.as_str(), second.as_str())
+    })
 }
 
 fn required_string(input: &Dynamic, key: &str) -> Result<String> {

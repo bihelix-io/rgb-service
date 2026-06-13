@@ -77,15 +77,15 @@ the low-water mark.
 Inside the REPL, admin/debug code is executed directly:
 
 ```zs
-btc::get_wallet_address()
-btc::balance()
-btc::utxos()
-btc::assets()
-btc::status()
+btc::get_wallet_address("")
+btc::balance("")
+btc::utxos("")
+btc::assets("")
+btc::status("")
 btc::address_pool_status()
 btc::refill_address_pool(20)
 btc::get_deposit_address("alice")
-btc::scan_deposits()
+btc::scan_deposits("alice")
 
 rgb::assets()
 rgb::token_list()
@@ -122,22 +122,55 @@ deposit addresses through Esplora, persisting discovered outpoints locally.
 BTC module scope:
 
 ```zs
-btc::balance()
-btc::utxos()
-btc::assets()
+btc::balance("")
+btc::utxos("")
+btc::assets("")
 btc::address_pool_status()
 btc::refill_address_pool(20)
 btc::get_deposit_address("alice")
-btc::scan_deposits()
+btc::scan_deposits("")
 btc::tx_status("...")
-btc::sign_psbt("...")
+btc::sign_psbt("...", "")
 btc::broadcast("...")
 ```
 
-`btc::assets()` and `rgb::assets()` read `local/btc-addr`, fetch its current
-L1 UTXOs from Esplora, and send those outpoints to the RGB daemon. Direct BTC
-send is not exposed until the signer App implements `/v1/signer/psbt/sign`;
-`btc::sign_psbt()` calls that path directly and returns the real signer result.
+BTC address-selecting calls take an `ident` string. `""` selects the default
+`local/btc-addr`; a non-empty ident selects the local pooled address previously
+assigned by `btc::get_deposit_address(ident)`.
+
+`btc::assets(ident)` fetches that account's current L1 UTXOs from Esplora and
+sends those outpoints to the RGB daemon.
+
+`btc::sign_psbt(psbt, ident)` calls signer App `/v1/signer/psbt/sign`. The
+request body includes:
+
+```json
+{
+  "account_id": "bc1q...",
+  "ident": "alice",
+  "domain": "bihelix-btc-wallet",
+  "psbt": "...",
+  "signing_accounts": [
+    {
+      "kind": "derived",
+      "ident": "alice",
+      "account_id": "bc1q...",
+      "address": "bc1q...",
+      "source": "local_address_pool",
+      "derivation_path": "m/84'/0'/0'/0/12",
+      "index": 12,
+      "script_pubkey": "0014...",
+      "signer_response": {}
+    }
+  ],
+  "policy": {},
+  "expires_at_ms": 0,
+  "timestamp_ms": 0
+}
+```
+
+For `ident == ""`, `signing_accounts[0].kind` is `"default"` and `address` is
+`local/btc-addr`.
 
 Useful REPL commands:
 
