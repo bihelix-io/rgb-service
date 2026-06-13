@@ -1,11 +1,3 @@
-mod btc_ln;
-mod ln_rgb_btc_ln_backend;
-mod lnnode;
-mod local_wallet;
-mod modules;
-mod node_config;
-mod node_store;
-
 use std::{
     env, fs,
     io::{self, Write},
@@ -63,7 +55,7 @@ fn print_help() {
 
 fn init_vm() -> Result<Vm> {
     let vm = Vm::with_all().context("initialize Zust VM")?;
-    modules::register_console_modules(&vm).context("register Zust console modules")?;
+    zust_console::register_console_modules(&vm).context("register Zust console modules")?;
     Ok(vm)
 }
 
