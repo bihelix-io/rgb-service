@@ -111,7 +111,6 @@ fn local_dynamic(name: &str) -> Option<Dynamic> {
 pub fn register_console_modules(vm: &Vm) -> Result<()> {
     register_btc_module(vm)?;
     register_rgb_module(vm)?;
-    register_ln_module(vm)?;
     register_ln_rgb_module(vm)?;
     Ok(())
 }
@@ -332,99 +331,31 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn register_ln_module(vm: &Vm) -> Result<()> {
+fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     let mut jit = vm.jit.write().unwrap();
     jit.add_native_module_ptr(
-        "ln",
-        "spawn_scanner",
-        &[Type::U64],
-        Type::Any,
-        ln_spawn_scanner as *const u8,
-    )?;
-    jit.add_native_module_ptr("ln", "start", &[], Type::Any, ln_start as *const u8)?;
-    jit.add_native_module_ptr("ln", "stop", &[], Type::Any, ln_stop as *const u8)?;
-    jit.add_native_module_ptr(
-        "ln",
-        "scanner_status",
-        &[],
-        Type::Any,
-        ln_scanner_status as *const u8,
-    )?;
-    jit.add_native_module_ptr("ln", "status", &[], Type::Any, ln_status as *const u8)?;
-    jit.add_native_module_ptr("ln", "events", &[], Type::Any, ln_events as *const u8)?;
-    jit.add_native_module_ptr(
-        "ln",
-        "get_node_id",
-        &[],
-        Type::Any,
-        ln_get_node_id as *const u8,
-    )?;
-    jit.add_native_module_ptr("ln", "get_addr", &[], Type::Any, ln_get_addr as *const u8)?;
-    jit.add_native_module_ptr("ln", "get_peers", &[], Type::Any, ln_get_peers as *const u8)?;
-    jit.add_native_module_ptr(
-        "ln",
-        "get_channels",
-        &[],
-        Type::Any,
-        ln_get_channels as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "connect",
-        &[Type::Str, Type::Str, Type::Bool],
-        Type::Any,
-        ln_connect as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "open_channel",
-        &[Type::Str, Type::Str, Type::U64, Type::U64],
-        Type::Any,
-        ln_open_channel as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "close_channel",
-        &[Type::Str, Type::Str, Type::Bool, Type::Str],
-        Type::Any,
-        ln_close_channel as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "invoice",
-        &[Type::U64, Type::Str, Type::U64],
-        Type::Any,
-        ln_invoice as *const u8,
-    )?;
-    jit.add_native_module_ptr("ln", "pay", &[Type::Str], Type::Any, ln_pay as *const u8)?;
-    jit.add_native_module_ptr(
-        "ln",
-        "token_list",
-        &[],
-        Type::Any,
-        ln_token_list as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
-        "rgb_channel_context",
-        &[Type::Str, Type::U64, Type::Bool],
-        Type::Any,
-        ln_rgb_channel_context as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln",
+        "ln_rgb",
         "node_address",
         &[Type::Any],
         Type::Any,
-        ln_node_address as *const u8,
+        ln_rgb_node_address as *const u8,
     )?;
-    Ok(())
-}
-
-fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
     jit.add_native_module_ptr("ln_rgb", "start", &[], Type::Any, ln_rgb_start as *const u8)?;
     jit.add_native_module_ptr("ln_rgb", "stop", &[], Type::Any, ln_rgb_stop as *const u8)?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "spawn_scanner",
+        &[Type::U64],
+        Type::Any,
+        ln_rgb_spawn_scanner as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "scanner_status",
+        &[],
+        Type::Any,
+        ln_rgb_scanner_status as *const u8,
+    )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "status",
@@ -522,6 +453,13 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
         &[],
         Type::Any,
         ln_rgb_events as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "token_list",
+        &[],
+        Type::Any,
+        ln_rgb_token_list as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
@@ -1644,7 +1582,7 @@ extern "C" fn rgb_test(scenario: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_status() -> *const Dynamic {
+extern "C" fn ln_rgb_status() -> *const Dynamic {
     native_result(|| {
         let node = current_ln_node();
         let (node_id, status, peers, channels, balances, storage_dir, network) =
@@ -1671,7 +1609,7 @@ extern "C" fn ln_status() -> *const Dynamic {
                 )
             };
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "enabled": true,
             "ln_rgb_lightning_linked": true,
             "ln_rgb_composer_bound": LN_RGB_COMPOSER.get().is_some(),
@@ -1699,7 +1637,7 @@ extern "C" fn ln_status() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_token_list() -> *const Dynamic {
+extern "C" fn ln_rgb_token_list() -> *const Dynamic {
     native_result(|| {
         let signer: Arc<dyn RgbServiceSigner + Send + Sync> = Arc::new(ConsoleRgbServiceSigner);
         let client =
@@ -1711,7 +1649,7 @@ extern "C" fn ln_token_list() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_channel_context(
+extern "C" fn ln_rgb_rgb_channel_context(
     contract_id: *const Dynamic,
     amount: u64,
     outbound: bool,
@@ -1723,7 +1661,7 @@ extern "C" fn ln_rgb_channel_context(
         let asset = LdkRgbAssetAmount::new(contract_id, amount);
         let context = RgbChannelContext::new(asset).into_rgb_context(outbound);
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "backend": "ln-rgb-lightning",
             "contract_id": context.contract_id.to_string(),
             "funding_rgb": context.funding_rgb,
@@ -1734,10 +1672,10 @@ extern "C" fn ln_rgb_channel_context(
     })
 }
 
-extern "C" fn ln_start() -> *const Dynamic {
+extern "C" fn ln_rgb_start() -> *const Dynamic {
     native_result(|| {
         let lightning = local_dynamic("lightning").context(
-            "missing root value `local/lightning`; run ln::node_address and root::add first",
+            "missing root value `local/lightning`; run ln_rgb::node_address and root::add first",
         )?;
         let requested = dynamic_to_json(&lightning);
         let path = find_string_field(&requested, &["path"])
@@ -1761,7 +1699,7 @@ extern "C" fn ln_start() -> *const Dynamic {
         if LN_STARTED.swap(true, Ordering::SeqCst) {
             let node = current_ln_node();
             return Ok(ok(json!({
-                "module": "ln",
+                "module": "ln_rgb",
                 "started": true,
                 "already_running": true,
                 "address": address,
@@ -1802,7 +1740,7 @@ extern "C" fn ln_start() -> *const Dynamic {
         }
 
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "started": true,
             "already_running": false,
             "address": address,
@@ -1819,7 +1757,7 @@ extern "C" fn ln_start() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_stop() -> *const Dynamic {
+extern "C" fn ln_rgb_stop() -> *const Dynamic {
     native_result(|| {
         let node = ln_node_slot()
             .lock()
@@ -1830,14 +1768,14 @@ extern "C" fn ln_stop() -> *const Dynamic {
         }
         LN_STARTED.store(false, Ordering::SeqCst);
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "stopped": true,
             "backend": "ln-rgb"
         })))
     })
 }
 
-extern "C" fn ln_events() -> *const Dynamic {
+extern "C" fn ln_rgb_events() -> *const Dynamic {
     native_result(|| ln_events_with_limit(100))
 }
 
@@ -1852,7 +1790,7 @@ fn ln_events_with_limit(limit: usize) -> Result<Dynamic> {
         node.event_handled()?;
     }
     Ok(ok(json!({
-        "module": "ln",
+        "module": "ln_rgb",
         "events": out
     })))
 }
@@ -1874,26 +1812,26 @@ fn ln_rgb_amount_snapshot(kind: &str) -> Result<Dynamic> {
     })))
 }
 
-extern "C" fn ln_get_node_id() -> *const Dynamic {
+extern "C" fn ln_rgb_get_node_id() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "node_id": node.node_id().to_string()
         })))
     })
 }
 
-extern "C" fn ln_get_addr() -> *const Dynamic {
+extern "C" fn ln_rgb_get_addr() -> *const Dynamic {
     native_result(|| {
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "address": current_ln_hot_address()?
         })))
     })
 }
 
-extern "C" fn ln_get_peers() -> *const Dynamic {
+extern "C" fn ln_rgb_get_peers() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         let peers = node
@@ -1909,13 +1847,13 @@ extern "C" fn ln_get_peers() -> *const Dynamic {
             })
             .collect::<Vec<_>>();
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "peers": peers
         })))
     })
 }
 
-extern "C" fn ln_get_channels() -> *const Dynamic {
+extern "C" fn ln_rgb_get_channels() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         let channels = node
@@ -1938,13 +1876,13 @@ extern "C" fn ln_get_channels() -> *const Dynamic {
             })
             .collect::<Vec<_>>();
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "channels": channels
         })))
     })
 }
 
-extern "C" fn ln_connect(
+extern "C" fn ln_rgb_connect(
     node_id: *const Dynamic,
     address: *const Dynamic,
     persist: bool,
@@ -1961,7 +1899,7 @@ extern "C" fn ln_connect(
         node.connect(peer_node_id, address.clone(), persist)
             .context("connect LN peer")?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "connected": true,
             "node_id": peer_node_id.to_string(),
             "address": address.to_string(),
@@ -1970,7 +1908,7 @@ extern "C" fn ln_connect(
     })
 }
 
-extern "C" fn ln_open_channel(
+extern "C" fn ln_rgb_open_channel(
     node_id: *const Dynamic,
     address: *const Dynamic,
     amount_sats: u64,
@@ -1995,7 +1933,7 @@ extern "C" fn ln_open_channel(
             })
             .context("open LN channel")?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "channel_open_submitted": true,
             "channel_id": channel_id,
             "node_id": peer_node_id.to_string(),
@@ -2004,7 +1942,7 @@ extern "C" fn ln_open_channel(
     })
 }
 
-extern "C" fn ln_close_channel(
+extern "C" fn ln_rgb_close_channel(
     channel_id: *const Dynamic,
     counterparty_node_id: *const Dynamic,
     force: bool,
@@ -2032,7 +1970,7 @@ extern "C" fn ln_close_channel(
         })
         .context("close LN channel")?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "channel_close_submitted": true,
             "channel_id": channel_id,
             "counterparty_node_id": counterparty_node_id.to_string(),
@@ -2041,7 +1979,7 @@ extern "C" fn ln_close_channel(
     })
 }
 
-extern "C" fn ln_invoice(
+extern "C" fn ln_rgb_invoice(
     amount_msat: u64,
     description: *const Dynamic,
     expiry_secs: u64,
@@ -2067,13 +2005,13 @@ extern "C" fn ln_invoice(
             })
             .context("create BOLT11 invoice")?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "invoice": invoice.to_string()
         })))
     })
 }
 
-extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
+extern "C" fn ln_rgb_pay(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |invoice| {
         let node = running_ln_node()?;
         let invoice = Bolt11Invoice::from_str(invoice)
@@ -2082,39 +2020,8 @@ extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
             .pay_bolt11(BtcLnBolt11PaymentRequest { invoice })
             .context("send BOLT11 payment")?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "payment_hash": payment_hash
-        })))
-    })
-}
-
-extern "C" fn ln_rgb_start() -> *const Dynamic {
-    ln_start()
-}
-
-extern "C" fn ln_rgb_stop() -> *const Dynamic {
-    ln_stop()
-}
-
-extern "C" fn ln_rgb_status() -> *const Dynamic {
-    ln_status()
-}
-
-extern "C" fn ln_rgb_get_node_id() -> *const Dynamic {
-    native_result(|| {
-        let node = running_ln_node()?;
-        Ok(ok(json!({
-            "module": "ln_rgb",
-            "node_id": node.node_id().to_string()
-        })))
-    })
-}
-
-extern "C" fn ln_rgb_get_addr() -> *const Dynamic {
-    native_result(|| {
-        Ok(ok(json!({
-            "module": "ln_rgb",
-            "address": current_ln_hot_address()?
         })))
     })
 }
@@ -2129,56 +2036,6 @@ extern "C" fn ln_rgb_btc_amount() -> *const Dynamic {
 
 extern "C" fn ln_rgb_ln_amount() -> *const Dynamic {
     native_result(|| ln_rgb_amount_snapshot("ln"))
-}
-
-extern "C" fn ln_rgb_get_peers() -> *const Dynamic {
-    ln_get_peers()
-}
-
-extern "C" fn ln_rgb_get_channels() -> *const Dynamic {
-    ln_get_channels()
-}
-
-extern "C" fn ln_rgb_connect(
-    node_id: *const Dynamic,
-    address: *const Dynamic,
-    persist: bool,
-) -> *const Dynamic {
-    ln_connect(node_id, address, persist)
-}
-
-extern "C" fn ln_rgb_open_channel(
-    node_id: *const Dynamic,
-    address: *const Dynamic,
-    amount_sats: u64,
-    push_msat: u64,
-) -> *const Dynamic {
-    ln_open_channel(node_id, address, amount_sats, push_msat)
-}
-
-extern "C" fn ln_rgb_close_channel(
-    channel_id: *const Dynamic,
-    counterparty_node_id: *const Dynamic,
-    force: bool,
-    reason: *const Dynamic,
-) -> *const Dynamic {
-    ln_close_channel(channel_id, counterparty_node_id, force, reason)
-}
-
-extern "C" fn ln_rgb_invoice(
-    amount_msat: u64,
-    description: *const Dynamic,
-    expiry_secs: u64,
-) -> *const Dynamic {
-    ln_invoice(amount_msat, description, expiry_secs)
-}
-
-extern "C" fn ln_rgb_pay(input: *const Dynamic) -> *const Dynamic {
-    ln_pay(input)
-}
-
-extern "C" fn ln_rgb_events() -> *const Dynamic {
-    ln_events()
 }
 
 extern "C" fn ln_rgb_open_rgb_channel(
@@ -2302,15 +2159,7 @@ extern "C" fn ln_rgb_get_info() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_rgb_channel_context(
-    contract_id: *const Dynamic,
-    amount: u64,
-    outbound: bool,
-) -> *const Dynamic {
-    ln_rgb_channel_context(contract_id, amount, outbound)
-}
-
-extern "C" fn ln_spawn_scanner(interval_ms: u64) -> *const Dynamic {
+extern "C" fn ln_rgb_spawn_scanner(interval_ms: u64) -> *const Dynamic {
     native_result(|| {
         let btc_addr = default_account_id()?;
         let rgb_service = local_string("rgb-service").unwrap_or_default();
@@ -2335,7 +2184,7 @@ extern "C" fn ln_spawn_scanner(interval_ms: u64) -> *const Dynamic {
 
         if LN_SCANNER_STARTED.swap(true, Ordering::SeqCst) {
             return Ok(ok(json!({
-                "module": "ln",
+                "module": "ln_rgb",
                 "scanner_started": true,
                 "already_running": true,
                 "btc_addr": btc_addr,
@@ -2357,7 +2206,7 @@ extern "C" fn ln_spawn_scanner(interval_ms: u64) -> *const Dynamic {
         }
 
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "scanner_started": true,
             "already_running": false,
             "btc_addr": btc_addr,
@@ -2370,7 +2219,7 @@ extern "C" fn ln_spawn_scanner(interval_ms: u64) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_node_address(input: *const Dynamic) -> *const Dynamic {
+extern "C" fn ln_rgb_node_address(input: *const Dynamic) -> *const Dynamic {
     native_dynamic_result(input, |input| {
         let path = ln_node_path(input);
         let low_water_sats = optional_u64(input, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
@@ -2493,7 +2342,7 @@ fn current_ln_node() -> Option<Arc<LnRgbBtcLnBackend>> {
 }
 
 fn running_ln_node() -> Result<Arc<LnRgbBtcLnBackend>> {
-    current_ln_node().context("LN RGB node is not running; call ln::start() first")
+    current_ln_node().context("LN RGB node is not running; call ln_rgb::start() first")
 }
 
 fn console_ln_rgb_config(config: &Value, mnemonic: String) -> Result<BtcLnRuntimeConfig> {
@@ -2628,13 +2477,13 @@ fn value_string_list(value: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
-extern "C" fn ln_scanner_status() -> *const Dynamic {
+extern "C" fn ln_rgb_scanner_status() -> *const Dynamic {
     native_result(|| {
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
         Ok(ok(json!({
-            "module": "ln",
+            "module": "ln_rgb",
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "layers": ["l1", "l2"],
             "scan_enabled": true,
@@ -3481,7 +3330,7 @@ fn current_ln_hot_address() -> Result<String> {
         read_json_file(&path).with_context(|| format!("read LN node state {}", path.display()))?;
     find_string_field(&stored, &["address", "btc_address"]).with_context(|| {
         format!(
-            "LN node state {} has no signer address; run ln::node_address first",
+            "LN node state {} has no signer address; run ln_rgb::node_address first",
             path.display()
         )
     })
@@ -3672,7 +3521,7 @@ fn redacted_ln_node_response(mut stored: Value, path: &PathBuf, created: bool) -
     let address = find_string_field(&stored, &["address", "btc_address"]).unwrap_or_default();
     redact_secret_fields(&mut stored);
     json!({
-        "module": "ln",
+        "module": "ln_rgb",
         "node_state": "created_or_loaded",
         "created": created,
         "address": address,

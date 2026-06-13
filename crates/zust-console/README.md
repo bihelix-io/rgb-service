@@ -6,7 +6,7 @@ REPL open for debugging and operations.
 
 ```bash
 cargo run -p zust-console -- crates/zust-console/start.zs
-cargo run -p zust-console -- -e 'ln::status()'
+cargo run -p zust-console -- -e 'ln_rgb::status()'
 ```
 
 Runtime config is written by the startup script:
@@ -137,7 +137,6 @@ Native modules currently registered:
 ```text
 btc
 rgb
-ln
 ln_rgb
 ```
 
@@ -223,15 +222,16 @@ rgb::commit_transfer("...", 100, transfer_id, txid, signed_psbt)
 RGB consignment storage/transport is handled by `rgb-service-daemon`, not by
 local console RGB stock.
 
-## ln
+## ln_rgb
 
-The `ln` module controls the local hot-wallet LN node. It uses
-`LnRgbBtcLnBackend` with `ln-rgb-lightning`.
+`ln_rgb` is the single local hot-wallet Lightning module. It controls the BTC LN
+node and the RGB-over-Lightning flows through the same `LnRgbBtcLnBackend`
+runtime.
 
 Create/load the hot wallet node:
 
 ```zs
-let lightning = ln::node_address({
+let lightning = ln_rgb::node_address({
   network: "bitcoin",
   low_water_sats: 100000,
   data_dir: ".zust-console/lightning",
@@ -243,72 +243,45 @@ let lightning = ln::node_address({
   },
 });
 root::add("local/lightning", lightning);
-ln::start()
+ln_rgb::start()
 ```
 
-Current LN functions:
+Current LN/RGB-LN functions:
 
 | Function | Description |
 | --- | --- |
-| `ln::node_address(config)` | Creates/loads local LN hot wallet, persists mnemonic, returns redacted node object. |
-| `ln::start()` | Starts the LN runtime from `local/lightning`. |
-| `ln::stop()` | Stops the LN runtime. |
-| `ln::status()` | Runtime status, balances, peer/channel counts. |
-| `ln::scanner_status()` | BTC address pool/scanner state. |
-| `ln::spawn_scanner(interval_ms)` | Starts the address-pool refill scanner thread. |
-| `ln::events()` | Drains up to 100 pending LN debug events. |
-| `ln::get_node_id()` | Returns LN node id. |
-| `ln::get_addr()` | Returns LN hot-wallet L1 deposit address. |
-| `ln::get_peers()` | Returns connected/persisted peers. |
-| `ln::get_channels()` | Returns channel snapshots. |
-| `ln::connect(node_id, address, persist)` | Connects to a peer. `address` is LDK socket address string. |
-| `ln::open_channel(node_id, address, amount_sats, push_msat)` | Opens a BTC LN channel. Use `0` push amount for none. |
-| `ln::close_channel(channel_id, counterparty_node_id, force, reason)` | Closes a BTC LN channel. Use `""` reason for none. |
-| `ln::invoice(amount_msat, description, expiry_secs)` | Creates a BOLT11 invoice. Use `""`/`0` for defaults. |
-| `ln::pay(invoice)` | Pays a BOLT11 invoice string. |
-| `ln::token_list()` | Calls RGB daemon token list through the LN RGB service client. |
-| `ln::rgb_channel_context(contract_id, amount, outbound)` | Builds RGB channel context for a contract/amount. |
-
-Examples:
-
-```zs
-ln::status()
-ln::get_addr()
-ln::invoice(1000, "test", 3600)
-ln::connect("...", "1.2.3.4:9735", true)
-```
-
-## ln_rgb
-
-`ln_rgb` is the RGB-over-Lightning facade. Basic BTC LN functions mostly forward
-to the same runtime as `ln`.
-
-| Function | Description |
-| --- | --- |
-| `ln_rgb::start()` | Same as `ln::start()`. |
-| `ln_rgb::stop()` | Same as `ln::stop()`. |
-| `ln_rgb::status()` | Same as `ln::status()`. |
+| `ln_rgb::node_address(config)` | Creates/loads local LN hot wallet, persists mnemonic, returns redacted node object. |
+| `ln_rgb::start()` | Starts the LN runtime from `local/lightning`. |
+| `ln_rgb::stop()` | Stops the LN runtime. |
+| `ln_rgb::status()` | Runtime status, balances, peer/channel counts. |
+| `ln_rgb::scanner_status()` | BTC address pool/scanner state. |
+| `ln_rgb::spawn_scanner(interval_ms)` | Starts the address-pool refill scanner thread. |
+| `ln_rgb::events()` | Drains up to 100 pending LN debug events. |
 | `ln_rgb::get_node_id()` | Returns LN node id. |
 | `ln_rgb::get_addr()` | Returns LN hot-wallet L1 deposit address. |
 | `ln_rgb::amount()` | Spendable onchain + LN balance snapshot in sats. |
 | `ln_rgb::btc_amount()` | Spendable onchain balance snapshot in sats. |
 | `ln_rgb::ln_amount()` | Lightning balance snapshot in sats. |
-| `ln_rgb::get_peers()` | Same as `ln::get_peers()`. |
-| `ln_rgb::get_channels()` | Same as `ln::get_channels()`. |
-| `ln_rgb::connect(node_id, address, persist)` | Same as `ln::connect(node_id, address, persist)`. |
-| `ln_rgb::open_channel(node_id, address, amount_sats, push_msat)` | Same as `ln::open_channel(node_id, address, amount_sats, push_msat)`. |
-| `ln_rgb::close_channel(channel_id, counterparty_node_id, force, reason)` | Same as `ln::close_channel(channel_id, counterparty_node_id, force, reason)`. |
-| `ln_rgb::invoice(amount_msat, description, expiry_secs)` | Same as `ln::invoice(amount_msat, description, expiry_secs)`. |
-| `ln_rgb::pay(invoice)` | Same as `ln::pay(invoice)`. |
-| `ln_rgb::events()` | Same as `ln::events()`. |
+| `ln_rgb::get_peers()` | Returns connected/persisted peers. |
+| `ln_rgb::get_channels()` | Returns channel snapshots. |
+| `ln_rgb::connect(node_id, address, persist)` | Connects to a peer. `address` is LDK socket address string. |
+| `ln_rgb::open_channel(node_id, address, amount_sats, push_msat)` | Opens a BTC LN channel. Use `0` push amount for none. |
+| `ln_rgb::close_channel(channel_id, counterparty_node_id, force, reason)` | Closes a BTC LN channel. Use `""` reason for none. |
+| `ln_rgb::invoice(amount_msat, description, expiry_secs)` | Creates a BOLT11 invoice. Use `""`/`0` for defaults. |
+| `ln_rgb::pay(invoice)` | Pays a BOLT11 invoice string. |
+| `ln_rgb::token_list()` | Calls RGB daemon token list through the LN RGB service client. |
 | `ln_rgb::get_info()` | RGB LN runtime info, balances, peer/channel counts. |
-| `ln_rgb::rgb_channel_context(contract_id, amount, outbound)` | Same context builder as `ln::rgb_channel_context`. |
+| `ln_rgb::rgb_channel_context(contract_id, amount, outbound)` | Builds RGB channel context for a contract/amount. |
 | `ln_rgb::open_rgb_channel(node_id, address, capacity_sat, push_msat, user_channel_id, contract_id, amount)` | Opens an RGB-funded channel. Use `""` address or `0` user channel id for defaults. |
 | `ln_rgb::send_rgb_payment(recipient_node_id, amount_msat, payment_id, contract_id, amount)` | Sends an RGB spontaneous payment. Use `""` payment id to generate one. |
 
 Examples:
 
 ```zs
+ln_rgb::status()
+ln_rgb::get_addr()
+ln_rgb::invoice(1000, "test", 3600)
+ln_rgb::connect("...", "1.2.3.4:9735", true)
 ln_rgb::get_info()
 ln_rgb::open_rgb_channel("...", "1.2.3.4:9735", 100000, 0, 0, "...", 100)
 ln_rgb::send_rgb_payment("...", 1000, "", "...", 1)

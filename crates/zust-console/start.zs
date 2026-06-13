@@ -19,13 +19,13 @@ let ln_node_config = {
   interval_ms: 30000,
 };
 
-let lightning = ln::node_address(ln_node_config);
+let lightning = ln_rgb::node_address(ln_node_config);
 root::add("local/lightning", lightning);
 root::add("local/lightning/node", lightning.config);
 
 {
   lightning: root::get("local/lightning"),
-  ln_start: ln::start(),
-  ln_scanner: ln::spawn_scanner(30000),
-  ln: ln::status(),
+  ln_rgb_start: ln_rgb::start(),
+  ln_rgb_scanner: ln_rgb::spawn_scanner(30000),
+  ln_rgb: ln_rgb::status(),
 }
