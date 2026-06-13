@@ -3919,7 +3919,7 @@ impl BtcLnNode for LnRgbBtcLnBackend {
 
     fn status_summary(&self) -> String {
         format!(
-            "ln-rgb scaffold version={} started={} storage={}",
+            "ln-rgb runtime version={} started={} storage={}",
             LN_RGB_LIGHTNING_VERSION,
             self.started.load(Ordering::SeqCst),
             self.config.storage_dir.display()
