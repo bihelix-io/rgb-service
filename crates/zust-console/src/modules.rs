@@ -109,51 +109,10 @@ fn local_dynamic(name: &str) -> Option<Dynamic> {
 }
 
 pub fn register_console_modules(vm: &Vm) -> Result<()> {
-    register_env_module(vm)?;
-    register_bdk_module(vm)?;
     register_btc_module(vm)?;
     register_rgb_module(vm)?;
     register_ln_module(vm)?;
     register_ln_rgb_module(vm)?;
-    Ok(())
-}
-
-fn register_env_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
-    jit.add_native_module_ptr("env", "get", &[Type::Str], Type::Str, env_get as *const u8)?;
-    Ok(())
-}
-
-fn register_bdk_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
-    jit.add_native_module_ptr(
-        "bdk",
-        "wallet",
-        &[Type::Any],
-        Type::Any,
-        bdk_wallet as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "bdk",
-        "sign_request",
-        &[Type::Any],
-        Type::Any,
-        bdk_sign_request as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "bdk",
-        "asset_authorization",
-        &[Type::Any],
-        Type::Any,
-        bdk_asset_authorization as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "bdk",
-        "external_anchor",
-        &[Type::Any],
-        Type::Any,
-        bdk_external_anchor as *const u8,
-    )?;
     Ok(())
 }
 
@@ -197,14 +156,14 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "get_deposit_address",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         btc_get_deposit_address as *const u8,
     )?;
     jit.add_native_module_ptr(
         "btc",
         "lookup_address_ident",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         btc_lookup_address_ident as *const u8,
     )?;
@@ -218,7 +177,7 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "scan_ident_deposits",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         btc_scan_ident_deposits as *const u8,
     )?;
@@ -232,7 +191,7 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "refill_address_pool",
-        &[Type::Any],
+        &[Type::U64],
         Type::Any,
         btc_refill_address_pool as *const u8,
     )?;
@@ -246,14 +205,14 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "btc",
         "broadcast",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         btc_broadcast as *const u8,
     )?;
     jit.add_native_module_ptr(
         "btc",
         "tx_status",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         btc_tx_status as *const u8,
     )?;
@@ -286,21 +245,28 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "rgb",
         "asset_authorization",
-        &[Type::Any],
+        &[
+            Type::Str,
+            Type::U64,
+            Type::Str,
+            Type::Str,
+            Type::Str,
+            Type::U64,
+        ],
         Type::Any,
         rgb_asset_authorization as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "request",
-        &[Type::Any],
+        &[Type::Str, Type::Any],
         Type::Any,
         rgb_request as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "issue",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::U8, Type::U64, Type::Str],
         Type::Any,
         rgb_issue as *const u8,
     )?;
@@ -315,49 +281,51 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "rgb",
         "balance",
-        &[Type::Any],
+        &[Type::Str, Type::Str],
         Type::Any,
         rgb_balance as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "balance_breakdown",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         rgb_balance_breakdown as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "prepare_transfer",
-        &[Type::Any],
+        &[
+            Type::Str,
+            Type::U64,
+            Type::Str,
+            Type::Str,
+            Type::U32,
+            Type::U32,
+            Type::U64,
+        ],
         Type::Any,
         rgb_prepare_transfer as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "commit_transfer",
-        &[Type::Any],
+        &[Type::Str, Type::U64, Type::Str, Type::Str, Type::Str],
         Type::Any,
         rgb_commit_transfer as *const u8,
     )?;
-    jit.add_native_module_ptr(
-        "rgb",
-        "pending",
-        &[Type::Any],
-        Type::Any,
-        rgb_pending as *const u8,
-    )?;
+    jit.add_native_module_ptr("rgb", "pending", &[], Type::Any, rgb_pending as *const u8)?;
     jit.add_native_module_ptr(
         "rgb",
         "recover",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         rgb_recover as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
         "test",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         rgb_test as *const u8,
     )?;
@@ -369,7 +337,7 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln",
         "spawn_scanner",
-        &[Type::Any],
+        &[Type::U64],
         Type::Any,
         ln_spawn_scanner as *const u8,
     )?;
@@ -403,32 +371,32 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln",
         "connect",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::Bool],
         Type::Any,
         ln_connect as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln",
         "open_channel",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::U64, Type::U64],
         Type::Any,
         ln_open_channel as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln",
         "close_channel",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::Bool, Type::Str],
         Type::Any,
         ln_close_channel as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln",
         "invoice",
-        &[Type::Any],
+        &[Type::U64, Type::Str, Type::U64],
         Type::Any,
         ln_invoice as *const u8,
     )?;
-    jit.add_native_module_ptr("ln", "pay", &[Type::Any], Type::Any, ln_pay as *const u8)?;
+    jit.add_native_module_ptr("ln", "pay", &[Type::Str], Type::Any, ln_pay as *const u8)?;
     jit.add_native_module_ptr(
         "ln",
         "token_list",
@@ -439,7 +407,7 @@ fn register_ln_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln",
         "rgb_channel_context",
-        &[Type::Any],
+        &[Type::Str, Type::U64, Type::Bool],
         Type::Any,
         ln_rgb_channel_context as *const u8,
     )?;
@@ -516,35 +484,35 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln_rgb",
         "connect",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::Bool],
         Type::Any,
         ln_rgb_connect as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "open_channel",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::U64, Type::U64],
         Type::Any,
         ln_rgb_open_channel as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "close_channel",
-        &[Type::Any],
+        &[Type::Str, Type::Str, Type::Bool, Type::Str],
         Type::Any,
         ln_rgb_close_channel as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "invoice",
-        &[Type::Any],
+        &[Type::U64, Type::Str, Type::U64],
         Type::Any,
         ln_rgb_invoice as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "pay",
-        &[Type::Any],
+        &[Type::Str],
         Type::Any,
         ln_rgb_pay as *const u8,
     )?;
@@ -558,14 +526,22 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln_rgb",
         "open_rgb_channel",
-        &[Type::Any],
+        &[
+            Type::Str,
+            Type::Str,
+            Type::U64,
+            Type::U64,
+            Type::U64,
+            Type::Str,
+            Type::U64,
+        ],
         Type::Any,
         ln_rgb_open_rgb_channel as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
         "send_rgb_payment",
-        &[Type::Any],
+        &[Type::Str, Type::U64, Type::Str, Type::Str, Type::U64],
         Type::Any,
         ln_rgb_send_rgb_payment as *const u8,
     )?;
@@ -579,70 +555,11 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     jit.add_native_module_ptr(
         "ln_rgb",
         "rgb_channel_context",
-        &[Type::Any],
+        &[Type::Str, Type::U64, Type::Bool],
         Type::Any,
         ln_rgb_rgb_channel_context as *const u8,
     )?;
     Ok(())
-}
-
-extern "C" fn env_get(name: *const Dynamic) -> *const Dynamic {
-    native_string_result(name, |name| {
-        Ok(std::env::var(name.as_str()).unwrap_or_default())
-    })
-}
-
-extern "C" fn bdk_wallet(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        Ok(ok(json!({
-            "module": "bdk",
-            "role": "external_btc_wallet",
-            "network": optional_string(input, "network").unwrap_or_else(|| "regtest".to_string()),
-            "data_dir": optional_string(input, "data_dir").unwrap_or_default(),
-            "note": "BTC UTXO selection, PSBT signing, and broadcast stay outside RGB Service"
-        })))
-    })
-}
-
-extern "C" fn bdk_sign_request(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let body = signed_body(input)?;
-        let signature = request_signature(SIGNER_REQUEST_SIGNATURE_PATH, &body)?;
-        Ok(json_to_dynamic(&signature))
-    })
-}
-
-extern "C" fn bdk_asset_authorization(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let asset_id = required_string(input, "asset_id")?;
-        let amount = required_u64(input, "amount")?;
-        let purpose =
-            optional_string(input, "purpose").unwrap_or_else(|| "l1_transfer".to_string());
-        let signature = request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &signed_body(input)?)?;
-        let authorization = json!({
-            "asset_id": asset_id,
-            "amount": amount,
-            "purpose": purpose,
-            "recipient": optional_string(input, "recipient"),
-            "anchor_psbt": optional_string(input, "anchor_psbt"),
-            "expires_at_ms": optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000),
-            "signature": signature
-        });
-        Ok(json_to_dynamic(&authorization))
-    })
-}
-
-extern "C" fn bdk_external_anchor(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        Ok(ok(json!({
-            "unsigned_anchor_psbt": optional_string(input, "unsigned_anchor_psbt"),
-            "signed_anchor_psbt": optional_string(input, "signed_anchor_psbt"),
-            "txid": optional_string(input, "txid"),
-            "change_vout": optional_u64(input, "change_vout"),
-            "recipient_vout": optional_u64(input, "recipient_vout"),
-            "note": "Populate these fields from the real external BTC wallet before prepare/commit"
-        })))
-    })
 }
 
 extern "C" fn btc_get_wallet_address(input: *const Dynamic) -> *const Dynamic {
@@ -661,12 +578,8 @@ extern "C" fn btc_get_wallet_address(input: *const Dynamic) -> *const Dynamic {
 }
 
 extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(
-            input.is_str(),
-            "btc::get_deposit_address expects ident string"
-        );
-        let ident = input.as_str().to_string();
+    native_string_dynamic_result(input, |ident| {
+        let ident = ident.to_string();
         if ident.trim().is_empty() {
             return Ok(ok(json!({
                 "module": "btc",
@@ -849,12 +762,8 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
 }
 
 extern "C" fn btc_lookup_address_ident(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(
-            input.is_str(),
-            "btc::lookup_address_ident expects address string"
-        );
-        let address = input.as_str().to_string();
+    native_string_dynamic_result(input, |address| {
+        let address = address.to_string();
         ensure!(!address.trim().is_empty(), "address must not be empty");
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         Ok(ok(json!({
@@ -1042,12 +951,8 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
 }
 
 extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(
-            input.is_str(),
-            "btc::scan_ident_deposits expects ident string"
-        );
-        let ident_filter = input.as_str().to_string();
+    native_string_dynamic_result(input, |ident_filter| {
+        let ident_filter = ident_filter.to_string();
         ensure!(!ident_filter.trim().is_empty(), "ident must not be empty");
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         store.put_wallet_btc_address(&default_account_id()?)?;
@@ -1228,21 +1133,9 @@ extern "C" fn btc_address_pool_status() -> *const Dynamic {
     })
 }
 
-extern "C" fn btc_refill_address_pool(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let count = match input {
-            Dynamic::Null => BTC_ADDRESS_POOL_TARGET as u64,
-            Dynamic::U8(value) => *value as u64,
-            Dynamic::I8(value) => u64::try_from(*value).context("count must be unsigned")?,
-            Dynamic::U16(value) => *value as u64,
-            Dynamic::I16(value) => u64::try_from(*value).context("count must be unsigned")?,
-            Dynamic::U32(value) => *value as u64,
-            Dynamic::I32(value) => u64::try_from(*value).context("count must be unsigned")?,
-            Dynamic::U64(value) => *value,
-            Dynamic::I64(value) => u64::try_from(*value).context("count must be unsigned")?,
-            value if value.is_str() => value.as_str().parse::<u64>().context("parse count")?,
-            _ => bail!("btc::refill_address_pool expects count number"),
-        } as usize;
+extern "C" fn btc_refill_address_pool(count: u64) -> *const Dynamic {
+    native_result(|| {
+        let count = count as usize;
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         let mut added = 0usize;
         if count > 0 {
@@ -1399,9 +1292,8 @@ extern "C" fn btc_sign_psbt(psbt: *const Dynamic, ident: *const Dynamic) -> *con
 }
 
 extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(input.is_str(), "btc::broadcast expects tx hex string");
-        let tx_hex = input.as_str().to_string();
+    native_string_dynamic_result(input, |tx_hex| {
+        let tx_hex = tx_hex.to_string();
         ensure!(!tx_hex.trim().is_empty(), "tx_hex must not be empty");
         let esplora = btc_esplora_url();
         let url = format!("{}/tx", esplora.trim_end_matches('/'));
@@ -1429,9 +1321,8 @@ extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
 }
 
 extern "C" fn btc_tx_status(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        ensure!(input.is_str(), "btc::tx_status expects txid string");
-        let txid = input.as_str().to_string();
+    native_string_dynamic_result(input, |txid| {
+        let txid = txid.to_string();
         ensure!(!txid.trim().is_empty(), "txid must not be empty");
         let esplora = btc_esplora_url();
         let status = esplora_get_json(&format!(
@@ -1467,65 +1358,110 @@ extern "C" fn rgb_request_signature(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn rgb_asset_authorization(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let asset_id = required_string(input, "asset_id")?;
-        let amount = required_u64(input, "amount")?;
-        let purpose =
-            optional_string(input, "purpose").unwrap_or_else(|| "l1_transfer".to_string());
-        let mut body = signed_body(input)?;
-        if let Value::Object(object) = &mut body {
-            object.insert("asset_id".to_string(), json!(asset_id));
-            object.insert("amount".to_string(), json!(amount));
-            object.insert("purpose".to_string(), json!(purpose));
-            object.insert(
-                "recipient".to_string(),
-                optional_string(input, "recipient")
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
-            );
-            object.insert(
-                "anchor_psbt".to_string(),
-                optional_string(input, "anchor_psbt")
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
-            );
-            object.insert(
-                "expires_at_ms".to_string(),
-                json!(optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000)),
-            );
-        }
+extern "C" fn rgb_asset_authorization(
+    asset_id: *const Dynamic,
+    amount: u64,
+    purpose: *const Dynamic,
+    recipient: *const Dynamic,
+    anchor_psbt: *const Dynamic,
+    expires_at_ms: u64,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let purpose = unsafe { &*purpose };
+    let recipient = unsafe { &*recipient };
+    let anchor_psbt = unsafe { &*anchor_psbt };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(purpose.is_str(), "purpose must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(anchor_psbt.is_str(), "anchor_psbt must be string");
+        let asset_id = asset_id.as_str().to_string();
+        let purpose = if purpose.as_str().trim().is_empty() {
+            "l1_transfer".to_string()
+        } else {
+            purpose.as_str().to_string()
+        };
+        let recipient =
+            (!recipient.as_str().trim().is_empty()).then(|| recipient.as_str().to_string());
+        let anchor_psbt =
+            (!anchor_psbt.as_str().trim().is_empty()).then(|| anchor_psbt.as_str().to_string());
+        let expires_at_ms = (expires_at_ms > 0)
+            .then_some(expires_at_ms)
+            .unwrap_or_else(|| now_ms() + 300000);
+        let body = json!({
+            "account_id": default_account_id()?,
+            "permission": "asset_authorization",
+            "payload": {
+                "account_id": default_account_id()?,
+                "asset_id": asset_id,
+                "amount": amount,
+                "purpose": purpose,
+                "recipient": recipient,
+                "anchor_psbt": anchor_psbt,
+                "expires_at_ms": expires_at_ms
+            },
+            "domain": "bihelix-rgb-service",
+            "expires_at_ms": expires_at_ms,
+            "timestamp_ms": now_ms()
+        });
         let signature = request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &body)?;
+        let payload = body.get("payload").cloned().unwrap_or(Value::Null);
         Ok(ok(json!({
             "status": "signed",
             "account_id": default_account_id()?,
             "signer_node": signer_node_id()?,
             "transport": "iroh",
             "asset_authorization_request": {
-                "asset_id": body.get("asset_id").cloned().unwrap_or(Value::Null),
-                "amount": body.get("amount").cloned().unwrap_or(Value::Null),
-                "purpose": body.get("purpose").cloned().unwrap_or(Value::Null),
-                "recipient": body.get("recipient").cloned().unwrap_or(Value::Null),
-                "anchor_psbt": body.get("anchor_psbt").cloned().unwrap_or(Value::Null),
-                "expires_at_ms": body.get("expires_at_ms").cloned().unwrap_or(Value::Null),
+                "asset_id": payload.get("asset_id").cloned().unwrap_or(Value::Null),
+                "amount": payload.get("amount").cloned().unwrap_or(Value::Null),
+                "purpose": payload.get("purpose").cloned().unwrap_or(Value::Null),
+                "recipient": payload.get("recipient").cloned().unwrap_or(Value::Null),
+                "anchor_psbt": payload.get("anchor_psbt").cloned().unwrap_or(Value::Null),
+                "expires_at_ms": payload.get("expires_at_ms").cloned().unwrap_or(Value::Null),
             },
             "signature": signature
         })))
     })
 }
 
-extern "C" fn rgb_request(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let route = required_string(input, "route")?;
-        rgb_post_dynamic(input, &route)
+extern "C" fn rgb_request(route: *const Dynamic, payload: *const Dynamic) -> *const Dynamic {
+    let route = unsafe { &*route };
+    let payload = unsafe { &*payload };
+    native_result(|| {
+        ensure!(route.is_str(), "route must be string");
+        rgb_post_dynamic(payload, route.as_str())
     })
 }
 
 extern "C" fn rgb_rna_balance() -> *const Dynamic {
     native_result(|| rgb_post_dynamic(&Dynamic::Null, "/v1/rna/balance"))
 }
-extern "C" fn rgb_issue(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/assets/issue")
+extern "C" fn rgb_issue(
+    ticker: *const Dynamic,
+    name: *const Dynamic,
+    precision: u8,
+    supply: u64,
+    allocation_outpoint: *const Dynamic,
+) -> *const Dynamic {
+    let ticker = unsafe { &*ticker };
+    let name = unsafe { &*name };
+    let allocation_outpoint = unsafe { &*allocation_outpoint };
+    native_result(|| {
+        ensure!(ticker.is_str(), "ticker must be string");
+        ensure!(name.is_str(), "name must be string");
+        ensure!(
+            allocation_outpoint.is_str(),
+            "allocation_outpoint must be string"
+        );
+        let payload = json!({
+            "ticker": ticker.as_str(),
+            "name": name.as_str(),
+            "precision": precision,
+            "supply": supply,
+            "allocation_outpoint": allocation_outpoint.as_str()
+        });
+        rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/assets/issue")
+    })
 }
 extern "C" fn rgb_assets() -> *const Dynamic {
     native_result(|| rgb_post_dynamic(&Dynamic::Null, "/v1/assets/list"))
@@ -1536,26 +1472,176 @@ extern "C" fn rgb_token_list() -> *const Dynamic {
         Ok(json_to_dynamic(&response))
     })
 }
-extern "C" fn rgb_balance(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/balance")
+extern "C" fn rgb_balance(asset_id: *const Dynamic, scope: *const Dynamic) -> *const Dynamic {
+    native_two_string_dynamic_result(asset_id, scope, |asset_id, scope| {
+        let scope = if scope.trim().is_empty() {
+            "all"
+        } else {
+            scope
+        };
+        rgb_post_dynamic(
+            &json_to_dynamic(&json!({
+                "asset_id": asset_id,
+                "scope": scope
+            })),
+            "/v1/balance",
+        )
+    })
 }
-extern "C" fn rgb_balance_breakdown(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/balance/breakdown")
+extern "C" fn rgb_balance_breakdown(asset_id: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(asset_id, |asset_id| {
+        rgb_post_dynamic(
+            &json_to_dynamic(&json!({
+                "asset_id": asset_id
+            })),
+            "/v1/balance/breakdown",
+        )
+    })
 }
-extern "C" fn rgb_prepare_transfer(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/transfers/prepare")
+extern "C" fn rgb_prepare_transfer(
+    asset_id: *const Dynamic,
+    amount: u64,
+    recipient: *const Dynamic,
+    unsigned_anchor_psbt: *const Dynamic,
+    change_vout: u32,
+    recipient_vout: u32,
+    fee_rate_sat_vb: u64,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let recipient = unsafe { &*recipient };
+    let unsigned_anchor_psbt = unsafe { &*unsigned_anchor_psbt };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(
+            unsigned_anchor_psbt.is_str(),
+            "unsigned_anchor_psbt must be string"
+        );
+        let asset_id = asset_id.as_str().to_string();
+        let recipient = recipient.as_str().to_string();
+        let unsigned_anchor_psbt = unsigned_anchor_psbt.as_str().to_string();
+        let fee_rate_sat_vb = (fee_rate_sat_vb > 0).then_some(fee_rate_sat_vb);
+        let expires_at_ms = now_ms() + 300000;
+        let auth_body = json!({
+            "account_id": default_account_id()?,
+            "permission": "prepare_transfer",
+            "payload": {
+                "account_id": default_account_id()?,
+                "asset_id": asset_id,
+                "amount": amount,
+                "purpose": "l1_transfer",
+                "recipient": recipient,
+                "anchor_psbt": unsigned_anchor_psbt,
+                "expires_at_ms": expires_at_ms
+            },
+            "domain": "bihelix-rgb-service",
+            "expires_at_ms": expires_at_ms,
+            "timestamp_ms": now_ms()
+        });
+        let asset_authorization = json!({
+            "asset_id": asset_id,
+            "amount": amount,
+            "purpose": "l1_transfer",
+            "recipient": recipient,
+            "anchor_psbt": unsigned_anchor_psbt,
+            "expires_at_ms": expires_at_ms,
+            "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &auth_body)?
+        });
+        let payload = json!({
+            "asset_id": asset_id,
+            "amount": amount,
+            "recipient": recipient,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "unsigned_anchor_psbt": unsigned_anchor_psbt,
+            "change_vout": change_vout,
+            "recipient_vout": recipient_vout,
+            "asset_authorization": asset_authorization
+        });
+        rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/transfers/prepare")
+    })
 }
-extern "C" fn rgb_commit_transfer(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/transfers/commit")
+extern "C" fn rgb_commit_transfer(
+    asset_id: *const Dynamic,
+    amount: u64,
+    transfer_id: *const Dynamic,
+    txid: *const Dynamic,
+    signed_anchor_psbt: *const Dynamic,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let transfer_id = unsafe { &*transfer_id };
+    let txid = unsafe { &*txid };
+    let signed_anchor_psbt = unsafe { &*signed_anchor_psbt };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(transfer_id.is_str(), "transfer_id must be string");
+        ensure!(txid.is_str(), "txid must be string");
+        ensure!(
+            signed_anchor_psbt.is_str(),
+            "signed_anchor_psbt must be string"
+        );
+        let asset_id = asset_id.as_str().to_string();
+        let signed_anchor_psbt = (!signed_anchor_psbt.as_str().trim().is_empty())
+            .then(|| signed_anchor_psbt.as_str().to_string());
+        let expires_at_ms = now_ms() + 300000;
+        let auth_body = json!({
+            "account_id": default_account_id()?,
+            "permission": "commit_transfer",
+            "payload": {
+                "account_id": default_account_id()?,
+                "asset_id": asset_id,
+                "amount": amount,
+                "purpose": "l1_transfer",
+                "recipient": Value::Null,
+                "anchor_psbt": signed_anchor_psbt,
+                "expires_at_ms": expires_at_ms
+            },
+            "domain": "bihelix-rgb-service",
+            "expires_at_ms": expires_at_ms,
+            "timestamp_ms": now_ms()
+        });
+        let asset_authorization = json!({
+            "asset_id": asset_id,
+            "amount": amount,
+            "purpose": "l1_transfer",
+            "recipient": Value::Null,
+            "anchor_psbt": signed_anchor_psbt,
+            "expires_at_ms": expires_at_ms,
+            "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &auth_body)?
+        });
+        let payload = json!({
+            "transfer_id": transfer_id.as_str(),
+            "txid": txid.as_str(),
+            "signed_anchor_psbt": signed_anchor_psbt,
+            "asset_authorization": asset_authorization
+        });
+        rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/transfers/commit")
+    })
 }
-extern "C" fn rgb_pending(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/pending/list")
+extern "C" fn rgb_pending() -> *const Dynamic {
+    native_result(|| rgb_post_dynamic(&Dynamic::Null, "/v1/pending/list"))
 }
-extern "C" fn rgb_recover(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/recover")
+extern "C" fn rgb_recover(operation_id: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(operation_id, |operation_id| {
+        let payload = json!({
+            "operation_id": (!operation_id.trim().is_empty()).then(|| operation_id.to_string())
+        });
+        rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/recover")
+    })
 }
-extern "C" fn rgb_test(input: *const Dynamic) -> *const Dynamic {
-    rgb_route(input, "/v1/test/rgb")
+extern "C" fn rgb_test(scenario: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(scenario, |scenario| {
+        let scenario = if scenario.trim().is_empty() {
+            "full_rgb20_lifecycle"
+        } else {
+            scenario
+        };
+        rgb_post_dynamic(
+            &json_to_dynamic(&json!({
+                "scenario": scenario
+            })),
+            "/v1/test/rgb",
+        )
+    })
 }
 
 extern "C" fn ln_status() -> *const Dynamic {
@@ -1625,11 +1711,15 @@ extern "C" fn ln_token_list() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
-        let contract_id = parse_ln_contract_id(&required_string(input, "contract_id")?)?;
-        let amount = required_u64(input, "amount")?;
-        let outbound = optional_bool(input, "outbound").unwrap_or(true);
+extern "C" fn ln_rgb_channel_context(
+    contract_id: *const Dynamic,
+    amount: u64,
+    outbound: bool,
+) -> *const Dynamic {
+    let contract_id = unsafe { &*contract_id };
+    native_result(|| {
+        ensure!(contract_id.is_str(), "contract_id must be string");
+        let contract_id = parse_ln_contract_id(contract_id.as_str())?;
         let asset = LdkRgbAssetAmount::new(contract_id, amount);
         let context = RgbChannelContext::new(asset).into_rgb_context(outbound);
         Ok(ok(json!({
@@ -1854,13 +1944,20 @@ extern "C" fn ln_get_channels() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_connect(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_connect(
+    node_id: *const Dynamic,
+    address: *const Dynamic,
+    persist: bool,
+) -> *const Dynamic {
+    let node_id = unsafe { &*node_id };
+    let address = unsafe { &*address };
+    native_result(|| {
         let node = running_ln_node()?;
-        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
-        let address = SocketAddress::from_str(&required_string(input, "address")?)
+        ensure!(node_id.is_str(), "node_id must be string");
+        ensure!(address.is_str(), "address must be string");
+        let peer_node_id = ldk_public_key(node_id.as_str())?;
+        let address = SocketAddress::from_str(address.as_str())
             .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
-        let persist = optional_bool(input, "persist").unwrap_or(true);
         node.connect(peer_node_id, address.clone(), persist)
             .context("connect LN peer")?;
         Ok(ok(json!({
@@ -1873,14 +1970,22 @@ extern "C" fn ln_connect(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_open_channel(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_open_channel(
+    node_id: *const Dynamic,
+    address: *const Dynamic,
+    amount_sats: u64,
+    push_msat: u64,
+) -> *const Dynamic {
+    let node_id = unsafe { &*node_id };
+    let address = unsafe { &*address };
+    native_result(|| {
         let node = running_ln_node()?;
-        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
-        let address = SocketAddress::from_str(&required_string(input, "address")?)
+        ensure!(node_id.is_str(), "node_id must be string");
+        ensure!(address.is_str(), "address must be string");
+        let peer_node_id = ldk_public_key(node_id.as_str())?;
+        let address = SocketAddress::from_str(address.as_str())
             .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
-        let amount_sats = required_u64(input, "amount_sats")?;
-        let push_msat = optional_u64(input, "push_msat");
+        let push_msat = (push_msat > 0).then_some(push_msat);
         let channel_id = node
             .open_channel(BtcLnChannelOpenRequest {
                 peer_node_id,
@@ -1899,15 +2004,26 @@ extern "C" fn ln_open_channel(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_close_channel(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_close_channel(
+    channel_id: *const Dynamic,
+    counterparty_node_id: *const Dynamic,
+    force: bool,
+    reason: *const Dynamic,
+) -> *const Dynamic {
+    let channel_id = unsafe { &*channel_id };
+    let counterparty_node_id = unsafe { &*counterparty_node_id };
+    let reason = unsafe { &*reason };
+    native_result(|| {
         let node = running_ln_node()?;
-        let channel_id = required_string(input, "channel_id")?;
-        let counterparty_node_id = required_string(input, "counterparty_node_id")
-            .or_else(|_| required_string(input, "node_id"))?;
-        let counterparty_node_id = ldk_public_key(&counterparty_node_id)?;
-        let force = optional_bool(input, "force").unwrap_or(false);
-        let reason = optional_string(input, "reason");
+        ensure!(channel_id.is_str(), "channel_id must be string");
+        ensure!(
+            counterparty_node_id.is_str(),
+            "counterparty_node_id must be string"
+        );
+        ensure!(reason.is_str(), "reason must be string");
+        let channel_id = channel_id.as_str().to_string();
+        let counterparty_node_id = ldk_public_key(counterparty_node_id.as_str())?;
+        let reason = (!reason.as_str().trim().is_empty()).then(|| reason.as_str().to_string());
         node.close_channel(BtcLnChannelCloseRequest {
             channel_id: channel_id.clone(),
             counterparty_node_id,
@@ -1925,13 +2041,21 @@ extern "C" fn ln_close_channel(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_invoice(
+    amount_msat: u64,
+    description: *const Dynamic,
+    expiry_secs: u64,
+) -> *const Dynamic {
+    let description = unsafe { &*description };
+    native_result(|| {
         let node = running_ln_node()?;
-        let amount_msat = required_u64(input, "amount_msat")?;
-        let description = optional_string(input, "description")
-            .unwrap_or_else(|| "BiHelix LN invoice".to_string());
-        let expiry_secs = optional_u64(input, "expiry_secs").unwrap_or(3600) as u32;
+        ensure!(description.is_str(), "description must be string");
+        let description = if description.as_str().trim().is_empty() {
+            "BiHelix LN invoice".to_string()
+        } else {
+            description.as_str().to_string()
+        };
+        let expiry_secs = (expiry_secs > 0).then_some(expiry_secs).unwrap_or(3600) as u32;
         let description = Bolt11InvoiceDescription::Direct(
             Description::new(description).map_err(|err| anyhow::anyhow!("{err:?}"))?,
         );
@@ -1950,10 +2074,9 @@ extern "C" fn ln_invoice(input: *const Dynamic) -> *const Dynamic {
 }
 
 extern "C" fn ln_pay(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+    native_string_dynamic_result(input, |invoice| {
         let node = running_ln_node()?;
-        ensure!(input.is_str(), "ln::pay expects BOLT11 invoice string");
-        let invoice = Bolt11Invoice::from_str(input.as_str())
+        let invoice = Bolt11Invoice::from_str(invoice)
             .map_err(|err| anyhow::anyhow!("parse BOLT11 invoice: {err:?}"))?;
         let payment_hash = node
             .pay_bolt11(BtcLnBolt11PaymentRequest { invoice })
@@ -2016,20 +2139,38 @@ extern "C" fn ln_rgb_get_channels() -> *const Dynamic {
     ln_get_channels()
 }
 
-extern "C" fn ln_rgb_connect(input: *const Dynamic) -> *const Dynamic {
-    ln_connect(input)
+extern "C" fn ln_rgb_connect(
+    node_id: *const Dynamic,
+    address: *const Dynamic,
+    persist: bool,
+) -> *const Dynamic {
+    ln_connect(node_id, address, persist)
 }
 
-extern "C" fn ln_rgb_open_channel(input: *const Dynamic) -> *const Dynamic {
-    ln_open_channel(input)
+extern "C" fn ln_rgb_open_channel(
+    node_id: *const Dynamic,
+    address: *const Dynamic,
+    amount_sats: u64,
+    push_msat: u64,
+) -> *const Dynamic {
+    ln_open_channel(node_id, address, amount_sats, push_msat)
 }
 
-extern "C" fn ln_rgb_close_channel(input: *const Dynamic) -> *const Dynamic {
-    ln_close_channel(input)
+extern "C" fn ln_rgb_close_channel(
+    channel_id: *const Dynamic,
+    counterparty_node_id: *const Dynamic,
+    force: bool,
+    reason: *const Dynamic,
+) -> *const Dynamic {
+    ln_close_channel(channel_id, counterparty_node_id, force, reason)
 }
 
-extern "C" fn ln_rgb_invoice(input: *const Dynamic) -> *const Dynamic {
-    ln_invoice(input)
+extern "C" fn ln_rgb_invoice(
+    amount_msat: u64,
+    description: *const Dynamic,
+    expiry_secs: u64,
+) -> *const Dynamic {
+    ln_invoice(amount_msat, description, expiry_secs)
 }
 
 extern "C" fn ln_rgb_pay(input: *const Dynamic) -> *const Dynamic {
@@ -2040,21 +2181,38 @@ extern "C" fn ln_rgb_events() -> *const Dynamic {
     ln_events()
 }
 
-extern "C" fn ln_rgb_open_rgb_channel(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_rgb_open_rgb_channel(
+    node_id: *const Dynamic,
+    address: *const Dynamic,
+    capacity_sat: u64,
+    push_msat: u64,
+    user_channel_id: u64,
+    contract_id: *const Dynamic,
+    amount: u64,
+) -> *const Dynamic {
+    let node_id = unsafe { &*node_id };
+    let address = unsafe { &*address };
+    let contract_id = unsafe { &*contract_id };
+    native_result(|| {
         let node = running_ln_node()?;
-        let peer_node_id = ldk_public_key(&required_string(input, "node_id")?)?;
-        if let Some(address) = optional_string(input, "address") {
-            let address = SocketAddress::from_str(&address)
+        ensure!(node_id.is_str(), "node_id must be string");
+        ensure!(address.is_str(), "address must be string");
+        ensure!(contract_id.is_str(), "contract_id must be string");
+        let peer_node_id = ldk_public_key(node_id.as_str())?;
+        if !address.as_str().trim().is_empty() {
+            let address = SocketAddress::from_str(address.as_str())
                 .map_err(|_| anyhow::anyhow!("invalid LN peer address"))?;
             node.connect(peer_node_id, address, true)?;
         }
-        let capacity_sat = optional_u64(input, "capacity_sat")
-            .or_else(|| optional_u64(input, "amount_sats"))
-            .context("missing `capacity_sat` or `amount_sats`")?;
-        let push_msat = optional_u64(input, "push_msat").unwrap_or(0);
-        let user_channel_id = optional_u128(input, "user_channel_id").unwrap_or_else(now_ms_u128);
-        let asset = wallet_rgb_asset_from_input(input)?;
+        let user_channel_id = (user_channel_id > 0)
+            .then_some(user_channel_id)
+            .map(u128::from)
+            .unwrap_or_else(now_ms_u128);
+        let asset = WalletRgbAssetAmount {
+            contract_id: rgbstd::ContractId::from_str(contract_id.as_str())
+                .with_context(|| format!("invalid RGB contract_id: {}", contract_id.as_str()))?,
+            amount,
+        };
         let channel_id = node.open_rgb_channel(RgbChannelOpenRequest {
             peer_node_id,
             capacity_sat,
@@ -2073,15 +2231,37 @@ extern "C" fn ln_rgb_open_rgb_channel(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_send_rgb_payment(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_rgb_send_rgb_payment(
+    recipient_node_id: *const Dynamic,
+    amount_msat: u64,
+    payment_id: *const Dynamic,
+    contract_id: *const Dynamic,
+    amount: u64,
+) -> *const Dynamic {
+    let recipient_node_id = unsafe { &*recipient_node_id };
+    let payment_id = unsafe { &*payment_id };
+    let contract_id = unsafe { &*contract_id };
+    native_result(|| {
         let node = running_ln_node()?;
-        let recipient_node_id = required_string(input, "node_id")
-            .or_else(|_| required_string(input, "recipient_node_id"))?;
-        let recipient_node_id = ldk_public_key(&recipient_node_id)?;
-        let amount_msat = required_u64(input, "amount_msat")?;
-        let payment_id = ln_rgb_payment_id(input)?;
-        let asset = wallet_rgb_asset_from_input(input)?;
+        ensure!(
+            recipient_node_id.is_str(),
+            "recipient_node_id must be string"
+        );
+        ensure!(payment_id.is_str(), "payment_id must be string");
+        ensure!(contract_id.is_str(), "contract_id must be string");
+        let recipient_node_id = ldk_public_key(recipient_node_id.as_str())?;
+        let payment_id = if payment_id.as_str().trim().is_empty() {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).context("generate RGB-LN payment_id")?;
+            bytes
+        } else {
+            hex32_to_bytes(payment_id.as_str())?
+        };
+        let asset = WalletRgbAssetAmount {
+            contract_id: rgbstd::ContractId::from_str(contract_id.as_str())
+                .with_context(|| format!("invalid RGB contract_id: {}", contract_id.as_str()))?,
+            amount,
+        };
         node.send_rgb_payment(RgbPaymentRequest {
             recipient_node_id,
             amount_msat,
@@ -2122,15 +2302,20 @@ extern "C" fn ln_rgb_get_info() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_rgb_channel_context(input: *const Dynamic) -> *const Dynamic {
-    ln_rgb_channel_context(input)
+extern "C" fn ln_rgb_rgb_channel_context(
+    contract_id: *const Dynamic,
+    amount: u64,
+    outbound: bool,
+) -> *const Dynamic {
+    ln_rgb_channel_context(contract_id, amount, outbound)
 }
 
-extern "C" fn ln_spawn_scanner(input: *const Dynamic) -> *const Dynamic {
-    native_dynamic_result(input, |input| {
+extern "C" fn ln_spawn_scanner(interval_ms: u64) -> *const Dynamic {
+    native_result(|| {
         let btc_addr = default_account_id()?;
         let rgb_service = local_string("rgb-service").unwrap_or_default();
-        let interval_ms = optional_u64(input, "interval_ms")
+        let interval_ms = (interval_ms > 0)
+            .then_some(interval_ms)
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
         let interval = Duration::from_millis(interval_ms.max(1000));
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
@@ -2676,10 +2861,6 @@ fn ln_inbound_loop(_node: Value, interval: Duration) {
     }
 }
 
-fn rgb_route(input: *const Dynamic, route: &str) -> *const Dynamic {
-    native_dynamic_result(input, |input| rgb_post_dynamic(input, route))
-}
-
 fn rgb_post_dynamic(input: &Dynamic, route: &str) -> Result<Dynamic> {
     let options = request_options(input, route)?;
     let response = http_request_options(&options)?;
@@ -3206,17 +3387,6 @@ fn native_result(f: impl FnOnce() -> Result<Dynamic>) -> *const Dynamic {
     }
 }
 
-fn native_string_result(
-    input: *const Dynamic,
-    f: impl FnOnce(&Dynamic) -> Result<String>,
-) -> *const Dynamic {
-    let input = unsafe { &*input };
-    match f(input) {
-        Ok(value) => Box::into_raw(Box::new(Dynamic::from(value))),
-        Err(_) => Box::into_raw(Box::new(Dynamic::from(""))),
-    }
-}
-
 fn native_string_dynamic_result(
     input: *const Dynamic,
     f: impl FnOnce(&str) -> Result<Dynamic>,
@@ -3254,10 +3424,6 @@ fn optional_string(input: &Dynamic, key: &str) -> Option<String> {
         .map(|value| value.as_str().to_string())
 }
 
-fn required_u64(input: &Dynamic, key: &str) -> Result<u64> {
-    optional_u64(input, key).with_context(|| format!("missing `{key}`"))
-}
-
 fn optional_u64(input: &Dynamic, key: &str) -> Option<u64> {
     input.get_dynamic(key).and_then(|value| match value {
         Dynamic::U8(value) => Some(value as u64),
@@ -3273,37 +3439,6 @@ fn optional_u64(input: &Dynamic, key: &str) -> Option<u64> {
     })
 }
 
-fn optional_u128(input: &Dynamic, key: &str) -> Option<u128> {
-    input.get_dynamic(key).and_then(|value| match value {
-        Dynamic::U8(value) => Some(value as u128),
-        Dynamic::I8(value) => u128::try_from(value).ok(),
-        Dynamic::U16(value) => Some(value as u128),
-        Dynamic::I16(value) => u128::try_from(value).ok(),
-        Dynamic::U32(value) => Some(value as u128),
-        Dynamic::I32(value) => u128::try_from(value).ok(),
-        Dynamic::U64(value) => Some(value as u128),
-        Dynamic::I64(value) => u128::try_from(value).ok(),
-        value if value.is_str() => value.as_str().parse::<u128>().ok(),
-        _ => None,
-    })
-}
-
-fn optional_bool(input: &Dynamic, key: &str) -> Option<bool> {
-    input.get_dynamic(key).and_then(|value| match value {
-        Dynamic::Bool(value) => Some(value),
-        value if value.is_str() => match value.as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    })
-}
-
-fn dynamic_field_json(input: &Dynamic, key: &str) -> Option<Value> {
-    input.get_dynamic(key).map(|value| dynamic_to_json(&value))
-}
-
 fn parse_ln_contract_id(value: &str) -> Result<LnContractId> {
     let value = value.trim();
     ensure!(value.len() == 64, "contract_id must be 32-byte hex");
@@ -3314,41 +3449,6 @@ fn parse_ln_contract_id(value: &str) -> Result<LnContractId> {
             .with_context(|| format!("invalid contract_id hex at byte {index}"))?;
     }
     Ok(LnContractId::from(bytes))
-}
-
-fn ln_rgb_asset_from_input(input: &Dynamic) -> Result<(LnContractId, u64)> {
-    let contract_id = required_string(input, "contract_id")
-        .or_else(|_| required_string(input, "asset_id"))
-        .context("missing `contract_id` or `asset_id`")?;
-    let amount = optional_u64(input, "amount")
-        .or_else(|| optional_u64(input, "rgb_amount"))
-        .or_else(|| optional_u64(input, "funding_rgb"))
-        .context("missing `amount`, `rgb_amount`, or `funding_rgb`")?;
-    Ok((parse_ln_contract_id(&contract_id)?, amount))
-}
-
-fn wallet_rgb_asset_from_input(input: &Dynamic) -> Result<WalletRgbAssetAmount> {
-    let contract_id = required_string(input, "contract_id")
-        .or_else(|_| required_string(input, "asset_id"))
-        .context("missing `contract_id` or `asset_id`")?;
-    let amount = optional_u64(input, "amount")
-        .or_else(|| optional_u64(input, "rgb_amount"))
-        .or_else(|| optional_u64(input, "funding_rgb"))
-        .context("missing `amount`, `rgb_amount`, or `funding_rgb`")?;
-    Ok(WalletRgbAssetAmount {
-        contract_id: rgbstd::ContractId::from_str(&contract_id)
-            .with_context(|| format!("invalid RGB contract_id: {contract_id}"))?,
-        amount,
-    })
-}
-
-fn ln_rgb_payment_id(input: &Dynamic) -> Result<[u8; 32]> {
-    if let Some(payment_id) = optional_string(input, "payment_id") {
-        return hex32_to_bytes(&payment_id);
-    }
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).context("generate RGB-LN payment_id")?;
-    Ok(bytes)
 }
 
 fn hex32_to_bytes(value: &str) -> Result<[u8; 32]> {
@@ -3414,21 +3514,6 @@ fn ln_rgb_network_name() -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "bitcoin".to_string())
-}
-
-fn ln_listen_address() -> String {
-    local_dynamic("lightning")
-        .map(|value| dynamic_to_json(&value))
-        .and_then(|value| {
-            value
-                .get("config")
-                .and_then(|config| config.get("listen"))
-                .and_then(Value::as_str)
-                .or_else(|| value.get("listen").and_then(Value::as_str))
-                .map(str::to_string)
-        })
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| LN_LISTEN_DEFAULT.to_string())
 }
 
 fn json_to_dynamic(value: &Value) -> Dynamic {

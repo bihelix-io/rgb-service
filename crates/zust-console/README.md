@@ -135,8 +135,6 @@ LN hot wallet state is separate:
 Native modules currently registered:
 
 ```text
-env
-bdk
 btc
 rgb
 ln
@@ -145,24 +143,6 @@ ln_rgb
 
 All native functions return a Dynamic value. Most object responses include
 `ok: true`; errors are returned as `{ ok: false, error: "..." }`.
-
-## env
-
-| Function | Description |
-| --- | --- |
-| `env::get(name)` | Returns an environment variable as string, or `""`. |
-
-## bdk
-
-The `bdk` module is a thin compatibility/admin surface for external BTC wallet
-coordination. It does not own the production signer key.
-
-| Function | Description |
-| --- | --- |
-| `bdk::wallet({ network?, data_dir? })` | Returns an external BTC wallet descriptor object. Defaults `network` to `regtest`. |
-| `bdk::sign_request(payload)` | Builds a signed body and sends `/v1/signer/request-signature`. |
-| `bdk::asset_authorization({ asset_id, amount, purpose?, recipient?, anchor_psbt?, expires_at_ms? })` | Requests `/v1/signer/asset-authorization`. |
-| `bdk::external_anchor({ unsigned_anchor_psbt?, signed_anchor_psbt?, txid?, change_vout?, recipient_vout? })` | Packages external BTC anchor fields for RGB prepare/commit flows. |
 
 ## btc
 
@@ -217,30 +197,27 @@ already contains a `signature` field.
 | `rgb::signed(payload)` | Returns `{ payload, signature }` for an arbitrary payload. |
 | `rgb::rna_balance()` | POST `/v1/rna/balance`. No arguments. |
 | `rgb::request_signature(payload)` | Direct signer request through `/v1/signer/request-signature`. |
-| `rgb::asset_authorization({ asset_id, amount, purpose?, recipient?, anchor_psbt?, expires_at_ms? })` | Direct signer asset authorization request. |
-| `rgb::request({ route, ...payload })` | POST an arbitrary RGB daemon route. |
-| `rgb::issue(payload)` | POST `/v1/assets/issue`. |
+| `rgb::asset_authorization(asset_id, amount, purpose, recipient, anchor_psbt, expires_at_ms)` | Direct signer asset authorization request. Use `""`/`0` for defaults. |
+| `rgb::request(route, payload)` | POST an arbitrary RGB daemon route. |
+| `rgb::issue(ticker, name, precision, supply, allocation_outpoint)` | POST `/v1/assets/issue`. |
 | `rgb::assets()` | POST `/v1/assets/list` for default account. |
 | `rgb::token_list()` | GET `/v1/tokens/list`; public token/contract list. |
-| `rgb::balance(payload)` | POST `/v1/balance`. Adds `scope: "all"` and tracked default UTXOs if omitted. |
-| `rgb::balance_breakdown(payload)` | POST `/v1/balance/breakdown`. Adds tracked default UTXOs if omitted. |
-| `rgb::prepare_transfer(payload)` | POST `/v1/transfers/prepare`. |
-| `rgb::commit_transfer(payload)` | POST `/v1/transfers/commit`. |
-| `rgb::pending(payload)` | POST `/v1/pending/list`. |
-| `rgb::recover(payload)` | POST `/v1/recover`. |
-| `rgb::test(payload)` | POST `/v1/test/rgb`. |
+| `rgb::balance(asset_id, scope)` | POST `/v1/balance`. Use `""` scope for `all`. |
+| `rgb::balance_breakdown(asset_id)` | POST `/v1/balance/breakdown`. |
+| `rgb::prepare_transfer(asset_id, amount, recipient, unsigned_anchor_psbt, change_vout, recipient_vout, fee_rate_sat_vb)` | Requests asset authorization, then POST `/v1/transfers/prepare`. |
+| `rgb::commit_transfer(asset_id, amount, transfer_id, txid, signed_anchor_psbt)` | Requests asset authorization, then POST `/v1/transfers/commit`. |
+| `rgb::pending()` | POST `/v1/pending/list`. |
+| `rgb::recover(operation_id)` | POST `/v1/recover`. Use `""` for all recoverable operations. |
+| `rgb::test(scenario)` | POST `/v1/test/rgb`. Use `""` for `full_rgb20_lifecycle`. |
 
 Examples:
 
 ```zs
 rgb::rna_balance()
 rgb::token_list()
-rgb::balance({ asset_id: "..." })
-rgb::prepare_transfer({
-  asset_id: "...",
-  amount: 100,
-  recipient: "bc1q...",
-})
+rgb::balance("...", "")
+rgb::prepare_transfer("...", 100, "receiver-account", unsigned_psbt, 1, 0, 1)
+rgb::commit_transfer("...", 100, transfer_id, txid, signed_psbt)
 ```
 
 RGB consignment storage/transport is handled by `rgb-service-daemon`, not by
@@ -278,27 +255,27 @@ Current LN functions:
 | `ln::stop()` | Stops the LN runtime. |
 | `ln::status()` | Runtime status, balances, peer/channel counts. |
 | `ln::scanner_status()` | BTC address pool/scanner state. |
-| `ln::spawn_scanner({ interval_ms? })` | Starts the address-pool refill scanner thread. |
+| `ln::spawn_scanner(interval_ms)` | Starts the address-pool refill scanner thread. |
 | `ln::events()` | Drains up to 100 pending LN debug events. |
 | `ln::get_node_id()` | Returns LN node id. |
 | `ln::get_addr()` | Returns LN hot-wallet L1 deposit address. |
 | `ln::get_peers()` | Returns connected/persisted peers. |
 | `ln::get_channels()` | Returns channel snapshots. |
-| `ln::connect({ node_id, address, persist? })` | Connects to a peer. `address` is LDK socket address string. |
-| `ln::open_channel({ node_id, address, amount_sats, push_msat? })` | Opens a BTC LN channel. |
-| `ln::close_channel({ channel_id, counterparty_node_id|node_id, force?, reason? })` | Closes a BTC LN channel. |
-| `ln::invoice({ amount_msat, description?, expiry_secs? })` | Creates a BOLT11 invoice. |
+| `ln::connect(node_id, address, persist)` | Connects to a peer. `address` is LDK socket address string. |
+| `ln::open_channel(node_id, address, amount_sats, push_msat)` | Opens a BTC LN channel. Use `0` push amount for none. |
+| `ln::close_channel(channel_id, counterparty_node_id, force, reason)` | Closes a BTC LN channel. Use `""` reason for none. |
+| `ln::invoice(amount_msat, description, expiry_secs)` | Creates a BOLT11 invoice. Use `""`/`0` for defaults. |
 | `ln::pay(invoice)` | Pays a BOLT11 invoice string. |
 | `ln::token_list()` | Calls RGB daemon token list through the LN RGB service client. |
-| `ln::rgb_channel_context({ contract_id, amount, outbound? })` | Builds RGB channel context for a contract/amount. |
+| `ln::rgb_channel_context(contract_id, amount, outbound)` | Builds RGB channel context for a contract/amount. |
 
 Examples:
 
 ```zs
 ln::status()
 ln::get_addr()
-ln::invoice({ amount_msat: 1000, description: "test" })
-ln::connect({ node_id: "...", address: "1.2.3.4:9735" })
+ln::invoice(1000, "test", 3600)
+ln::connect("...", "1.2.3.4:9735", true)
 ```
 
 ## ln_rgb
@@ -318,34 +295,23 @@ to the same runtime as `ln`.
 | `ln_rgb::ln_amount()` | Lightning balance snapshot in sats. |
 | `ln_rgb::get_peers()` | Same as `ln::get_peers()`. |
 | `ln_rgb::get_channels()` | Same as `ln::get_channels()`. |
-| `ln_rgb::connect(payload)` | Same as `ln::connect(payload)`. |
-| `ln_rgb::open_channel(payload)` | Same as `ln::open_channel(payload)`. |
-| `ln_rgb::close_channel(payload)` | Same as `ln::close_channel(payload)`. |
-| `ln_rgb::invoice(payload)` | Same as `ln::invoice(payload)`. |
+| `ln_rgb::connect(node_id, address, persist)` | Same as `ln::connect(node_id, address, persist)`. |
+| `ln_rgb::open_channel(node_id, address, amount_sats, push_msat)` | Same as `ln::open_channel(node_id, address, amount_sats, push_msat)`. |
+| `ln_rgb::close_channel(channel_id, counterparty_node_id, force, reason)` | Same as `ln::close_channel(channel_id, counterparty_node_id, force, reason)`. |
+| `ln_rgb::invoice(amount_msat, description, expiry_secs)` | Same as `ln::invoice(amount_msat, description, expiry_secs)`. |
 | `ln_rgb::pay(invoice)` | Same as `ln::pay(invoice)`. |
 | `ln_rgb::events()` | Same as `ln::events()`. |
 | `ln_rgb::get_info()` | RGB LN runtime info, balances, peer/channel counts. |
-| `ln_rgb::rgb_channel_context({ contract_id|asset_id, amount|rgb_amount|funding_rgb, outbound? })` | Same context helper as `ln::rgb_channel_context`. |
-| `ln_rgb::open_rgb_channel({ node_id, address?, capacity_sat|amount_sats, push_msat?, user_channel_id?, contract_id|asset_id, amount|rgb_amount|funding_rgb })` | Opens an RGB-funded channel. |
-| `ln_rgb::send_rgb_payment({ node_id|recipient_node_id, amount_msat, payment_id?, contract_id|asset_id, amount|rgb_amount|funding_rgb })` | Sends an RGB spontaneous payment. |
+| `ln_rgb::rgb_channel_context(contract_id, amount, outbound)` | Same context builder as `ln::rgb_channel_context`. |
+| `ln_rgb::open_rgb_channel(node_id, address, capacity_sat, push_msat, user_channel_id, contract_id, amount)` | Opens an RGB-funded channel. Use `""` address or `0` user channel id for defaults. |
+| `ln_rgb::send_rgb_payment(recipient_node_id, amount_msat, payment_id, contract_id, amount)` | Sends an RGB spontaneous payment. Use `""` payment id to generate one. |
 
 Examples:
 
 ```zs
 ln_rgb::get_info()
-ln_rgb::open_rgb_channel({
-  node_id: "...",
-  address: "1.2.3.4:9735",
-  capacity_sat: 100000,
-  contract_id: "...",
-  amount: 100,
-})
-ln_rgb::send_rgb_payment({
-  recipient_node_id: "...",
-  amount_msat: 1000,
-  contract_id: "...",
-  amount: 1,
-})
+ln_rgb::open_rgb_channel("...", "1.2.3.4:9735", 100000, 0, 0, "...", 100)
+ln_rgb::send_rgb_payment("...", 1000, "", "...", 1)
 ```
 
 ## Current Operational Notes

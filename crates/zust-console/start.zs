@@ -24,21 +24,8 @@ root::add("local/lightning", lightning);
 root::add("local/lightning/node", lightning.config);
 
 {
-  btc_wallet: bdk::wallet({
-    network: "bitcoin",
-  }),
-  btc_anchor: bdk::external_anchor({
-    unsigned_anchor_psbt: "",
-    signed_anchor_psbt: "",
-    txid: "",
-  }),
-  btc_signature: bdk::sign_request({
-    operation: "btc",
-  }),
   lightning: root::get("local/lightning"),
   ln_start: ln::start(),
-  ln_scanner: ln::spawn_scanner({
-    interval_ms: 30000,
-  }),
+  ln_scanner: ln::spawn_scanner(30000),
   ln: ln::status(),
 }
