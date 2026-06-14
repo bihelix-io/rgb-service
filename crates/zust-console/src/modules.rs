@@ -30,9 +30,9 @@ use bitcoin::{
     Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
+use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use lightning::ln::msgs::SocketAddress;
-use lightning::rgb::TrackedUtxo as LnRgbTrackedUtxo;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
@@ -267,6 +267,13 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         rgb_assets as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
+        "scan_utxos",
+        &[Type::Str],
+        Type::Any,
+        rgb_scan_utxos as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
@@ -1693,14 +1700,41 @@ extern "C" fn rgb_issue(
         );
         let ticker = ticker.as_str().to_string();
         let name = name.as_str().to_string();
-        let allocation_outpoint = allocation_outpoint.as_str().to_string();
+        let allocation_outpoint = allocation_outpoint.as_str().trim().to_string();
         spawn_rgb_callback_worker("issue", callback, move || {
+            let account_id = default_account_id()?;
+            let utxos = scan_utxos_json(&account_id, &btc_esplora_url())?;
+            let utxo_items = utxos.as_array().cloned().unwrap_or_default();
+            let selected_outpoint = if allocation_outpoint.is_empty() {
+                utxo_items
+                    .iter()
+                    .find(|utxo| {
+                        utxo.get("confirmed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .and_then(|utxo| utxo.get("outpoint").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .with_context(|| format!("no confirmed BTC UTXO found for RGB issue account {account_id}"))?
+            } else {
+                allocation_outpoint.clone()
+            };
+            ensure!(
+                utxo_items.iter().any(|utxo| {
+                    utxo.get("outpoint")
+                        .and_then(Value::as_str)
+                        .map(|outpoint| outpoint == selected_outpoint)
+                        .unwrap_or(false)
+                }),
+                "allocation_outpoint {selected_outpoint} is not in RGB issue account {account_id} UTXOs"
+            );
             let payload = json!({
                 "ticker": ticker,
                 "name": name,
                 "precision": precision,
                 "supply": supply,
-                "allocation_outpoint": allocation_outpoint
+                "allocation_outpoint": selected_outpoint,
+                "utxos": utxos
             });
             rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/assets/issue")
         })
@@ -1712,6 +1746,27 @@ extern "C" fn rgb_assets(callback: *const Dynamic) -> *const Dynamic {
         spawn_rgb_callback_worker("assets", callback, move || {
             rgb_post_dynamic(&Dynamic::Null, "/v1/assets/list")
         })
+    })
+}
+extern "C" fn rgb_scan_utxos(address: *const Dynamic) -> *const Dynamic {
+    let address = unsafe { &*address };
+    native_result(|| {
+        ensure!(address.is_str(), "address must be string");
+        let address = address.as_str().trim().to_string();
+        ensure!(!address.is_empty(), "address must not be empty");
+        let esplora = btc_esplora_url();
+        let utxos = scan_utxos_json(&address, &esplora)?;
+        let recorded = record_daemon_account_utxos(&address, &utxos)?;
+        let count = utxos.as_array().map(Vec::len).unwrap_or_default();
+        Ok(ok(json!({
+            "module": "rgb",
+            "operation": "scan_utxos",
+            "account_id": address,
+            "address": address,
+            "count": count,
+            "recorded": recorded,
+            "utxos": utxos
+        })))
     })
 }
 extern "C" fn rgb_token_list() -> *const Dynamic {
@@ -2299,12 +2354,12 @@ extern "C" fn ln_rgb_assets() -> *const Dynamic {
     native_result(|| {
         let node = running_ln_node()?;
         let account_id = node.account_id().to_string();
-        let tracked_utxos = ln_rgb_tracked_utxos_for_address(&account_id)?;
-        let response = node.list_rgb_assets(tracked_utxos)?;
+        let response = node.list_rgb_assets()?;
         Ok(ok(json!({
             "module": "ln_rgb",
             "account_id": account_id,
-            "assets": response.assets
+            "assets": response.assets,
+            "utxo_assets": response.utxo_assets
         })))
     })
 }
@@ -2314,41 +2369,13 @@ extern "C" fn ln_rgb_balance(asset_id: *const Dynamic) -> *const Dynamic {
         ensure!(!asset_id.trim().is_empty(), "asset_id must not be empty");
         let node = running_ln_node()?;
         let account_id = node.account_id().to_string();
-        let tracked_utxos = ln_rgb_tracked_utxos_for_address(&account_id)?;
-        let balance = node.rgb_balance(asset_id.to_string(), tracked_utxos)?;
+        let balance = node.rgb_balance(asset_id.to_string())?;
         Ok(ok(json!({
             "module": "ln_rgb",
             "account_id": account_id,
             "balance": balance
         })))
     })
-}
-
-fn ln_rgb_tracked_utxos_for_address(address: &str) -> Result<Vec<LnRgbTrackedUtxo>> {
-    let tracked = tracked_utxos_json(address)?;
-    tracked
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|utxo| {
-            Ok(LnRgbTrackedUtxo {
-                outpoint: utxo
-                    .get("outpoint")
-                    .and_then(Value::as_str)
-                    .context("tracked utxo missing outpoint")?
-                    .to_string(),
-                address: utxo
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                confirmed: utxo
-                    .get("confirmed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })
-        .collect()
 }
 
 fn ln_rgb_amount_snapshot(kind: &str) -> Result<Dynamic> {
@@ -3482,8 +3509,7 @@ fn btc_assets_json(ident: &str) -> Result<Value> {
     let payload = json!({
         "account_id": address,
         "ident": ident,
-        "account": account,
-        "tracked_utxos": tracked_utxos_json(&address)?
+        "account": account
     });
     Ok(dynamic_to_json(&rgb_post_dynamic(
         &json_to_dynamic(&payload),
@@ -3499,9 +3525,8 @@ fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
     .with_context(|| format!("fetch BTC L1 UTXOs for {address}"))
 }
 
-fn tracked_utxos_json(address: &str) -> Result<Value> {
-    let esplora = btc_esplora_url();
-    let utxos = btc_address_utxos_json(address, &esplora)?;
+fn scan_utxos_json(address: &str, esplora: &str) -> Result<Value> {
+    let utxos = btc_address_utxos_json(address, esplora)?;
     let tracked = utxos
         .as_array()
         .cloned()
@@ -3523,6 +3548,59 @@ fn tracked_utxos_json(address: &str) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(Value::Array(tracked))
+}
+
+fn record_daemon_account_utxos(account_id: &str, utxos: &Value) -> Result<usize> {
+    let data_dir = rgb_service_data_dir()?;
+    let db_dir = data_dir.join("kv");
+    ensure!(
+        db_dir.is_dir(),
+        "RGB service database not found at {}; set `local/rgb-service-data` to daemon service.data_dir on the SSH host",
+        db_dir.display()
+    );
+    let db = SingleWriterTxDatabase::builder(&db_dir)
+        .open()
+        .with_context(|| format!("open RGB service database {}", db_dir.display()))?;
+    let keyspace = db
+        .keyspace("account_utxos", KeyspaceCreateOptions::default)
+        .context("open RGB service account_utxos keyspace")?;
+    let mut tx = db.write_tx();
+    let mut recorded = 0usize;
+    for utxo in utxos.as_array().cloned().unwrap_or_default() {
+        let outpoint = utxo
+            .get("outpoint")
+            .and_then(Value::as_str)
+            .context("scanned UTXO missing outpoint")?;
+        OutPoint::from_str(outpoint).with_context(|| format!("invalid outpoint {outpoint}"))?;
+        let key = format!("{account_id}:{outpoint}");
+        let bytes = serde_json::to_vec(&utxo).context("encode account UTXO")?;
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        recorded += 1;
+    }
+    tx.commit().context("record RGB account UTXOs")?;
+    db.persist(PersistMode::SyncAll)
+        .context("persist RGB account UTXOs")?;
+    Ok(recorded)
+}
+
+fn rgb_service_data_dir() -> Result<PathBuf> {
+    local_string("rgb-service-data")
+        .or_else(|| {
+            local_dynamic("rgb-service-config")
+                .map(|value| dynamic_to_json(&value))
+                .and_then(|value| {
+                    value
+                        .get("service")
+                        .and_then(|service| service.get("data_dir"))
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("data_dir").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+        })
+        .map(PathBuf::from)
+        .context(
+            "missing root value `local/rgb-service-data`; set it to daemon service.data_dir on the SSH host",
+        )
 }
 
 fn esplora_get_json(url: &str) -> Result<Value> {
@@ -3634,14 +3712,6 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
     object
         .entry("account_id".to_string())
         .or_insert(json!(default_account_id()?));
-    if matches!(
-        route,
-        "/v1/assets/list" | "/v1/balance" | "/v1/balance/breakdown"
-    ) {
-        object
-            .entry("tracked_utxos".to_string())
-            .or_insert(tracked_utxos_json(&default_account_id()?)?);
-    }
     if route == "/v1/balance" {
         object.entry("scope".to_string()).or_insert(json!("all"));
     }
