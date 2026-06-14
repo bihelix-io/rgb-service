@@ -302,7 +302,9 @@ pub struct LnChannelOpenPrepareRequest {
     pub account_id: AccountId,
     pub channel_id: String,
     pub contract_id: ContractId,
-    pub funding_outpoint: Outpoint,
+    pub unsigned_anchor_psbt: String,
+    pub change_vout: u32,
+    pub funding_vout: u32,
     pub funding_rgb: u64,
     pub to_local_rgb: u64,
     pub to_remote_rgb: u64,
@@ -313,6 +315,36 @@ pub struct LnChannelOpenPrepareRequest {
 pub struct LnChannelOpenPrepareResponse {
     pub funding_ref: RgbFundingRef,
     pub operation_id: OperationId,
+    pub funding_outpoint: Outpoint,
+    pub anchor_psbt: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelFundingRefRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelFundingRefResponse {
+    pub funding_ref: Option<RgbFundingRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnPaymentClaimRequest {
+    pub account_id: AccountId,
+    pub channel_id: Option<String>,
+    pub payment_hash: String,
+    pub contract_id: ContractId,
+    pub amount_msat: u64,
+    pub rgb_amount: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnPaymentClaimResponse {
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+    pub rgb_state_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -448,9 +480,11 @@ account_scoped!(
     PrepareTransferRequest,
     CommitTransferRequest,
     LnChannelOpenPrepareRequest,
+    LnChannelFundingRefRequest,
     LnCommitmentComposeRequest,
     LnClosingComposeRequest,
     LnOnchainClaimComposeRequest,
+    LnPaymentClaimRequest,
     LnRecoverRequest,
     CancelTransferRequest,
     ListPendingRequest,

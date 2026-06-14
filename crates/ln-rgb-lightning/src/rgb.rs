@@ -117,10 +117,7 @@ impl RgbServiceClient {
         self.get_json("/v1/tokens/list")
     }
 
-    pub fn balance(
-        &self,
-        req: BalanceRequest,
-    ) -> Result<RgbBalance, RgbServiceClientError> {
+    pub fn balance(&self, req: BalanceRequest) -> Result<RgbBalance, RgbServiceClientError> {
         self.post_signed("/v1/balance", "balance", req)
     }
 
@@ -156,6 +153,13 @@ impl RgbServiceClient {
         )
     }
 
+    pub fn ln_channel_funding_ref(
+        &self,
+        req: LnChannelFundingRefRequest,
+    ) -> Result<LnChannelFundingRefResponse, RgbServiceClientError> {
+        self.post_signed("/v1/ln/channels/funding-ref", "ln_channel_funding_ref", req)
+    }
+
     pub fn compose_ln_commitment(
         &self,
         req: LnCommitmentComposeRequest,
@@ -179,6 +183,13 @@ impl RgbServiceClient {
             "ln_onchain_claim_compose",
             req,
         )
+    }
+
+    pub fn claim_ln_payment(
+        &self,
+        req: LnPaymentClaimRequest,
+    ) -> Result<LnPaymentClaimResponse, RgbServiceClientError> {
+        self.post_signed("/v1/ln/payments/claim", "ln_payment_claim", req)
     }
 
     fn signed<T: Serialize>(
@@ -841,7 +852,9 @@ pub struct LnChannelOpenPrepareRequest {
     pub account_id: AccountId,
     pub channel_id: String,
     pub contract_id: ContractIdString,
-    pub funding_outpoint: OutpointString,
+    pub unsigned_anchor_psbt: String,
+    pub change_vout: u32,
+    pub funding_vout: u32,
     pub funding_rgb: u64,
     pub to_local_rgb: u64,
     pub to_remote_rgb: u64,
@@ -852,6 +865,36 @@ pub struct LnChannelOpenPrepareRequest {
 pub struct LnChannelOpenPrepareResponse {
     pub funding_ref: RgbFundingRef,
     pub operation_id: OperationId,
+    pub funding_outpoint: OutpointString,
+    pub anchor_psbt: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelFundingRefRequest {
+    pub account_id: AccountId,
+    pub channel_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnChannelFundingRefResponse {
+    pub funding_ref: Option<RgbFundingRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnPaymentClaimRequest {
+    pub account_id: AccountId,
+    pub channel_id: Option<String>,
+    pub payment_hash: String,
+    pub contract_id: ContractIdString,
+    pub amount_msat: u64,
+    pub rgb_amount: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LnPaymentClaimResponse {
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+    pub rgb_state_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

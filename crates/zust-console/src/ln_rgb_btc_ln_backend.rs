@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi;
 use bdk_wallet::keys::bip39::{Language as BdkLanguage, Mnemonic as BdkMnemonic};
-use bdk_wallet::KeychainKind;
 use bdk_wallet::SignOptions;
+use bdk_wallet::{KeychainKind, TxOrdering};
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256, Hash, HashEngine};
@@ -35,11 +35,12 @@ use lightning::ln::types::ChannelId as LnRgbChannelId;
 use lightning::onion_message::messenger::DefaultMessageRouter;
 use lightning::rgb::{
     init_rgb_ln_tx_composer, AssetSpendAuthorization, AssetSpendPurpose, BalanceRequest,
-    BalanceScope, ListAssetsRequest, ListAssetsResponse, LnChannelOpenPrepareRequest,
-    RequestSignature, RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext,
-    RgbDaemonLnTxComposer, RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer,
-    RgbLnTxComposer, RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner,
-    SignatureScheme, TrackedUtxo,
+    BalanceScope, ListAssetsRequest, ListAssetsResponse, LnChannelFundingRefRequest,
+    LnChannelOpenPrepareRequest, LnPaymentClaimRequest, RequestSignature,
+    RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext, RgbDaemonLnTxComposer,
+    RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer, RgbLnTxComposer,
+    RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner, SignatureScheme,
+    TrackedUtxo,
 };
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::router::{
@@ -101,6 +102,7 @@ pub struct LnRgbBtcLnBackend {
     rgb_payment_assets: Mutex<HashMap<String, RgbAssetAmount>>,
     pending_funding_transactions: Mutex<HashMap<LnRgbChannelId, PendingFundingTransaction>>,
     pending_rgb_funding: Mutex<HashMap<LnRgbChannelId, PendingRgbFundingTransfer>>,
+    pending_inbound_rgb_channels: Mutex<HashMap<LnRgbChannelId, PublicKey>>,
     generated_rgb_funding_transfers: Mutex<VecDeque<RgbFundingTransfer>>,
     rgb_funding_bindings: Mutex<HashMap<LnRgbChannelId, RgbFundingOutpointBinding>>,
     esplora_cursor: AtomicUsize,
@@ -665,6 +667,7 @@ impl LnRgbBtcLnBackend {
             rgb_payment_assets: Mutex::new(HashMap::new()),
             pending_funding_transactions: Mutex::new(HashMap::new()),
             pending_rgb_funding: Mutex::new(HashMap::new()),
+            pending_inbound_rgb_channels: Mutex::new(HashMap::new()),
             generated_rgb_funding_transfers: Mutex::new(VecDeque::new()),
             rgb_funding_bindings: Mutex::new(HashMap::new()),
             esplora_cursor: AtomicUsize::new(0),
@@ -1265,6 +1268,14 @@ impl LnRgbBtcLnBackend {
                         "ln-rgb RGB funding ref confirmation failed: {err:#}"
                     ));
             }
+            if let Err(err) = self.try_attach_inbound_rgb_funding_refs() {
+                self.events
+                    .lock()
+                    .expect("ln-rgb event lock poisoned")
+                    .push_back(format!(
+                        "ln-rgb inbound RGB funding ref lookup failed: {err:#}"
+                    ));
+            }
             if let Err(err) = self.try_confirm_rgb_sweep_carriers() {
                 self.events
                     .lock()
@@ -1296,81 +1307,17 @@ impl LnRgbBtcLnBackend {
                     .expect("rgb channel asset lock poisoned")
                     .get(&user_channel_id)
                     .cloned();
-                let tx =
-                    self.build_funding_transaction(channel_value_satoshis, output_script.clone())?;
-                let funding_outpoint =
-                    funding_outpoint_from_tx(&tx, &output_script, channel_value_satoshis)
-                        .context("LDK funding transaction is missing requested funding output")?;
-                let txid = tx.compute_txid();
                 if let Some(asset) = asset {
-                    let unsigned_tx_hex = bytes_to_hex(&serialize(&tx));
-                    let expires_at_ms = now_secs().saturating_mul(1000).saturating_add(300_000);
-                    let contract_id = asset.contract_id.to_string();
-                    let purpose = AssetSpendPurpose::L2Reserve;
-                    let authorization_payload = json!({
-                        "asset_id": contract_id,
-                        "amount": asset.amount,
-                        "purpose": purpose,
-                        "recipient": null,
-                        "anchor_psbt": unsigned_tx_hex,
-                        "expires_at_ms": expires_at_ms
-                    });
-                    let mut nonce = [0u8; 16];
-                    getrandom::fill(&mut nonce)
-                        .context("generate LN RGB asset authorization nonce")?;
-                    let nonce = bytes_to_hex(&nonce);
-                    let timestamp_ms = now_millis();
-                    let authorization_payload_bytes = serde_json::to_vec(&authorization_payload)
-                        .context("encode LN RGB asset authorization payload")?;
-                    let mut engine = sha256::Hash::engine();
-                    engine.input(b"bihelix-ln-rgb-auth-v1");
-                    engine.input(b"l2_reserve");
-                    engine.input(nonce.as_bytes());
-                    engine.input(&timestamp_ms.to_be_bytes());
-                    engine.input(&authorization_payload_bytes);
-                    let message =
-                        Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array());
-                    let secp = Secp256k1::new();
-                    let signature = secp.sign_ecdsa(&message, &self.node_secret);
-                    let signature = RequestSignature {
-                        signer_id: self.node_id.to_string(),
-                        public_key: self.node_id.to_string(),
-                        scheme: SignatureScheme::Ecdsa,
-                        nonce,
-                        timestamp_ms,
-                        signature: bytes_to_hex(&signature.serialize_der()),
-                    };
-                    let asset_authorization = AssetSpendAuthorization {
-                        asset_id: contract_id.clone(),
-                        amount: asset.amount,
-                        purpose,
-                        recipient: None,
-                        anchor_psbt: Some(unsigned_tx_hex),
-                        expires_at_ms,
-                        signature,
-                    };
-                    let client = RgbServiceClient::new(
-                        self.config.rgb_service_url.clone(),
-                        Arc::new(BackendRgbServiceSigner {
-                            node_id: self.node_id,
-                            node_secret: self.node_secret,
-                        }),
-                    )
-                    .map_err(|err| anyhow!("{err}"))?;
                     let channel = hex32(temporary_channel_id.0);
-                    let prepared = client
-                        .prepare_ln_channel_open(LnChannelOpenPrepareRequest {
-                            account_id: self.config.account_id.clone(),
-                            channel_id: channel.clone(),
-                            contract_id,
-                            funding_outpoint: funding_outpoint.to_string(),
-                            funding_rgb: asset.amount,
-                            to_local_rgb: asset.amount,
-                            to_remote_rgb: 0,
-                            asset_authorization,
-                        })
-                        .map_err(|err| anyhow!("{err}"))?;
-                    let funding_ref = prepared.funding_ref;
+                    let (tx, funding_outpoint, funding_ref) = self
+                        .build_rgb_funding_transaction(
+                            channel_value_satoshis,
+                            output_script.clone(),
+                            &channel,
+                            &asset,
+                        )
+                        .context("build RGB LN funding transaction")?;
+                    let txid = tx.compute_txid();
                     let generated_transfer = RgbFundingTransfer {
                         temporary_channel_id: ChannelId(temporary_channel_id.0),
                         peer_node_id: counterparty_node_id,
@@ -1409,6 +1356,14 @@ impl LnRgbBtcLnBackend {
                             "ln-rgb RGB funding transaction generated: user_channel_id={user_channel_id} temporary_channel_id={temporary_channel_id} channel_id={channel} funding_outpoint={funding_outpoint} txid={txid}"
                         ));
                 } else {
+                    let tx = self
+                        .build_funding_transaction(channel_value_satoshis, output_script.clone())?;
+                    let funding_outpoint =
+                        funding_outpoint_from_tx(&tx, &output_script, channel_value_satoshis)
+                            .context(
+                                "LDK funding transaction is missing requested funding output",
+                            )?;
+                    let txid = tx.compute_txid();
                     self.submit_funding_transaction(
                         channel_manager,
                         temporary_channel_id,
@@ -1533,6 +1488,10 @@ impl LnRgbBtcLnBackend {
                             "ln-rgb accepted inbound channel: peer={counterparty_node_id} temporary_channel_id={temporary_channel_id}"
                         ));
                 }
+                self.pending_inbound_rgb_channels
+                    .lock()
+                    .expect("pending inbound rgb channel lock poisoned")
+                    .insert(temporary_channel_id, counterparty_node_id);
             }
             Event::FundingTxBroadcastSafe {
                 channel_id,
@@ -1631,6 +1590,17 @@ impl LnRgbBtcLnBackend {
             } => {
                 let inbound_rgb = channel_manager.inbound_rgb_payment_amount(&payment_hash);
                 if let Some((contract_id, rgb_amount)) = inbound_rgb {
+                    if let Err(err) = self.claim_inbound_rgb_payment(
+                        payment_hash,
+                        amount_msat,
+                        &contract_id.to_string(),
+                        rgb_amount,
+                    ) {
+                        self.events
+                            .lock()
+                            .expect("ln-rgb event lock poisoned")
+                            .push_back(format!("ln-rgb daemon RGB payment claim failed: {err:#}"));
+                    }
                     self.persist_inbound_rgb_payment_claimed(
                         payment_hash,
                         amount_msat,
@@ -1760,6 +1730,159 @@ impl LnRgbBtcLnBackend {
             local.persist()?;
             psbt.extract_tx()
                 .context("failed to extract LN funding transaction")
+        })
+    }
+
+    fn build_rgb_funding_transaction(
+        &self,
+        channel_value_satoshis: u64,
+        output_script: ScriptBuf,
+        channel_id: &str,
+        asset: &RgbAssetAmount,
+    ) -> Result<(Transaction, OutPoint, RgbFundingRef)> {
+        self.retry_transient_esplora("build RGB LN funding transaction", || {
+            let mut local = self.open_l1_wallet()?;
+            let esplora = self.next_esplora_url();
+            self.sync_l1_wallet_or_use_cached(
+                &mut local,
+                &esplora,
+                "build RGB LN funding transaction",
+            )?;
+
+            let fee_rate = FeeRate::from_sat_per_vb(2)
+                .context("invalid RGB LN funding transaction fee rate")?;
+            let mut builder = local.wallet.build_tx();
+            builder
+                .ordering(TxOrdering::Untouched)
+                .add_recipient(
+                    output_script.clone(),
+                    Amount::from_sat(channel_value_satoshis),
+                )
+                .add_data(&[0; 32])
+                .fee_rate(fee_rate)
+                .nlocktime(LockTime::ZERO);
+
+            let psbt = builder
+                .finish()
+                .context("failed to build unsigned RGB LN funding PSBT")?;
+            let funding_vout = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .position(|output| {
+                    output.script_pubkey == output_script
+                        && output.value == Amount::from_sat(channel_value_satoshis)
+                })
+                .context("unsigned RGB LN funding PSBT is missing funding output")?
+                as u32;
+            let change_vout = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .enumerate()
+                .find(|(vout, output)| {
+                    *vout as u32 != funding_vout
+                        && !output.script_pubkey.is_op_return()
+                        && output.value > Amount::ZERO
+                })
+                .map(|(vout, _)| vout as u32)
+                .context("unsigned RGB LN funding PSBT is missing RGB change output")?;
+            let unsigned_anchor_psbt = bytes_to_hex(&psbt.serialize());
+            let expires_at_ms = now_secs().saturating_mul(1000).saturating_add(300_000);
+            let contract_id = asset.contract_id.to_string();
+            let purpose = AssetSpendPurpose::L2Reserve;
+            let authorization_payload = json!({
+                "asset_id": contract_id,
+                "amount": asset.amount,
+                "purpose": purpose,
+                "recipient": null,
+                "anchor_psbt": unsigned_anchor_psbt,
+                "expires_at_ms": expires_at_ms
+            });
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).context("generate LN RGB asset authorization nonce")?;
+            let nonce = bytes_to_hex(&nonce);
+            let timestamp_ms = now_millis();
+            let authorization_payload_bytes = serde_json::to_vec(&authorization_payload)
+                .context("encode LN RGB asset authorization payload")?;
+            let mut engine = sha256::Hash::engine();
+            engine.input(b"bihelix-ln-rgb-auth-v1");
+            engine.input(b"l2_reserve");
+            engine.input(nonce.as_bytes());
+            engine.input(&timestamp_ms.to_be_bytes());
+            engine.input(&authorization_payload_bytes);
+            let message = Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array());
+            let secp = Secp256k1::new();
+            let signature = secp.sign_ecdsa(&message, &self.node_secret);
+            let signature = RequestSignature {
+                signer_id: self.node_id.to_string(),
+                public_key: self.node_id.to_string(),
+                scheme: SignatureScheme::Ecdsa,
+                nonce,
+                timestamp_ms,
+                signature: bytes_to_hex(&signature.serialize_der()),
+            };
+            let asset_authorization = AssetSpendAuthorization {
+                asset_id: contract_id.clone(),
+                amount: asset.amount,
+                purpose,
+                recipient: None,
+                anchor_psbt: Some(unsigned_anchor_psbt.clone()),
+                expires_at_ms,
+                signature,
+            };
+            let client = RgbServiceClient::new(
+                self.config.rgb_service_url.clone(),
+                Arc::new(BackendRgbServiceSigner {
+                    node_id: self.node_id,
+                    node_secret: self.node_secret,
+                }),
+            )
+            .map_err(|err| anyhow!("{err}"))?;
+            let prepared = client
+                .prepare_ln_channel_open(LnChannelOpenPrepareRequest {
+                    account_id: self.config.account_id.clone(),
+                    channel_id: channel_id.to_string(),
+                    contract_id,
+                    unsigned_anchor_psbt,
+                    change_vout,
+                    funding_vout,
+                    funding_rgb: asset.amount,
+                    to_local_rgb: asset.amount,
+                    to_remote_rgb: 0,
+                    asset_authorization,
+                })
+                .map_err(|err| anyhow!("{err}"))?;
+            let prepared_anchor_psbt = hex_to_bytes(&prepared.anchor_psbt)
+                .context("decode RGB LN prepared anchor PSBT hex")?;
+            let mut prepared_psbt = Psbt::deserialize(&prepared_anchor_psbt)
+                .context("deserialize RGB LN prepared anchor PSBT")?;
+            let finalized = local
+                .wallet
+                .sign(&mut prepared_psbt, SignOptions::default())
+                .context("failed to sign RGB LN funding transaction")?;
+            if !finalized {
+                bail!("RGB LN funding transaction was not finalized");
+            }
+            local.persist()?;
+            let tx = prepared_psbt
+                .extract_tx()
+                .context("failed to extract RGB LN funding transaction")?;
+            let funding_outpoint = OutPoint::from_str(&prepared.funding_outpoint)
+                .context("RGB service returned invalid funding_outpoint")?;
+            ensure!(
+                tx.compute_txid() == funding_outpoint.txid,
+                "RGB LN funding txid mismatch: signed={} daemon={}",
+                tx.compute_txid(),
+                funding_outpoint.txid
+            );
+            ensure!(
+                tx.output
+                    .get(funding_outpoint.vout as usize)
+                    .is_some_and(|output| output.script_pubkey == output_script),
+                "RGB LN funding output script changed"
+            );
+            Ok((tx, funding_outpoint, prepared.funding_ref))
         })
     }
 
@@ -2451,6 +2574,34 @@ impl LnRgbBtcLnBackend {
         self.write_rgb_payment_state(&format!("inbound-{payment_hash_hex}"), &record)
     }
 
+    fn claim_inbound_rgb_payment(
+        &self,
+        payment_hash: PaymentHash,
+        amount_msat: u64,
+        contract_id: &str,
+        rgb_amount: u64,
+    ) -> Result<()> {
+        let client = RgbServiceClient::new(
+            self.config.rgb_service_url.clone(),
+            Arc::new(BackendRgbServiceSigner {
+                node_id: self.node_id,
+                node_secret: self.node_secret,
+            }),
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        client
+            .claim_ln_payment(LnPaymentClaimRequest {
+                account_id: self.config.account_id.clone(),
+                channel_id: None,
+                payment_hash: hex32(payment_hash.0),
+                contract_id: contract_id.to_string(),
+                amount_msat,
+                rgb_amount,
+            })
+            .map(|_| ())
+            .map_err(|err| anyhow!("{err}"))
+    }
+
     fn update_rgb_payment_state(
         &self,
         key: &str,
@@ -2616,6 +2767,82 @@ impl LnRgbBtcLnBackend {
                         "ln-rgb RGB funding stock promotion skipped: funding={funding_outpoint} error={err:#}"
                     ));
             }
+        }
+        Ok(())
+    }
+
+    fn try_attach_inbound_rgb_funding_refs(&self) -> Result<()> {
+        let pending = self
+            .pending_inbound_rgb_channels
+            .lock()
+            .expect("pending inbound rgb channel lock poisoned")
+            .iter()
+            .map(|(channel_id, peer)| (*channel_id, *peer))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let client = RgbServiceClient::new(
+            self.config.rgb_service_url.clone(),
+            Arc::new(BackendRgbServiceSigner {
+                node_id: self.node_id,
+                node_secret: self.node_secret,
+            }),
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        let managers = {
+            let runtime_guard = self.runtime.lock().expect("ln-rgb runtime lock poisoned");
+            runtime_guard.as_ref().map(|runtime| {
+                (
+                    Arc::clone(&runtime.channel_manager),
+                    Arc::clone(&runtime.peer_manager),
+                    Arc::clone(&runtime.kv_store),
+                )
+            })
+        };
+        let Some((channel_manager, peer_manager, kv_store)) = managers else {
+            return Ok(());
+        };
+        for (temporary_channel_id, peer_node_id) in pending {
+            let channel = hex32(temporary_channel_id.0);
+            let response = match client.ln_channel_funding_ref(LnChannelFundingRefRequest {
+                account_id: self.config.account_id.clone(),
+                channel_id: channel.clone(),
+            }) {
+                Ok(response) => response,
+                Err(err) => {
+                    self.events
+                        .lock()
+                        .expect("ln-rgb event lock poisoned")
+                        .push_back(format!(
+                            "ln-rgb inbound RGB funding ref lookup deferred: channel={channel} error={err}"
+                        ));
+                    continue;
+                }
+            };
+            let Some(funding_ref) = response.funding_ref else {
+                continue;
+            };
+            channel_manager
+                .provide_funding_rgb_transfer_for_unfunded_channel(
+                    temporary_channel_id,
+                    peer_node_id,
+                    ldk_rgb_funding_transfer(funding_ref.clone()),
+                )
+                .map_err(|err| anyhow!("LDK rejected inbound RGB funding ref: {err:?}"))?;
+            peer_manager.process_events();
+            Self::persist_channel_manager_to_store(&kv_store, &channel_manager)?;
+            self.pending_inbound_rgb_channels
+                .lock()
+                .expect("pending inbound rgb channel lock poisoned")
+                .remove(&temporary_channel_id);
+            self.events
+                .lock()
+                .expect("ln-rgb event lock poisoned")
+                .push_back(format!(
+                    "ln-rgb inbound RGB funding ref attached: channel={channel} transfer_id={}",
+                    funding_ref.transfer_id
+                ));
         }
         Ok(())
     }

@@ -39,12 +39,14 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
             "/v1/ln/channels/open/prepare",
             post(prepare_ln_channel_open),
         )
+        .route("/v1/ln/channels/funding-ref", post(ln_channel_funding_ref))
         .route("/v1/ln/commitments/compose", post(compose_ln_commitment))
         .route("/v1/ln/closing/compose", post(compose_ln_closing))
         .route(
             "/v1/ln/onchain-claims/compose",
             post(compose_ln_onchain_claim),
         )
+        .route("/v1/ln/payments/claim", post(claim_ln_payment))
         .route("/v1/ln/recover", post(recover_ln))
         .route("/v1/transfers/cancel", post(cancel_transfer))
         .route("/v1/test/rgb", post(run_rgb_test))
@@ -170,6 +172,14 @@ async fn prepare_ln_channel_open(
     Ok(Json(state.service.prepare_ln_channel_open(req).await?))
 }
 
+async fn ln_channel_funding_ref(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnChannelFundingRefRequest>>,
+) -> Result<Json<LnChannelFundingRefResponse>, HttpError> {
+    let req = authorize(&state, Permission::LnChannelFundingRef, req).await?;
+    Ok(Json(state.service.ln_channel_funding_ref(req).await?))
+}
+
 async fn compose_ln_commitment(
     State(state): State<ApiState>,
     Json(req): Json<SignedRequest<LnCommitmentComposeRequest>>,
@@ -192,6 +202,14 @@ async fn compose_ln_onchain_claim(
 ) -> Result<Json<LnComposeResponse>, HttpError> {
     let req = authorize(&state, Permission::LnOnchainClaimCompose, req).await?;
     Ok(Json(state.service.compose_ln_onchain_claim(req).await?))
+}
+
+async fn claim_ln_payment(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<LnPaymentClaimRequest>>,
+) -> Result<Json<LnPaymentClaimResponse>, HttpError> {
+    let req = authorize(&state, Permission::LnPaymentClaim, req).await?;
+    Ok(Json(state.service.claim_ln_payment(req).await?))
 }
 
 async fn recover_ln(

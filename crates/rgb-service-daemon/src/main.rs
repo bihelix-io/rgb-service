@@ -25,14 +25,16 @@ use rgb_service_api::{
     AuthVerifier, Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
     CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
     IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
-    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
-    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
-    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveredChannel,
-    LnRecoveredCompose, LnRecoveryReport, OperationStatus, Permission, PrepareTransferRequest,
-    PrepareTransferResponse, RecoverRequest, RecoveryAction, RecoveryReport, RequestSignature,
-    RgbAllocation, RgbAssetInfo, RgbBalance, RgbContractInfo, RgbFundingRef, RgbServiceApi,
-    RgbServiceError, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest,
-    RunRgbTestResponse, SignatureScheme, TokenListResponse, TrackedUtxo,
+    ListPendingRequest, ListPendingResponse, LnChannelFundingRefRequest,
+    LnChannelFundingRefResponse, LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse,
+    LnClosingComposeRequest, LnCommitmentComposeRequest, LnComposeResponse,
+    LnOnchainClaimComposeRequest, LnPaymentClaimRequest, LnPaymentClaimResponse, LnRecoverRequest,
+    LnRecoveredChannel, LnRecoveredCompose, LnRecoveryReport, OperationStatus, Permission,
+    PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryAction,
+    RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance, RgbContractInfo,
+    RgbFundingRef, RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest,
+    RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SignatureScheme, TokenListResponse,
+    TrackedUtxo,
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, encode_fascia_bytes, issue_rgb20_fixed_with_chain_source,
@@ -278,9 +280,11 @@ impl ConfiguredAuthVerifier {
             Permission::PrepareTransfer => &["prepare_transfer"],
             Permission::CommitTransfer => &["commit_transfer"],
             Permission::LnChannelOpenPrepare => &["ln_channel_open_prepare"],
+            Permission::LnChannelFundingRef => &["ln_channel_funding_ref"],
             Permission::LnCommitmentCompose => &["ln_commitment_compose"],
             Permission::LnClosingCompose => &["ln_closing_compose"],
             Permission::LnOnchainClaimCompose => &["ln_onchain_claim_compose"],
+            Permission::LnPaymentClaim => &["ln_payment_claim"],
             Permission::LnRecover => &["ln_recover"],
             Permission::CancelTransfer => &["cancel_transfer"],
             Permission::ManagePending => &["manage_pending", "list_pending"],
@@ -469,10 +473,13 @@ struct LnChannelRecord {
     channel_id: String,
     contract_id: String,
     funding_outpoint: String,
+    funding_vout: u32,
     funding_rgb: u64,
     to_local_rgb: u64,
     to_remote_rgb: u64,
     funding_ref: RgbFundingRef,
+    opening_txid: String,
+    opening_fascia: Vec<u8>,
     created_at_ms: u64,
 }
 
@@ -494,6 +501,19 @@ struct LnComposeRecord {
     fascia: Vec<u8>,
     funding_ref: RgbFundingRef,
     assignments: Vec<LnOutputAssignmentRecord>,
+    created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LnPaymentRecord {
+    account_id: String,
+    channel_id: Option<String>,
+    payment_hash: String,
+    contract_id: String,
+    amount_msat: u64,
+    rgb_amount: u64,
+    status: OperationStatus,
+    rgb_state_ref: Option<String>,
     created_at_ms: u64,
 }
 
@@ -696,6 +716,23 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(err.to_string()))
     }
 
+    fn put_ln_payment_record(&self, record: &LnPaymentRecord) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("ln_payments", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = format!("{}:{}", record.account_id, record.payment_hash);
+        let bytes =
+            serde_json::to_vec(record).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
     fn get_ln_channel_record(
         &self,
         account_id: &str,
@@ -737,6 +774,29 @@ impl LocalDaemonService {
             );
         }
         Ok(records)
+    }
+
+    fn find_ln_channel_record_by_channel_id(
+        &self,
+        channel_id: &str,
+    ) -> rgb_service_api::Result<Option<LnChannelRecord>> {
+        let keyspace = self
+            .db
+            .keyspace("ln_channels", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        for item in keyspace.as_ref().prefix(b"") {
+            let value = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let record: LnChannelRecord = serde_json::from_slice(value.as_ref())
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            if record.channel_id == channel_id
+                || record.funding_ref.channel_id.as_deref() == Some(channel_id)
+            {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 
     fn list_ln_compose_records(
@@ -884,7 +944,16 @@ impl LocalDaemonService {
         let psbt = Psbt::from_unsigned_tx(tx).map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid unsigned transaction for PSBT: {err}"))
         })?;
-        let stock_dir = self.account_stock_dir(account_id);
+        let stock_account_id = self
+            .get_ln_channel_record(account_id, channel_id)?
+            .or_else(|| {
+                self.find_ln_channel_record_by_channel_id(channel_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|record| record.account_id)
+            .unwrap_or_else(|| account_id.to_string());
+        let stock_dir = self.account_stock_dir(&stock_account_id);
         let prepared = prepare_rgb20_psbt(&stock_dir, psbt, change_vout, assignments)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let tx = prepared.psbt.unsigned_tx;
@@ -1477,9 +1546,6 @@ impl RgbServiceApi for LocalDaemonService {
                 "contract_id must not be empty".to_string(),
             ));
         }
-        OutPoint::from_str(&payload.funding_outpoint).map_err(|err| {
-            RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
-        })?;
         if payload.to_local_rgb + payload.to_remote_rgb != payload.funding_rgb {
             return Err(RgbServiceError::InvalidRequest(
                 "to_local_rgb + to_remote_rgb must equal funding_rgb".to_string(),
@@ -1490,9 +1556,54 @@ impl RgbServiceApi for LocalDaemonService {
             payload.funding_rgb,
             &payload.asset_authorization,
         )?;
+        let psbt =
+            Psbt::deserialize(&hex_decode(&payload.unsigned_anchor_psbt)?).map_err(|err| {
+                RgbServiceError::InvalidRequest(format!("invalid unsigned_anchor_psbt: {err}"))
+            })?;
+        let funding_output = psbt
+            .unsigned_tx
+            .output
+            .get(payload.funding_vout as usize)
+            .ok_or_else(|| {
+                RgbServiceError::InvalidRequest("funding_vout is out of bounds".to_string())
+            })?;
+        if funding_output.value == bitcoin::Amount::ZERO {
+            return Err(RgbServiceError::InvalidRequest(
+                "funding output must be non-zero".to_string(),
+            ));
+        }
+        if !psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|output| output.script_pubkey.is_op_return())
+        {
+            return Err(RgbServiceError::InvalidRequest(
+                "RGB LN funding PSBT must include an OP_RETURN carrier output".to_string(),
+            ));
+        }
         self.charge_rna(&account_id, route, purpose, amount)?;
         let result = (|| {
             let operation_id = Self::require_nonce(&payload.asset_authorization)?;
+            let stock_dir = self.account_stock_dir(&account_id);
+            let contract_id = parse_contract_id(&payload.contract_id)?;
+            let prepared = prepare_rgb20_psbt(
+                &stock_dir,
+                psbt,
+                payload.change_vout,
+                [Rgb20PsbtAssignment {
+                    contract_id,
+                    amount: payload.funding_rgb,
+                    vout: payload.funding_vout,
+                }],
+            )
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            let opening_txid = prepared.psbt.unsigned_tx.compute_txid();
+            let funding_outpoint = OutPoint::new(opening_txid, payload.funding_vout);
+            let fascia = encode_fascia_bytes(&prepared.fascia)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            stage_sender_fascia(&stock_dir, opening_txid, &prepared.fascia)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
             let funding_ref = RgbFundingRef {
                 transfer_id: format!("ln-open:{operation_id}"),
                 operation_id: operation_id.clone(),
@@ -1502,19 +1613,39 @@ impl RgbServiceApi for LocalDaemonService {
                 account_id: payload.account_id,
                 channel_id: payload.channel_id,
                 contract_id: payload.contract_id,
-                funding_outpoint: payload.funding_outpoint,
+                funding_outpoint: funding_outpoint.to_string(),
+                funding_vout: payload.funding_vout,
                 funding_rgb: payload.funding_rgb,
                 to_local_rgb: payload.to_local_rgb,
                 to_remote_rgb: payload.to_remote_rgb,
                 funding_ref: funding_ref.clone(),
+                opening_txid: opening_txid.to_string(),
+                opening_fascia: fascia,
                 created_at_ms: now_ms(),
             })?;
             Ok(LnChannelOpenPrepareResponse {
                 funding_ref,
                 operation_id,
+                funding_outpoint: funding_outpoint.to_string(),
+                anchor_psbt: hex_encode(&prepared.psbt.serialize()),
             })
         })();
         self.refund_rna_on_error(result, &account_id, route, purpose, amount)
+    }
+
+    async fn ln_channel_funding_ref(
+        &self,
+        req: Authorized<LnChannelFundingRefRequest>,
+    ) -> rgb_service_api::Result<LnChannelFundingRefResponse> {
+        let funding_ref = self
+            .get_ln_channel_record(&req.payload.account_id, &req.payload.channel_id)?
+            .or_else(|| {
+                self.find_ln_channel_record_by_channel_id(&req.payload.channel_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|record| record.funding_ref);
+        Ok(LnChannelFundingRefResponse { funding_ref })
     }
 
     async fn compose_ln_commitment(
@@ -1569,6 +1700,45 @@ impl RgbServiceApi for LocalDaemonService {
             assignments,
             &req.payload.asset_authorization,
         )
+    }
+
+    async fn claim_ln_payment(
+        &self,
+        req: Authorized<LnPaymentClaimRequest>,
+    ) -> rgb_service_api::Result<LnPaymentClaimResponse> {
+        if req.payload.payment_hash.trim().is_empty() {
+            return Err(RgbServiceError::InvalidRequest(
+                "payment_hash must not be empty".to_string(),
+            ));
+        }
+        if req.payload.rgb_amount == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "rgb_amount must be greater than zero".to_string(),
+            ));
+        }
+        parse_contract_id(&req.payload.contract_id)?;
+        let operation_id = format!("ln-payment:{}", req.payload.payment_hash);
+        let rgb_state_ref = req
+            .payload
+            .channel_id
+            .as_ref()
+            .map(|channel_id| format!("ln:{channel_id}:{operation_id}"));
+        self.put_ln_payment_record(&LnPaymentRecord {
+            account_id: req.payload.account_id,
+            channel_id: req.payload.channel_id,
+            payment_hash: req.payload.payment_hash,
+            contract_id: req.payload.contract_id,
+            amount_msat: req.payload.amount_msat,
+            rgb_amount: req.payload.rgb_amount,
+            status: OperationStatus::Settled,
+            rgb_state_ref: rgb_state_ref.clone(),
+            created_at_ms: now_ms(),
+        })?;
+        Ok(LnPaymentClaimResponse {
+            operation_id,
+            status: OperationStatus::Settled,
+            rgb_state_ref,
+        })
     }
 
     async fn compose_ln_closing(

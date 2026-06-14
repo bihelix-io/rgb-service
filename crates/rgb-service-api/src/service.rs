@@ -46,6 +46,11 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         req: Authorized<LnChannelOpenPrepareRequest>,
     ) -> Result<LnChannelOpenPrepareResponse>;
 
+    async fn ln_channel_funding_ref(
+        &self,
+        req: Authorized<LnChannelFundingRefRequest>,
+    ) -> Result<LnChannelFundingRefResponse>;
+
     async fn compose_ln_commitment(
         &self,
         req: Authorized<LnCommitmentComposeRequest>,
@@ -60,6 +65,11 @@ pub trait RgbServiceApi: Send + Sync + 'static {
         &self,
         req: Authorized<LnOnchainClaimComposeRequest>,
     ) -> Result<LnComposeResponse>;
+
+    async fn claim_ln_payment(
+        &self,
+        req: Authorized<LnPaymentClaimRequest>,
+    ) -> Result<LnPaymentClaimResponse>;
 
     async fn recover_ln(&self, req: Authorized<LnRecoverRequest>) -> Result<LnRecoveryReport>;
 
