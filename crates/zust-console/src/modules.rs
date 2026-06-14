@@ -1702,7 +1702,9 @@ extern "C" fn rgb_issue(
         let name = name.as_str().to_string();
         let allocation_outpoint = allocation_outpoint.as_str().trim().to_string();
         spawn_rgb_callback_worker("issue", callback, move || {
-            let account_id = rgb_issue_account_id()?;
+            let node = current_ln_node()
+                .context("LN RGB node is not running; rgb::issue uses the LN hot wallet")?;
+            let account_id = node.account_id().to_string();
             let utxos = scan_utxos_json(&account_id, &btc_esplora_url())?;
             let utxo_items = utxos.as_array().cloned().unwrap_or_default();
             let selected_outpoint = if allocation_outpoint.is_empty() {
@@ -1715,7 +1717,9 @@ extern "C" fn rgb_issue(
                     })
                     .and_then(|utxo| utxo.get("outpoint").and_then(Value::as_str))
                     .map(str::to_string)
-                    .with_context(|| format!("no confirmed BTC UTXO found for RGB issue account {account_id}"))?
+                    .with_context(|| {
+                        format!("no confirmed BTC UTXO found for RGB issue account {account_id}")
+                    })?
             } else {
                 allocation_outpoint.clone()
             };
@@ -1724,20 +1728,21 @@ extern "C" fn rgb_issue(
                     utxo.get("outpoint")
                         .and_then(Value::as_str)
                         .map(|outpoint| outpoint == selected_outpoint)
-                        .unwrap_or(false)
+                    .unwrap_or(false)
                 }),
                 "allocation_outpoint {selected_outpoint} is not in RGB issue account {account_id} UTXOs"
             );
-            let payload = json!({
-                "account_id": account_id,
-                "ticker": ticker,
-                "name": name,
-                "precision": precision,
-                "supply": supply,
-                "allocation_outpoint": selected_outpoint,
-                "utxos": utxos
-            });
-            rgb_post_dynamic(&json_to_dynamic(&payload), "/v1/assets/issue")
+            let tracked_utxos =
+                serde_json::from_value(utxos).context("decode RGB issue account UTXOs")?;
+            let response = node.issue_rgb_asset(
+                ticker,
+                name,
+                precision,
+                supply,
+                selected_outpoint,
+                tracked_utxos,
+            )?;
+            Ok(json_to_dynamic(&serde_json::to_value(response)?))
         })
     })
 }
@@ -3721,15 +3726,6 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
 
 pub(crate) fn default_account_id() -> Result<String> {
     local_string("btc-addr").context("missing root value `local/btc-addr`")
-}
-
-fn rgb_issue_account_id() -> Result<String> {
-    current_ln_node()
-        .map(|node| node.account_id().to_string())
-        .filter(|account_id| !account_id.trim().is_empty())
-        .or_else(|| local_string("rgb-issue-account"))
-        .map(Ok)
-        .unwrap_or_else(default_account_id)
 }
 
 fn signer_node_id() -> Result<String> {

@@ -35,11 +35,12 @@ use lightning::ln::types::ChannelId as LnRgbChannelId;
 use lightning::onion_message::messenger::DefaultMessageRouter;
 use lightning::rgb::{
     init_rgb_ln_tx_composer, AssetSpendAuthorization, AssetSpendPurpose, BalanceRequest,
-    BalanceScope, ListAssetsRequest, ListAssetsResponse, LnChannelFundingRefRequest,
-    LnChannelOpenPrepareRequest, LnPaymentClaimRequest, RequestSignature,
-    RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext, RgbDaemonLnTxComposer,
-    RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer, RgbLnTxComposer,
-    RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner, SignatureScheme,
+    BalanceScope, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
+    LnChannelFundingRefRequest, LnChannelOpenPrepareRequest, LnPaymentClaimRequest,
+    RequestSignature, RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext,
+    RgbDaemonLnTxComposer, RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer,
+    RgbLnTxComposer, RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner,
+    SignatureScheme, TrackedUtxo,
 };
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::router::{
@@ -711,6 +712,36 @@ impl LnRgbBtcLnBackend {
         client
             .list_assets(ListAssetsRequest {
                 account_id: self.config.account_id.clone(),
+            })
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    pub fn issue_rgb_asset(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        supply: u64,
+        allocation_outpoint: String,
+        utxos: Vec<TrackedUtxo>,
+    ) -> Result<IssueAssetResponse> {
+        let client = RgbServiceClient::new(
+            self.config.rgb_service_url.clone(),
+            Arc::new(BackendRgbServiceSigner {
+                node_id: self.node_id,
+                node_secret: self.node_secret,
+            }),
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        client
+            .issue_asset(IssueAssetRequest {
+                account_id: self.config.account_id.clone(),
+                ticker,
+                name,
+                precision,
+                supply,
+                allocation_outpoint,
+                utxos,
             })
             .map_err(|err| anyhow!("{err}"))
     }
