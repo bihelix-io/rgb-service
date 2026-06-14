@@ -1702,7 +1702,7 @@ extern "C" fn rgb_issue(
         let name = name.as_str().to_string();
         let allocation_outpoint = allocation_outpoint.as_str().trim().to_string();
         spawn_rgb_callback_worker("issue", callback, move || {
-            let account_id = default_account_id()?;
+            let account_id = rgb_issue_account_id()?;
             let utxos = scan_utxos_json(&account_id, &btc_esplora_url())?;
             let utxo_items = utxos.as_array().cloned().unwrap_or_default();
             let selected_outpoint = if allocation_outpoint.is_empty() {
@@ -1729,6 +1729,7 @@ extern "C" fn rgb_issue(
                 "allocation_outpoint {selected_outpoint} is not in RGB issue account {account_id} UTXOs"
             );
             let payload = json!({
+                "account_id": account_id,
                 "ticker": ticker,
                 "name": name,
                 "precision": precision,
@@ -3720,6 +3721,15 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
 
 pub(crate) fn default_account_id() -> Result<String> {
     local_string("btc-addr").context("missing root value `local/btc-addr`")
+}
+
+fn rgb_issue_account_id() -> Result<String> {
+    current_ln_node()
+        .map(|node| node.account_id().to_string())
+        .filter(|account_id| !account_id.trim().is_empty())
+        .or_else(|| local_string("rgb-issue-account"))
+        .map(Ok)
+        .unwrap_or_else(default_account_id)
 }
 
 fn signer_node_id() -> Result<String> {
