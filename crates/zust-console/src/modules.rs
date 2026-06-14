@@ -2949,7 +2949,7 @@ fn ln_node_slot() -> &'static Mutex<Option<Arc<LnRgbBtcLnBackend>>> {
     LN_RGB_NODE.get_or_init(|| Mutex::new(None))
 }
 
-fn current_ln_node() -> Option<Arc<LnRgbBtcLnBackend>> {
+pub fn current_ln_node() -> Option<Arc<LnRgbBtcLnBackend>> {
     ln_node_slot()
         .lock()
         .expect("LN node slot lock poisoned")
