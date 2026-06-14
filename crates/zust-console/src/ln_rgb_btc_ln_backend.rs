@@ -40,7 +40,6 @@ use lightning::rgb::{
     RgbAssetAmount as LdkRgbAssetAmount, RgbBalance, RgbChannelContext, RgbDaemonLnTxComposer,
     RgbFundingRef, RgbFundingTransfer as LdkRgbFundingTransfer, RgbLnTxComposer,
     RgbPaymentMetadata, RgbServiceClient, RgbServiceClientError, RgbServiceSigner, SignatureScheme,
-    TrackedUtxo,
 };
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::router::{
@@ -700,7 +699,7 @@ impl LnRgbBtcLnBackend {
         &self.config.account_id
     }
 
-    pub fn list_rgb_assets(&self, tracked_utxos: Vec<TrackedUtxo>) -> Result<ListAssetsResponse> {
+    pub fn list_rgb_assets(&self) -> Result<ListAssetsResponse> {
         let client = RgbServiceClient::new(
             self.config.rgb_service_url.clone(),
             Arc::new(BackendRgbServiceSigner {
@@ -712,16 +711,11 @@ impl LnRgbBtcLnBackend {
         client
             .list_assets(ListAssetsRequest {
                 account_id: self.config.account_id.clone(),
-                tracked_utxos,
             })
             .map_err(|err| anyhow!("{err}"))
     }
 
-    pub fn rgb_balance(
-        &self,
-        asset_id: String,
-        tracked_utxos: Vec<TrackedUtxo>,
-    ) -> Result<RgbBalance> {
+    pub fn rgb_balance(&self, asset_id: String) -> Result<RgbBalance> {
         let client = RgbServiceClient::new(
             self.config.rgb_service_url.clone(),
             Arc::new(BackendRgbServiceSigner {
@@ -735,7 +729,6 @@ impl LnRgbBtcLnBackend {
                 account_id: self.config.account_id.clone(),
                 asset_id,
                 scope: BalanceScope::All,
-                tracked_utxos,
             })
             .map_err(|err| anyhow!("{err}"))
     }

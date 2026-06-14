@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     fs::OpenOptions,
     io::Write,
@@ -615,11 +615,58 @@ impl LocalDaemonService {
         Ok(summary)
     }
 
-    fn tracked_utxos(
+    fn validate_tracked_utxo(utxo: TrackedUtxo) -> rgb_service_api::Result<TrackedUtxo> {
+        OutPoint::from_str(&utxo.outpoint)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        Ok(utxo)
+    }
+
+    fn account_utxo_key(account_id: &str, outpoint: &str) -> String {
+        format!("{account_id}:{outpoint}")
+    }
+
+    fn put_account_utxo(&self, account_id: &str, utxo: TrackedUtxo) -> rgb_service_api::Result<()> {
+        let utxo = Self::validate_tracked_utxo(utxo)?;
+        let keyspace = self
+            .db
+            .keyspace("account_utxos", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = Self::account_utxo_key(account_id, &utxo.outpoint);
+        let bytes =
+            serde_json::to_vec(&utxo).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn list_account_utxos(&self, account_id: &str) -> rgb_service_api::Result<Vec<TrackedUtxo>> {
+        let keyspace = self
+            .db
+            .keyspace("account_utxos", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let prefix = format!("{account_id}:");
+        let mut utxos = Vec::new();
+        for item in keyspace.as_ref().prefix(prefix.as_bytes()) {
+            let value = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            utxos.push(
+                serde_json::from_slice(value.as_ref())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))?,
+            );
+        }
+        Ok(utxos)
+    }
+
+    fn account_rgb20_utxos(
         &self,
-        tracked: Vec<TrackedUtxo>,
+        account_id: &str,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
-        tracked
+        self.list_account_utxos(account_id)?
             .into_iter()
             .map(|utxo| {
                 Ok(Rgb20TrackedUtxo {
@@ -630,6 +677,41 @@ impl LocalDaemonService {
                 })
             })
             .collect()
+    }
+
+    fn remove_account_utxos(
+        &self,
+        account_id: &str,
+        outpoints: BTreeSet<String>,
+    ) -> rgb_service_api::Result<()> {
+        if outpoints.is_empty() {
+            return Ok(());
+        }
+        let keyspace = self
+            .db
+            .keyspace("account_utxos", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        for outpoint in outpoints {
+            let key = Self::account_utxo_key(account_id, &outpoint);
+            tx.remove(&keyspace, key.as_bytes());
+        }
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn issue_utxo(allocation_outpoint: String, mut utxos: Vec<TrackedUtxo>) -> TrackedUtxo {
+        utxos
+            .drain(..)
+            .find(|utxo| utxo.outpoint == allocation_outpoint)
+            .unwrap_or(TrackedUtxo {
+                outpoint: allocation_outpoint,
+                address: None,
+                confirmed: true,
+            })
     }
 
     fn prepared_key(account_id: &str, transfer_id: &str) -> String {
@@ -1220,6 +1302,7 @@ impl RgbServiceApi for LocalDaemonService {
         let account_id = payload.account_id.clone();
         let ticker = payload.ticker.clone();
         let allocation_outpoint = payload.allocation_outpoint.clone();
+        let issued_utxo = Self::issue_utxo(allocation_outpoint.clone(), payload.utxos.clone());
         self.charge_rna(&account_id, route, purpose, amount)?;
         let result = (|| {
             let stock_dir = self.account_stock_dir(&account_id);
@@ -1238,6 +1321,7 @@ impl RgbServiceApi for LocalDaemonService {
                 },
             )
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            self.put_account_utxo(&account_id, issued_utxo)?;
             Ok(IssueAssetResponse {
                 contract_id: issued.contract_id.to_string(),
                 asset_id: issued.contract_id.to_string(),
@@ -1267,26 +1351,54 @@ impl RgbServiceApi for LocalDaemonService {
             self.rna.query_fee,
         )?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let allocations =
-            list_rgb20_assets_for_utxos(&stock_dir, self.tracked_utxos(req.payload.tracked_utxos)?)
-                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
+        let known_outpoints = account_utxos
+            .iter()
+            .map(|utxo| utxo.outpoint.to_string())
+            .collect::<BTreeSet<_>>();
+        let allocations = list_rgb20_assets_for_utxos(&stock_dir, account_utxos)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let mut assets = Vec::<RgbAssetInfo>::new();
+        let mut rgb_outpoints = BTreeSet::new();
+        let mut utxo_assets = BTreeMap::<String, Vec<RgbAllocation>>::new();
         for allocation in allocations {
+            let outpoint = allocation.outpoint.to_string();
+            rgb_outpoints.insert(outpoint.clone());
             if assets
                 .iter()
                 .any(|asset| asset.contract_id == allocation.contract_id.to_string())
             {
-                continue;
+            } else {
+                assets.push(RgbAssetInfo {
+                    asset_id: allocation.contract_id.to_string(),
+                    contract_id: allocation.contract_id.to_string(),
+                    ticker: allocation.ticker.clone(),
+                    name: allocation.name.clone(),
+                    precision: allocation.precision,
+                });
             }
-            assets.push(RgbAssetInfo {
-                asset_id: allocation.contract_id.to_string(),
-                contract_id: allocation.contract_id.to_string(),
-                ticker: allocation.ticker,
-                name: allocation.name,
-                precision: allocation.precision,
-            });
+            utxo_assets
+                .entry(outpoint.clone())
+                .or_default()
+                .push(RgbAllocation {
+                    asset_id: allocation.contract_id.to_string(),
+                    outpoint,
+                    amount: allocation.amount_raw,
+                    layer: AssetLayer::L1,
+                    status: AllocationStatus::Available,
+                });
         }
-        Ok(ListAssetsResponse { assets })
+        self.remove_account_utxos(
+            &req.payload.account_id,
+            known_outpoints
+                .difference(&rgb_outpoints)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )?;
+        Ok(ListAssetsResponse {
+            assets,
+            utxo_assets,
+        })
     }
 
     async fn token_list(&self) -> rgb_service_api::Result<TokenListResponse> {
@@ -1331,7 +1443,6 @@ impl RgbServiceApi for LocalDaemonService {
                 payload: BalanceBreakdownRequest {
                     account_id: req.payload.account_id,
                     asset_id: req.payload.asset_id,
-                    tracked_utxos: req.payload.tracked_utxos,
                 },
             })
             .await?;
@@ -1343,9 +1454,13 @@ impl RgbServiceApi for LocalDaemonService {
         req: Authorized<BalanceBreakdownRequest>,
     ) -> rgb_service_api::Result<BalanceBreakdownResponse> {
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
-        let allocations =
-            list_rgb20_assets_for_utxos(&stock_dir, self.tracked_utxos(req.payload.tracked_utxos)?)
-                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
+        let known_outpoints = account_utxos
+            .iter()
+            .map(|utxo| utxo.outpoint.to_string())
+            .collect::<BTreeSet<_>>();
+        let allocations = list_rgb20_assets_for_utxos(&stock_dir, account_utxos)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         let mut summary = RgbBalance {
             asset_id: req.payload.asset_id.clone(),
             total: 0,
@@ -1360,23 +1475,40 @@ impl RgbServiceApi for LocalDaemonService {
             settling: 0,
         };
         let mut response_allocations = Vec::new();
+        let mut rgb_outpoints = BTreeSet::new();
+        let mut utxo_assets = BTreeMap::<String, Vec<RgbAllocation>>::new();
         for allocation in allocations {
+            let outpoint = allocation.outpoint.to_string();
+            rgb_outpoints.insert(outpoint.clone());
             if allocation.contract_id.to_string() != req.payload.asset_id {
                 continue;
             }
             summary.total += allocation.amount_raw;
             summary.l1_available += allocation.amount_raw;
-            response_allocations.push(RgbAllocation {
+            let response_allocation = RgbAllocation {
                 asset_id: req.payload.asset_id.clone(),
-                outpoint: allocation.outpoint.to_string(),
+                outpoint: outpoint.clone(),
                 amount: allocation.amount_raw,
                 layer: AssetLayer::L1,
                 status: AllocationStatus::Available,
-            });
+            };
+            response_allocations.push(response_allocation.clone());
+            utxo_assets
+                .entry(outpoint)
+                .or_default()
+                .push(response_allocation);
         }
+        self.remove_account_utxos(
+            &req.payload.account_id,
+            known_outpoints
+                .difference(&rgb_outpoints)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )?;
         Ok(BalanceBreakdownResponse {
             summary,
             allocations: response_allocations,
+            utxo_assets,
             pending_ops: Vec::new(),
         })
     }
@@ -1474,6 +1606,9 @@ impl RgbServiceApi for LocalDaemonService {
         let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
         stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let receiver_outpoint = format!("{}:{}", req.payload.txid, record.recipient_vout);
+        let receiver_utxo = Self::issue_utxo(receiver_outpoint, req.payload.utxos.clone());
+        self.put_account_utxo(&record.recipient_account_id, receiver_utxo)?;
         Ok(CommitTransferResponse {
             transfer_id: req.payload.transfer_id,
             operation_id: txid.to_string(),

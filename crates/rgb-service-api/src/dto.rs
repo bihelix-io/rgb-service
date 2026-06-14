@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AccountScoped, AssetSpendAuthorization, AssetSpendAuthorized};
@@ -37,6 +39,7 @@ pub struct IssueAssetRequest {
     pub precision: u8,
     pub supply: u64,
     pub allocation_outpoint: Outpoint,
+    pub utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,13 +52,12 @@ pub struct IssueAssetResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListAssetsRequest {
     pub account_id: AccountId,
-    #[serde(default)]
-    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListAssetsResponse {
     pub assets: Vec<RgbAssetInfo>,
+    pub utxo_assets: BTreeMap<Outpoint, Vec<RgbAllocation>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -88,8 +90,6 @@ pub struct BalanceRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
     pub scope: BalanceScope,
-    #[serde(default)]
-    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,14 +121,13 @@ pub struct RgbBalance {
 pub struct BalanceBreakdownRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
-    #[serde(default)]
-    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BalanceBreakdownResponse {
     pub summary: RgbBalance,
     pub allocations: Vec<RgbAllocation>,
+    pub utxo_assets: BTreeMap<Outpoint, Vec<RgbAllocation>>,
     pub pending_ops: Vec<PendingOperation>,
 }
 
@@ -193,6 +192,7 @@ pub struct CommitTransferRequest {
     pub transfer_id: TransferId,
     pub txid: Txid,
     pub signed_anchor_psbt: Option<String>,
+    pub utxos: Vec<TrackedUtxo>,
     pub asset_authorization: AssetSpendAuthorization,
 }
 

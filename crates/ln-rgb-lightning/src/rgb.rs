@@ -14,6 +14,7 @@
 #![allow(missing_docs)]
 
 use alloc::sync::Arc;
+use std::collections::BTreeMap;
 use std::io::Read as IoRead;
 use std::net::TcpStream;
 use std::sync::OnceLock;
@@ -711,6 +712,7 @@ pub struct IssueAssetRequest {
     pub precision: u8,
     pub supply: u64,
     pub allocation_outpoint: OutpointString,
+    pub utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -723,13 +725,12 @@ pub struct IssueAssetResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListAssetsRequest {
     pub account_id: AccountId,
-    #[serde(default)]
-    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListAssetsResponse {
     pub assets: Vec<RgbAssetInfo>,
+    pub utxo_assets: BTreeMap<OutpointString, Vec<RgbAllocation>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -762,8 +763,6 @@ pub struct BalanceRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
     pub scope: BalanceScope,
-    #[serde(default)]
-    pub tracked_utxos: Vec<TrackedUtxo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -799,6 +798,33 @@ pub struct TrackedUtxo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RgbAllocation {
+    pub asset_id: AssetId,
+    pub outpoint: OutpointString,
+    pub amount: u64,
+    pub layer: AssetLayer,
+    pub status: AllocationStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetLayer {
+    L1,
+    L2,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationStatus {
+    Available,
+    Reserved,
+    PendingIn,
+    PendingOut,
+    Settling,
+    Locked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PrepareTransferRequest {
     pub account_id: AccountId,
     pub asset_id: AssetId,
@@ -824,6 +850,7 @@ pub struct CommitTransferRequest {
     pub transfer_id: TransferId,
     pub txid: TxidString,
     pub signed_anchor_psbt: Option<String>,
+    pub utxos: Vec<TrackedUtxo>,
     pub asset_authorization: AssetSpendAuthorization,
 }
 
