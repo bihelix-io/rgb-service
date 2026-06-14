@@ -3512,15 +3512,19 @@ fn btc_assets_json(ident: &str) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let payload = json!({
+    if let Some(node) = current_ln_node() {
+        if ident.trim().is_empty() || address == node.account_id() {
+            return Ok(serde_json::to_value(node.list_rgb_assets()?)?);
+        }
+    }
+    Ok(json!({
+        "assets": [],
+        "utxo_assets": {},
         "account_id": address,
         "ident": ident,
-        "account": account
-    });
-    Ok(dynamic_to_json(&rgb_post_dynamic(
-        &json_to_dynamic(&payload),
-        "/v1/assets/list",
-    )?))
+        "account": account,
+        "source": "rgb_assets_unavailable_without_ln_hot_wallet"
+    }))
 }
 
 fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
