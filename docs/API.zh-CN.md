@@ -2,6 +2,12 @@
 
 本文档描述 `rgb-service-daemon` 当前公开给客户端的 HTTP API 边界。
 
+L1/L2 转账流程手册见 [TRANSFER.zh-CN.md](TRANSFER.zh-CN.md)。
+
+当前 L1 direct send 和 L2/LN RGB 状态默认只支持同一个
+`rgb-service-daemon` 内部的 account/channel；扩展到多个 daemon 时，主要增加
+consignment transport、receiver-side staging 和跨 daemon auth/幂等处理。
+
 ## 服务边界
 
 RGB Service 负责托管服务端 RGB 状态：

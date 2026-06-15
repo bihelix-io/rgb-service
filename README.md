@@ -6,6 +6,7 @@ This repository contains the RGB contract and asset libraries extracted from
 `btc-local-wallet`. It intentionally excludes Lightning Network node code.
 
 中文 API 说明见 [docs/API.zh-CN.md](docs/API.zh-CN.md)。
+L1/L2 转账流程手册见 [docs/TRANSFER.zh-CN.md](docs/TRANSFER.zh-CN.md)。
 
 ## Crates
 
@@ -625,8 +626,11 @@ For an L1 transfer, the external wallet remains responsible for BTC ownership:
 4. Wallet signs and broadcasts the returned PSBT.
 5. Wallet calls /v1/transfers/commit with transfer_id + txid.
 6. RGB Service builds the consignment and stages it directly for the recipient account.
-7. RGB Service marks the RGB operation pending and later /v1/recover promotes it.
+7. The daemon background scanner promotes staged RGB stock when chain conditions are met.
 ```
 
 The external caller never receives raw fascia in this public flow. Consignment
-is delivered internally by `/v1/transfers/commit`.
+is delivered internally by `/v1/transfers/commit`. The current direct-send flow
+is for accounts on the same `rgb-service-daemon`; extending it to multiple
+daemons mainly requires a remote consignment transport and receiver-side staging
+API.
