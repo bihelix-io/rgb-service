@@ -225,6 +225,8 @@ rgb::scan_utxos("bc1...")
 
 ## RGB-aware LN 路由
 
+这组接口由 `rgb-service-daemon` 直接提供，是 daemon 公开 HTTP API 的一部分，不是 zust-console 本地能力。它们用于 `ln-rgb-lightning` 这类上层 LN/RGB 状态机，把 RGB 状态绑定到 LN channel funding、commitment、closing、claim 和 payment claim 流程。
+
 ```text
 POST /v1/ln/channels/open/prepare
 POST /v1/ln/channels/funding-ref
@@ -235,7 +237,406 @@ POST /v1/ln/payments/claim
 POST /v1/ln/recover
 ```
 
-这些接口是 `ln-rgb-lightning` 使用的 service-owned state transition API。它们需要 signed request，涉及移动或锁定 RGB value 的路径还需要 `asset_authorization`。
+所有 LN 路由都需要 `SignedRequest<T>`。其中会移动或锁定 RGB value 的接口还需要 `asset_authorization`：
+
+- `/v1/ln/channels/open/prepare`
+- `/v1/ln/commitments/compose`
+- `/v1/ln/closing/compose`
+
+以下接口不额外要求 `asset_authorization`；它们要么查询/恢复 daemon 已有状态，要么基于 daemon 已保存的 RGB assignment 继续 compose：
+
+- `/v1/ln/channels/funding-ref`
+- `/v1/ln/onchain-claims/compose`
+- `/v1/ln/payments/claim`
+- `/v1/ln/recover`
+
+daemon 会把 LN 相关状态写入本地 KV：
+
+- `ln_channels`：channel funding 和 opening RGB state
+- `ln_composes`：commitment/closing/claim compose 结果
+- `ln_payments`：payment claim 记录
+
+LN `asset_authorization` 当前强校验：
+
+- `asset_id` 必须等于请求里的 `contract_id`
+- `amount` 必须等于本次 LN/RGB 状态转换的 RGB 总量
+- channel open 的总量是 `funding_rgb`
+- commitment/closing compose 的总量是 `to_local_rgb + to_remote_rgb + htlcs.amount_rgb...`
+
+### `POST /v1/ln/channels/open/prepare`
+
+用途：
+
+- 为 RGB-aware LN channel open 准备 funding anchor PSBT
+- 检查 `funding_rgb == to_local_rgb + to_remote_rgb`
+- 要求 funding PSBT 包含 OP_RETURN carrier output
+- 将 `funding_rgb` 绑定到 `funding_vout`
+- 保存 channel funding 记录，返回 `funding_ref`
+
+权限 purpose：
+
+```text
+ln_channel_open_prepare
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "contract_id": "rgb:...",
+  "unsigned_anchor_psbt": "hex-psbt",
+  "change_vout": 1,
+  "funding_vout": 0,
+  "funding_rgb": 1000,
+  "to_local_rgb": 600,
+  "to_remote_rgb": 400,
+  "asset_authorization": {
+    "asset_id": "rgb:...",
+    "amount": 1000,
+    "purpose": "channel_deposit",
+    "recipient": "channel-id",
+    "anchor_psbt": "hex-psbt",
+    "expires_at_ms": 1760000300000,
+    "signature": {}
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "funding_ref": {
+    "transfer_id": "ln-open:nonce-or-operation-id",
+    "operation_id": "nonce-or-operation-id",
+    "channel_id": "channel-id"
+  },
+  "operation_id": "nonce-or-operation-id",
+  "funding_outpoint": "txid:0",
+  "anchor_psbt": "hex-psbt"
+}
+```
+
+### `POST /v1/ln/channels/funding-ref`
+
+用途：
+
+- 根据 `channel_id` 查询 daemon 已保存的 RGB funding reference
+- 给后续 commitment/closing compose 传入 `funding_ref`
+
+权限 purpose：
+
+```text
+ln_channel_funding_ref
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id"
+}
+```
+
+响应：
+
+```json
+{
+  "funding_ref": {
+    "transfer_id": "ln-open:...",
+    "operation_id": "...",
+    "channel_id": "channel-id"
+  }
+}
+```
+
+没有记录时：
+
+```json
+{
+  "funding_ref": null
+}
+```
+
+### `POST /v1/ln/commitments/compose`
+
+用途：
+
+- 为 LN commitment transaction 组合 RGB transition
+- 把 RGB amount 分配到本地输出、远端输出和 HTLC 输出
+- 返回带 RGB state 的 transaction hex 和 `rgb_state_ref`
+- 保存 compose 记录，供 on-chain claim 和 recover 使用
+
+权限 purpose：
+
+```text
+ln_commitment_compose
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "funding_ref": {
+    "transfer_id": "ln-open:...",
+    "operation_id": "...",
+    "channel_id": "channel-id"
+  },
+  "unsigned_tx_hex": "bitcoin-tx-hex",
+  "funding_outpoint": "funding-txid:vout",
+  "contract_id": "rgb:...",
+  "to_local_rgb": 600,
+  "to_local_vout": 0,
+  "to_remote_rgb": 300,
+  "to_remote_vout": 1,
+  "htlcs": [
+    {
+      "vout": 2,
+      "amount_rgb": 100
+    }
+  ],
+  "change_vout": 3,
+  "asset_authorization": {
+    "asset_id": "rgb:...",
+    "amount": 1000,
+    "purpose": "channel_deposit",
+    "recipient": "channel-id",
+    "anchor_psbt": "bitcoin-tx-hex",
+    "expires_at_ms": 1760000300000,
+    "signature": {}
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "operation_id": "nonce-or-operation-id",
+  "tx_hex": "bitcoin-tx-hex",
+  "rgb_state_ref": "ln:channel-id:operation-id"
+}
+```
+
+说明：
+
+- `to_local_rgb > 0` 时必须提供 `to_local_vout`。
+- `to_remote_rgb > 0` 时必须提供 `to_remote_vout`。
+- `htlcs` 为空数组表示没有 RGB HTLC output。
+
+### `POST /v1/ln/closing/compose`
+
+用途：
+
+- 为 LN cooperative/force closing transaction 组合 RGB transition
+- 把 channel 内 RGB amount 分配到 closing transaction 的本地/远端输出
+- 保存 compose 记录，供 recover 使用
+
+权限 purpose：
+
+```text
+ln_closing_compose
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "funding_ref": {
+    "transfer_id": "ln-open:...",
+    "operation_id": "...",
+    "channel_id": "channel-id"
+  },
+  "unsigned_tx_hex": "bitcoin-tx-hex",
+  "funding_outpoint": "funding-txid:vout",
+  "contract_id": "rgb:...",
+  "to_local_rgb": 600,
+  "to_local_vout": 0,
+  "to_remote_rgb": 400,
+  "to_remote_vout": 1,
+  "change_vout": 2,
+  "asset_authorization": {
+    "asset_id": "rgb:...",
+    "amount": 1000,
+    "purpose": "channel_withdraw",
+    "recipient": "bc1...",
+    "anchor_psbt": "bitcoin-tx-hex",
+    "expires_at_ms": 1760000300000,
+    "signature": {}
+  }
+}
+```
+
+响应同 commitment compose：
+
+```json
+{
+  "operation_id": "nonce-or-operation-id",
+  "tx_hex": "bitcoin-tx-hex",
+  "rgb_state_ref": "ln:channel-id:operation-id"
+}
+```
+
+### `POST /v1/ln/onchain-claims/compose`
+
+用途：
+
+- 为 commitment output 或 HTLC output 的 on-chain claim transaction 组合 RGB transition
+- daemon 会根据 `commitment_txid + vout` 在已保存 compose 记录中找原 RGB output assignment
+- 找到后，把该 RGB amount 转移到 claim transaction 的唯一输出 `vout = 0`
+- 找不到 assignment 时原样返回 unsigned tx，并且 `rgb_state_ref = null`
+
+权限 purpose：
+
+```text
+ln_onchain_claim_compose
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "commitment_txid": "commitment-txid",
+  "vout": 2,
+  "unsigned_tx_hex": "claim-tx-hex"
+}
+```
+
+响应：
+
+```json
+{
+  "operation_id": "ln-claim:commitment-txid:2:claim-txid",
+  "tx_hex": "claim-tx-hex",
+  "rgb_state_ref": "ln:channel-id:ln-claim:..."
+}
+```
+
+说明：如果找到了 RGB assignment，claim transaction 必须只有一个输出；daemon 会把 RGB amount 放到该输出。
+
+### `POST /v1/ln/payments/claim`
+
+用途：
+
+- 记录 LN payment 对应的 RGB claim 状态
+- 以 `payment_hash` 生成 operation id
+- 当前实现会把该 payment 标记为 `settled`
+
+权限 purpose：
+
+```text
+ln_payment_claim
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "payment_hash": "hex-payment-hash",
+  "contract_id": "rgb:...",
+  "amount_msat": 100000,
+  "rgb_amount": 100
+}
+```
+
+响应：
+
+```json
+{
+  "operation_id": "ln-payment:hex-payment-hash",
+  "status": "settled",
+  "rgb_state_ref": "ln:channel-id:ln-payment:hex-payment-hash"
+}
+```
+
+`channel_id` 可以为 `null`；这种情况下 `rgb_state_ref` 也会是 `null`。
+
+### `POST /v1/ln/recover`
+
+用途：
+
+- 从 daemon 本地 KV 读取 LN channel、compose 记录
+- 返回某个 account 下全部 channel 的 LN/RGB 状态
+- 如果传 `channel_id`，只返回该 channel 的状态
+- 给 LN/RGB 上层服务恢复内存状态用
+
+权限 purpose：
+
+```text
+ln_recover
+```
+
+请求 payload：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id"
+}
+```
+
+恢复 account 下全部 channel：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": null
+}
+```
+
+响应：
+
+```json
+{
+  "account_id": "bc1...",
+  "channel_id": "channel-id",
+  "channels": [
+    {
+      "channel_id": "channel-id",
+      "contract_id": "rgb:...",
+      "funding_outpoint": "funding-txid:vout",
+      "funding_rgb": 1000,
+      "to_local_rgb": 600,
+      "to_remote_rgb": 400,
+      "funding_ref": {
+        "transfer_id": "ln-open:...",
+        "operation_id": "...",
+        "channel_id": "channel-id"
+      },
+      "created_at_ms": 1760000000000
+    }
+  ],
+  "composes": [
+    {
+      "channel_id": "channel-id",
+      "operation_id": "...",
+      "route": "/v1/ln/commitments/compose",
+      "contract_id": "rgb:...",
+      "txid": "txid",
+      "tx_hex": "bitcoin-tx-hex",
+      "rgb_state_ref": "ln:channel-id:operation-id",
+      "fascia_len": 1234,
+      "funding_ref": {
+        "transfer_id": "ln-open:...",
+        "operation_id": "...",
+        "channel_id": "channel-id"
+      },
+      "created_at_ms": 1760000000000
+    }
+  ]
+}
+```
 
 普通 L1 的 `/v1/recover` 已经移除；`/v1/ln/recover` 只用于 LN/RGB 服务状态恢复，不是给客户端推进普通 L1 pending stock 的入口。
 

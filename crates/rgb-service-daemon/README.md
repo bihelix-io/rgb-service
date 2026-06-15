@@ -183,6 +183,9 @@ INFO rna new_profile_grant=10000 issue_fee=1000 transfer_fee=100 query_fee=1
 
 ## Public HTTP API
 
+中文 API 说明和 LN route 字段示例见仓库根目录
+`docs/API.zh-CN.md`。
+
 Current public daemon routes:
 
 ```text
