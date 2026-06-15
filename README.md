@@ -5,6 +5,8 @@ BiHelix RGB service workspace.
 This repository contains the RGB contract and asset libraries extracted from
 `btc-local-wallet`. It intentionally excludes Lightning Network node code.
 
+中文 API 说明见 [docs/API.zh-CN.md](docs/API.zh-CN.md)。
+
 ## Crates
 
 - `rgb-aluvm`
@@ -30,7 +32,7 @@ Internal RGB workspace crates are kept where required:
 - asset and contract management
 - balance and allocation queries
 - transfer prepare/commit/cancel
-- pending operation and recovery workflows
+- service-owned pending staging and background promotion
 - admin-triggered RGB test workflows
 
 HTTP support is available behind the `axum` feature. Mutating endpoints accept
@@ -95,13 +97,14 @@ Accounts are API/KV concepts, not static config sections. Requests carry
 
 当前 daemon 公开的 HTTP API 只面向 RGB 合约和资产服务。外部钱包仍然负责
 BTC UTXO 选择、BTC 私钥签名、PSBT 最终签名和交易广播。RGB Service 负责
-托管 RGB stock、合约状态、资产分配、pending operation 和 recovery 状态。
+托管 RGB stock、合约状态、资产分配和 pending/recovery 状态推进。
+pending/recovery 是 daemon 内部状态机和后台 scanner 的职责，不作为客户端
+HTTP 能力暴露。
 
 Public daemon routes:
 
 ```text
-POST /v1/iroh-nodes/register
-POST /v1/iroh-nodes/lookup
+POST /v1/rna/balance
 POST /v1/assets/issue
 POST /v1/assets/list
 GET  /v1/tokens/list
@@ -110,8 +113,13 @@ POST /v1/balance/breakdown
 POST /v1/transfers/prepare
 POST /v1/transfers/commit
 POST /v1/transfers/cancel
-POST /v1/pending/list
-POST /v1/recover
+POST /v1/ln/channels/open/prepare
+POST /v1/ln/channels/funding-ref
+POST /v1/ln/commitments/compose
+POST /v1/ln/closing/compose
+POST /v1/ln/onchain-claims/compose
+POST /v1/ln/payments/claim
+POST /v1/ln/recover
 POST /v1/test/rgb
 ```
 
@@ -195,78 +203,6 @@ channel_withdraw
 
 ## Route Details
 
-### `POST /v1/iroh-nodes/register`
-
-用途：注册 BTC 地址到 iroh node 的绑定，用于后续通过 BTC 地址找到接收方 iroh 节点。
-
-权限：`register_iroh_node`
-
-请求 payload：
-
-```json
-{
-  "account_id": "alice",
-  "btc_address": "bcrt1...",
-  "iroh_node_id": "iroh-node-id",
-  "label": "alice mobile signer"
-}
-```
-
-响应：
-
-```json
-{
-  "binding": {
-    "account_id": "alice",
-    "btc_address": "bcrt1...",
-    "iroh_node_id": "iroh-node-id",
-    "label": "alice mobile signer",
-    "updated_at_ms": 1760000000000
-  }
-}
-```
-
-说明：BTC 地址是目录 key。注册必须签名，避免第三方替地址写入错误 node_id。
-
-### `POST /v1/iroh-nodes/lookup`
-
-用途：调用方用自己的 `account_id + 签名` 进行访问控制，然后根据任意 BTC 地址查询已注册的 iroh node_id。
-
-权限：`lookup_iroh_node`
-
-说明：`account_id` 是查询调用方身份，不要求等于被查询地址的 owner。这样可以查别人的地址，同时要求签名以降低公开目录被滥用和 DoS 的风险。
-
-请求 payload：
-
-```json
-{
-  "account_id": "caller-account",
-  "btc_address": "bcrt1..."
-}
-```
-
-响应：
-
-```json
-{
-  "binding": {
-    "account_id": "alice",
-    "btc_address": "bcrt1...",
-    "iroh_node_id": "iroh-node-id",
-    "label": "alice mobile signer",
-    "updated_at_ms": 1760000000000
-  }
-}
-```
-
-如果没有绑定：
-
-```json
-{
-  "binding": null
-}
-```
-
 ### `POST /v1/assets/issue`
 
 用途：发行 RGB20 资产，并把初始供应量分配到指定 Bitcoin outpoint。
@@ -282,7 +218,14 @@ channel_withdraw
   "name": "Alice USD Asset",
   "precision": 2,
   "supply": 1000000,
-  "allocation_outpoint": "txid:vout"
+  "allocation_outpoint": "txid:vout",
+  "utxos": [
+    {
+      "outpoint": "txid:vout",
+      "address": "bc1...",
+      "confirmed": true
+    }
+  ]
 }
 ```
 
@@ -308,14 +251,7 @@ channel_withdraw
 
 ```json
 {
-  "account_id": "alice",
-  "tracked_utxos": [
-    {
-      "outpoint": "txid:vout",
-      "address": "bcrt1...",
-      "confirmed": true
-    }
-  ]
+  "account_id": "alice"
 }
 ```
 
@@ -331,11 +267,23 @@ channel_withdraw
       "name": "Alice USD Asset",
       "precision": 2
     }
-  ]
+  ],
+  "utxo_assets": {
+    "txid:vout": [
+      {
+        "asset_id": "...",
+        "outpoint": "txid:vout",
+        "amount": 1000,
+        "layer": "l1",
+        "status": "available"
+      }
+    ]
+  }
 }
 ```
 
-说明：`tracked_utxos` 由外部钱包提供，用于限定或辅助查询钱包正在跟踪的 UTXO。
+说明：daemon 维护 account/address 下的 UTXO 集合。查询时会返回 `utxo_assets`，
+并自动移除没有 RGB 资产的 UTXO。
 
 ### `GET /v1/tokens/list`
 
@@ -381,8 +329,7 @@ channel_withdraw
 {
   "account_id": "alice",
   "asset_id": "...",
-  "scope": "all",
-  "tracked_utxos": []
+  "scope": "all"
 }
 ```
 
@@ -428,8 +375,7 @@ account
 ```json
 {
   "account_id": "alice",
-  "asset_id": "...",
-  "tracked_utxos": []
+  "asset_id": "..."
 }
 ```
 
@@ -459,6 +405,17 @@ account
       "status": "available"
     }
   ],
+  "utxo_assets": {
+    "txid:vout": [
+      {
+        "asset_id": "...",
+        "outpoint": "txid:vout",
+        "amount": 1000,
+        "layer": "l1",
+        "status": "available"
+      }
+    ]
+  },
   "pending_ops": []
 }
 ```
@@ -536,6 +493,13 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
   "transfer_id": "...",
   "txid": "bitcoin-txid",
   "signed_anchor_psbt": "...",
+  "utxos": [
+    {
+      "outpoint": "bitcoin-txid:0",
+      "address": "bc1...",
+      "confirmed": true
+    }
+  ],
   "asset_authorization": {
     "asset_id": "...",
     "amount": 1000,
@@ -596,85 +560,6 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
 
 说明：只能取消仍可安全回滚的状态。已经广播并进入链上确认流程的交易不能靠 API 静默撤销。
 
-### `POST /v1/pending/list`
-
-用途：列出 account 下还在 pending、settling、recovery required 等状态的 operation。
-
-权限：`manage_pending`
-
-请求 payload：
-
-```json
-{
-  "account_id": "alice"
-}
-```
-
-响应：
-
-```json
-{
-  "pending": [
-    {
-      "operation_id": "...",
-      "asset_id": "...",
-      "amount": 1000,
-      "status": "pending",
-      "layer": "l1",
-      "related_txid": "bitcoin-txid",
-      "related_l2_ref": null
-    }
-  ]
-}
-```
-
-`operation.status` 可选值：
-
-```text
-prepared
-reserved
-pending
-committed
-settled
-cancelled
-failed
-recovery_required
-```
-
-### `POST /v1/recover`
-
-用途：扫描并恢复 pending operation，把已经满足条件的 RGB 状态推进到 settled/committed，或者报告失败项。
-
-权限：`recover`
-
-请求 payload：
-
-```json
-{
-  "account_id": "alice",
-  "operation_id": null
-}
-```
-
-响应：
-
-```json
-{
-  "scanned": 1,
-  "recovered": 1,
-  "failed": 0,
-  "actions": [
-    {
-      "operation_id": "...",
-      "action": "promote_pending",
-      "message": "operation promoted"
-    }
-  ]
-}
-```
-
-说明：`operation_id` 为空表示扫描该 account 下所有 pending operation；非空表示只恢复指定 operation。
-
 ### `POST /v1/test/rgb`
 
 用途：触发服务端 RGB 集成测试路径，用于本地、CI 或受控测试环境验证完整 RGB20 生命周期。
@@ -720,7 +605,7 @@ recovery_required
 7. 钱包拿到 txid 后调用 POST /v1/transfers/commit。
 8. RGB Service 构造 consignment，并直接暂存到 `recipient` 对应的接收方 account。
 9. RGB Service 根据 transfer_id / txid 进入 pending/recovery 流程。
-10. 调用方或后台任务调用 POST /v1/recover 推进最终状态。
+10. daemon 后台 scanner 自动扫描 staged stock 并推进最终状态；客户端没有 recover API。
 ```
 
 这个流程里，BTC 私钥、BTC 签名和广播都在外部钱包；RGB 合约状态、资产分配、pending 状态

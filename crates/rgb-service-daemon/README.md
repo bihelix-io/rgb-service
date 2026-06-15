@@ -195,8 +195,18 @@ POST /v1/balance/breakdown      # Query allocations and pending detail, charges 
 POST /v1/transfers/prepare      # Prepare RGB transfer, charges transfer_fee
 POST /v1/transfers/commit       # Commit txid and stage consignment for recipient
 POST /v1/transfers/cancel       # Cancel unfinished transfer
+POST /v1/ln/channels/open/prepare # Prepare RGB-aware LN channel open
+POST /v1/ln/channels/funding-ref  # Register/query LN funding reference
+POST /v1/ln/commitments/compose   # Compose RGB-aware LN commitment transition
+POST /v1/ln/closing/compose       # Compose RGB-aware LN closing transition
+POST /v1/ln/onchain-claims/compose # Compose RGB-aware LN on-chain claim
+POST /v1/ln/payments/claim        # Claim RGB-aware LN payment state
+POST /v1/ln/recover               # Recover RGB-aware LN service state
 POST /v1/test/rgb               # Controlled RGB lifecycle test route
 ```
+
+L1 pending/recovery is daemon-owned background work. The public HTTP API does
+not expose `/v1/pending/list` or `/v1/recover` to clients.
 
 
 LN compose routes are service-owned state-transition APIs for `ln-rgb-lightning`. They require both the outer request signature and `asset_authorization`. Until the daemon RGB-LN state machine is wired to `rgb-service-local`, these routes fail loudly with HTTP 501 instead of falling back to local LN RGB state.
@@ -225,7 +235,29 @@ Important fjall keyspaces:
 profiles                 # btc_addr profile, stored as Zust Dynamic MsgPack
 usage_logs               # internal RNA debit logs
 prepared_transfers       # pending prepared transfer state
+account_utxos            # daemon-maintained account UTXOs used for RGB allocation lookup
 ```
+
+## RGB UTXO ownership
+
+RGB assets are bound to BTC UTXOs. The daemon maintains each account's known
+RGB-relevant UTXOs in `account_utxos`.
+
+The public HTTP API does not provide an ops/admin UTXO registration endpoint,
+and asset/balance queries do not scan Esplora as a fallback. Issue and transfer
+commit requests add the involved UTXOs to daemon state; queries remove known
+UTXOs that no longer carry RGB allocations.
+
+For historical backfill or operational recovery, run the console over SSH and
+scan explicitly:
+
+```zust
+rgb::scan_utxos("bc1...")
+```
+
+That console function scans the address UTXOs and records them directly into the
+daemon local `account_utxos` state on the SSH host. It is not a public HTTP
+permission path.
 
 ## Deployment note
 

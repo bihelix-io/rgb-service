@@ -12,6 +12,7 @@ cargo run -p zust-console -- -e 'ln_rgb::status()'
 
 ```zs
 root::add("local/rgb-service", "http://3.1.207.115:8091");
+root::add("local/rgb-service-data", "/home/ubuntu/rgb-service-data");
 root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 root::add("local/signer-node", "417c33530ab6097e5e2538ffd16e833ee4337318015f201452a540c49adb4158");
 root::add("local/signer-request", {
@@ -23,6 +24,8 @@ root::add("local/signer-request", {
 
 `local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/signer-node` 是 signer App
 的 iroh node id。`local/rgb-service` 是 RGB daemon 的 HTTP 地址。
+`local/rgb-service-data` 只给 SSH 运维 console 使用，指向 daemon 的
+`service.data_dir`，用于本地维护 daemon-owned 状态，不是公开 HTTP 权限入口。
 `local/signer-request` 控制 signer Iroh 请求重试；它只重试签名请求，不重试
 RGB daemon POST。
 
@@ -166,7 +169,7 @@ BTC 相关接口使用 `ident` 字符串选择地址：
 | `btc::balance(ident)` | 通过 Esplora 读取选中地址的余额和 UTXO。 |
 | `btc::status(ident)` | 返回选中 BTC 地址余额，并附带 `btc::assets(ident)` 结果。 |
 | `btc::utxos(ident)` | 通过 Esplora 列出选中地址的 UTXO。 |
-| `btc::assets(ident)` | 将选中地址的已跟踪 UTXO 发送到 RGB daemon `/v1/assets/list`。 |
+| `btc::assets(ident)` | 查询选中地址在 RGB daemon 中已维护的资产列表。 |
 | `btc::get_deposit_address(ident)` | 返回已有分配地址，或从本地 signer 派生地址池取一个地址。`""` 返回默认账户。 |
 | `btc::lookup_address_ident(address)` | 从本地记录反查已分配地址对应的 ident。 |
 | `btc::scan_deposits(ident)` | 通过 Esplora 扫描默认/ident 地址，并持久化入账记录。 |
@@ -207,6 +210,7 @@ callback 参数返回。需要签名的调用会在后台线程里按 `local/sig
 | `rgb::request(route, payload, callback)` | POST 任意 RGB daemon route，结果进 callback。 |
 | `rgb::issue(ticker, name, precision, supply, allocation_outpoint, callback)` | POST `/v1/assets/issue`，结果进 callback。 |
 | `rgb::assets(callback)` | 对默认账户 POST `/v1/assets/list`，结果进 callback。 |
+| `rgb::scan_utxos(addr)` | SSH 运维函数：通过 Esplora 扫描地址 UTXO，并直接写入 daemon 本地 `account_utxos`。不经过 HTTP 管理入口。 |
 | `rgb::token_list()` | GET `/v1/tokens/list`；公开 token/contract 列表。 |
 | `rgb::balance(asset_id, scope, callback)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`，结果进 callback。 |
 | `rgb::balance_breakdown(asset_id, callback)` | POST `/v1/balance/breakdown`，结果进 callback。 |
@@ -222,6 +226,7 @@ rgb::rna_balance(|result| {
   result
 })
 rgb::token_list()
+rgb::scan_utxos("bc1...")
 rgb::balance("...", "", |result| {
   root::add("local/rgb/balance", result);
   result
