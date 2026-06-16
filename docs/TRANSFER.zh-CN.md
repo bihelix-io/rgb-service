@@ -24,6 +24,15 @@
 
 ## 角色边界
 
+调用 daemon 的最小依赖很少：HTTP + JSON + signer 输出的签名。客户端不需要链接
+RGB crate，不需要本地 RGB stock，也不需要跑 zust-console。
+
+真正的额外依赖来自业务本身：
+
+- L1 转账业务需要外部 BTC 钱包能力，用来选 UTXO、构造/签名/广播 PSBT。
+- L2/LN 转账业务需要外部 LN node 能力，用来处理 peer、channel、HTLC、commitment 和 LN 签名协议。
+- signer 可以是 signer-app，也可以是能产出 daemon 接受的 ECDSA/legacy `bip322` envelope 的钱包组件。
+
 `rgb-service-daemon` 负责：
 
 - 保存 RGB stock、合约、allocation 和 consignment 状态

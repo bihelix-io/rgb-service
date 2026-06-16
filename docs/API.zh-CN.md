@@ -10,6 +10,21 @@ consignment transport、receiver-side staging 和跨 daemon auth/幂等处理。
 
 ## 服务边界
 
+调用 `rgb-service-daemon` 本身不需要依赖 Rust SDK、RGB 本地库、本地 RGB stock
+或 zust-console。普通客户端只需要：
+
+- 能发 HTTP request
+- 能编码/解析 JSON
+- 能拿到 signer 生成的 request signature
+- 在花费 RGB 资产时，能拿到 signer 生成的 `asset_authorization`
+
+不同业务场景会有自己的外部能力，但那不是调用 daemon 的 SDK 依赖：
+
+- 只查公开 catalog：只需要 HTTP GET。
+- 查余额、发行、转账：需要 signed request。
+- L1 转账：外部 BTC 钱包需要会选 UTXO、构造/签名/广播 PSBT。
+- L2/LN 转账：外部 LN node 需要会处理 peer、channel、HTLC、commitment 和签名协议。
+
 RGB Service 负责托管服务端 RGB 状态：
 
 - RGB stock、合约和资产状态
