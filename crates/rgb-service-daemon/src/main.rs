@@ -4,7 +4,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -46,13 +46,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal};
 
+mod legacy;
+
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
     service: ServiceConfig,
     rna: RnaConfig,
+    #[serde(default)]
+    legacy: LegacyConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ServiceConfig {
     bind: SocketAddr,
     network: String,
@@ -62,9 +66,32 @@ struct ServiceConfig {
     recovery_scan_interval_secs: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_legacy_allow_loopback")]
+    allow_loopback: bool,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+}
+
+impl Default for LegacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_loopback: default_legacy_allow_loopback(),
+            allowed_ips: Vec::new(),
+        }
+    }
+}
+
+fn default_legacy_allow_loopback() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RnaConfig {
-    new_profile_grant: u64,
     issue_fee: u64,
     transfer_fee: u64,
     query_fee: u64,
@@ -72,9 +99,6 @@ struct RnaConfig {
 
 impl RnaConfig {
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.new_profile_grant == 0 {
-            return Err("rna.new_profile_grant must be greater than zero".into());
-        }
         if self.issue_fee == 0 {
             return Err("rna.issue_fee must be greater than zero".into());
         }
@@ -104,17 +128,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let bind = config.service.bind;
+    let legacy_config = config.legacy.clone();
     let service = Arc::new(LocalDaemonService::new(config).await?);
     spawn_recovery_scanner(Arc::clone(&service));
     let auth = Arc::new(ConfiguredAuthVerifier);
-    let app = router(service, auth);
+    let mut app = router(service.clone(), auth);
+    if legacy_config.enabled {
+        service
+            .logger
+            .info("legacy wallet-service-v2 compatible routes enabled");
+        app = app.merge(legacy::router(service, legacy_config));
+    }
     let listener = TcpListener::bind(bind).await?;
 
-    serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = signal::ctrl_c().await;
-        })
-        .await?;
+    serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = signal::ctrl_c().await;
+    })
+    .await?;
 
     Ok(())
 }
@@ -414,6 +448,7 @@ struct LocalDaemonService {
     rna: RnaConfig,
     db: SingleWriterTxDatabase,
     logger: DaemonLogger,
+    pending_stock_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 #[derive(Default)]
@@ -534,17 +569,20 @@ impl LocalDaemonService {
         fs::create_dir_all(&kv_dir)?;
         let db = SingleWriterTxDatabase::builder(&kv_dir).open()?;
         logger.info(format!(
-            "rna new_profile_grant={} issue_fee={} transfer_fee={} query_fee={}",
-            config.rna.new_profile_grant,
-            config.rna.issue_fee,
-            config.rna.transfer_fee,
-            config.rna.query_fee
+            "rna issue_fee={} transfer_fee={} query_fee={}",
+            config.rna.issue_fee, config.rna.transfer_fee, config.rna.query_fee
+        ));
+        let pending_stock_dirs = Self::discover_pending_stock_dirs(&config.service.data_dir)?;
+        logger.info(format!(
+            "rgb pending scanner registered {} stock dirs at startup",
+            pending_stock_dirs.len()
         ));
         Ok(Self {
             config: config.service,
             rna: config.rna,
             db,
             logger,
+            pending_stock_dirs: Arc::new(Mutex::new(pending_stock_dirs)),
         })
     }
 
@@ -575,6 +613,93 @@ impl LocalDaemonService {
         Ok(dirs)
     }
 
+    fn pending_stock_root(stock_dir: &Path) -> PathBuf {
+        let stock_name = stock_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("stock");
+        stock_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{stock_name}_pending"))
+    }
+
+    fn pending_status_is_terminal(status_path: &Path) -> bool {
+        fs::read(status_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|status| matches!(status.as_str(), "confirmed" | "invalid"))
+    }
+
+    fn stock_has_active_pending(stock_dir: &Path) -> bool {
+        let pending_root = Self::pending_stock_root(stock_dir);
+        let Ok(entries) = fs::read_dir(pending_root) else {
+            return false;
+        };
+        entries.filter_map(|entry| entry.ok()).any(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .is_some_and(|file_type| file_type.is_dir())
+                && !Self::pending_status_is_terminal(&entry.path().join("pending-status.json"))
+        })
+    }
+
+    fn discover_pending_stock_dirs(data_dir: &Path) -> rgb_service_api::Result<BTreeSet<PathBuf>> {
+        let accounts_dir = data_dir.join("accounts");
+        if !accounts_dir.exists() {
+            return Ok(BTreeSet::new());
+        }
+        let entries = fs::read_dir(&accounts_dir)
+            .map_err(|err| RgbServiceError::Backend(format!("read accounts dir: {err}")))?;
+        let mut dirs = BTreeSet::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
+            let stock_dir = entry.path().join("rgb-stock");
+            if stock_dir.exists() && Self::stock_has_active_pending(&stock_dir) {
+                dirs.insert(stock_dir);
+            }
+        }
+        Ok(dirs)
+    }
+
+    fn pending_stock_dirs_snapshot(&self) -> rgb_service_api::Result<Vec<PathBuf>> {
+        self.pending_stock_dirs
+            .lock()
+            .map(|dirs| dirs.iter().cloned().collect())
+            .map_err(|err| RgbServiceError::Backend(format!("pending stock dirs lock: {err}")))
+    }
+
+    fn register_pending_stock_dir(&self, stock_dir: &Path) -> rgb_service_api::Result<()> {
+        let mut dirs = self
+            .pending_stock_dirs
+            .lock()
+            .map_err(|err| RgbServiceError::Backend(format!("pending stock dirs lock: {err}")))?;
+        if dirs.insert(stock_dir.to_path_buf()) {
+            self.logger.info(format!(
+                "rgb pending scanner registered stock_dir={}",
+                stock_dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn unregister_pending_stock_dir(&self, stock_dir: &Path) -> rgb_service_api::Result<()> {
+        let mut dirs = self
+            .pending_stock_dirs
+            .lock()
+            .map_err(|err| RgbServiceError::Backend(format!("pending stock dirs lock: {err}")))?;
+        dirs.remove(stock_dir);
+        Ok(())
+    }
+
     fn network(&self) -> rgb_service_api::Result<bitcoin::Network> {
         parse_network(&self.config.network)
     }
@@ -587,7 +712,7 @@ impl LocalDaemonService {
         let network = self.network()?;
         let esplora_urls = std::slice::from_ref(&self.config.esplora_url);
         let mut summary = RecoveryScanSummary::default();
-        for stock_dir in self.account_stock_dirs()? {
+        for stock_dir in self.pending_stock_dirs_snapshot()? {
             summary.accounts += 1;
             match scan_and_promote_confirmed_staged_rgb_stocks(&stock_dir, network, esplora_urls) {
                 Ok(report) => {
@@ -601,6 +726,9 @@ impl LocalDaemonService {
                             stock_dir.display(),
                             report.promoted_txids
                         ));
+                    }
+                    if !Self::stock_has_active_pending(&stock_dir) {
+                        self.unregister_pending_stock_dir(&stock_dir)?;
                     }
                 }
                 Err(err) => {
@@ -758,6 +886,135 @@ impl LocalDaemonService {
                 RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
             })?;
         serde_json::from_slice(&bytes).map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn legacy_list_assets(&self, account_id: &str) -> rgb_service_api::Result<ListAssetsResponse> {
+        let stock_dir = self.account_stock_dir(account_id);
+        let account_utxos = self.account_rgb20_utxos(account_id)?;
+        let known_outpoints = account_utxos
+            .iter()
+            .map(|utxo| utxo.outpoint.to_string())
+            .collect::<BTreeSet<_>>();
+        let allocations = list_rgb20_assets_for_utxos(&stock_dir, account_utxos)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let mut assets = Vec::<RgbAssetInfo>::new();
+        let mut rgb_outpoints = BTreeSet::new();
+        let mut utxo_assets = BTreeMap::<String, Vec<RgbAllocation>>::new();
+        for allocation in allocations {
+            let outpoint = allocation.outpoint.to_string();
+            rgb_outpoints.insert(outpoint.clone());
+            if !assets
+                .iter()
+                .any(|asset| asset.contract_id == allocation.contract_id.to_string())
+            {
+                assets.push(RgbAssetInfo {
+                    asset_id: allocation.contract_id.to_string(),
+                    contract_id: allocation.contract_id.to_string(),
+                    ticker: allocation.ticker.clone(),
+                    name: allocation.name.clone(),
+                    precision: allocation.precision,
+                });
+            }
+            utxo_assets
+                .entry(outpoint.clone())
+                .or_default()
+                .push(RgbAllocation {
+                    asset_id: allocation.contract_id.to_string(),
+                    outpoint,
+                    amount: allocation.amount_raw,
+                    layer: AssetLayer::L1,
+                    status: AllocationStatus::Available,
+                });
+        }
+        self.remove_account_utxos(
+            account_id,
+            known_outpoints
+                .difference(&rgb_outpoints)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )?;
+        Ok(ListAssetsResponse {
+            assets,
+            utxo_assets,
+        })
+    }
+
+    fn legacy_put_prepared_transfer(
+        &self,
+        account_id: &str,
+        transfer_id: &str,
+        asset_id: String,
+        recipient_account_id: String,
+        recipient_vout: u32,
+        fascia: &rgb_service_local::rgbstd::containers::Fascia,
+    ) -> rgb_service_api::Result<()> {
+        let fascia = encode_fascia_bytes(fascia)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        self.put_prepared_transfer(
+            account_id,
+            transfer_id,
+            &PreparedTransferRecord {
+                asset_id,
+                recipient_account_id,
+                recipient_vout,
+                fascia,
+            },
+        )
+    }
+
+    fn legacy_commit_prepared_transfer(
+        &self,
+        account_id: &str,
+        transfer_id: &str,
+        txid: &str,
+        utxos: Vec<TrackedUtxo>,
+    ) -> rgb_service_api::Result<()> {
+        let stock_dir = self.account_stock_dir(account_id);
+        let txid =
+            Txid::from_str(txid).map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        let record = self.get_prepared_transfer(account_id, transfer_id)?;
+        let fascia = rgb_service_local::decode_fascia_bytes(&record.fascia)
+            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
+        stage_sender_fascia(&stock_dir, txid, &fascia)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        self.register_pending_stock_dir(&stock_dir)?;
+        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&record.asset_id)
+            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+        let consignment = build_rgb20_transfer_consignment(
+            &stock_dir,
+            fascia,
+            contract_id,
+            txid,
+            record.recipient_vout,
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
+        stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        self.register_pending_stock_dir(&receiver_stock_dir)?;
+        let receiver_outpoint = format!("{}:{}", txid, record.recipient_vout);
+        let receiver_utxo = Self::issue_utxo(receiver_outpoint, utxos);
+        self.put_account_utxo(&record.recipient_account_id, receiver_utxo)?;
+        Ok(())
+    }
+
+    fn legacy_remove_prepared_transfer(
+        &self,
+        account_id: &str,
+        transfer_id: &str,
+    ) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("prepared_transfers", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let key = Self::prepared_key(account_id, transfer_id);
+        let mut tx = self.db.write_tx();
+        tx.remove(&keyspace, key.as_bytes());
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
     }
 
     fn ln_channel_key(account_id: &str, channel_id: &str) -> String {
@@ -1067,7 +1324,7 @@ impl LocalDaemonService {
     fn new_profile(&self, id: &str, now: u64) -> Value {
         json!({
             "id": id,
-            "rna_balance": self.rna.new_profile_grant,
+            "rna_balance": 0_u64,
             "created_at_ms": now,
             "updated_at_ms": now
         })
@@ -1284,7 +1541,7 @@ impl RgbServiceApi for LocalDaemonService {
         Ok(RnaBalanceResponse {
             account_id: req.payload.account_id,
             rna_balance: Self::profile_rna_balance(&profile)?,
-            new_profile_grant: self.rna.new_profile_grant,
+            new_profile_grant: 0,
             issue_fee: self.rna.issue_fee,
             transfer_fee: self.rna.transfer_fee,
             query_fee: self.rna.query_fee,
@@ -1593,6 +1850,7 @@ impl RgbServiceApi for LocalDaemonService {
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
         stage_sender_fascia(&stock_dir, txid, &fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        self.register_pending_stock_dir(&stock_dir)?;
         let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&record.asset_id)
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
         let consignment = build_rgb20_transfer_consignment(
@@ -1606,6 +1864,7 @@ impl RgbServiceApi for LocalDaemonService {
         let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
         stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        self.register_pending_stock_dir(&receiver_stock_dir)?;
         let receiver_outpoint = format!("{}:{}", req.payload.txid, record.recipient_vout);
         let receiver_utxo = Self::issue_utxo(receiver_outpoint, req.payload.utxos.clone());
         self.put_account_utxo(&record.recipient_account_id, receiver_utxo)?;
@@ -1739,6 +1998,7 @@ impl RgbServiceApi for LocalDaemonService {
                 .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
             stage_sender_fascia(&stock_dir, opening_txid, &prepared.fascia)
                 .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            self.register_pending_stock_dir(&stock_dir)?;
             let funding_ref = RgbFundingRef {
                 transfer_id: format!("ln-open:{operation_id}"),
                 operation_id: operation_id.clone(),

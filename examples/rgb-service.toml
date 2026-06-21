@@ -5,7 +5,13 @@ data_dir = "/tmp/bihelix-rgb-service"
 esplora_url = "http://127.0.0.1:3002"
 
 [rna]
-new_profile_grant = 10000
 issue_fee = 1000
 transfer_fee = 100
 query_fee = 1
+
+[legacy]
+# Disabled by default. This exposes wallet-service-v2 compatible routes for
+# trusted callers only.
+enabled = false
+allow_loopback = true
+allowed_ips = []

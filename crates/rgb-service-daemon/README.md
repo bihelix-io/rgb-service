@@ -62,12 +62,11 @@ It exists only inside the daemon profile:
 profiles/{btc_addr} -> Dynamic MsgPack
 ```
 
-A new profile receives the configured `new_profile_grant`.
+New profiles start with `0` RNA. The daemon no longer grants RNA automatically.
 
 Default fee policy:
 
 ```text
-new profile grant: 10000 RNA
 issue asset:       1000 RNA
 transfer prepare:   100 RNA
 query:                1 RNA
@@ -87,7 +86,6 @@ data_dir = "/tmp/bihelix-rgb-service"
 esplora_url = "http://127.0.0.1:3002"
 
 [rna]
-new_profile_grant = 10000
 issue_fee = 1000
 transfer_fee = 100
 query_fee = 1
@@ -103,7 +101,6 @@ data_dir = "/home/ubuntu/rgb-service-data"
 esplora_url = "https://mempool.space/api"
 
 [rna]
-new_profile_grant = 10000
 issue_fee = 1000
 transfer_fee = 100
 query_fee = 1
@@ -178,7 +175,7 @@ Expected mainnet startup log:
 
 ```text
 starting rgb-service on 0.0.0.0:8787 for mainnet with data_dir /home/ubuntu/rgb-service-data
-INFO rna new_profile_grant=10000 issue_fee=1000 transfer_fee=100 query_fee=1
+INFO rna issue_fee=1000 transfer_fee=100 query_fee=1
 ```
 
 ## Public HTTP API
@@ -207,6 +204,50 @@ POST /v1/ln/payments/claim        # Claim RGB-aware LN payment state
 POST /v1/ln/recover               # Recover RGB-aware LN service state
 POST /v1/test/rgb               # Controlled RGB lifecycle test route
 ```
+
+## Internal Legacy Compatibility
+
+The wallet-service-v2 compatible routes are **not public API**. They are kept as
+an internal compatibility experiment and are disabled by default. They are only
+mounted when `[legacy].enabled = true` in the daemon config and should be bound
+to loopback or a trusted internal network during development.
+
+```text
+PUT  /account/create
+GET  /asset/list
+GET  /asset
+POST /asset/internal/issue
+POST /transfer/psbt
+POST /transfer/callback
+POST /transfer/cancel
+```
+
+The legacy `/transfer/psbt` route opens a watch-only descriptor wallet, syncs
+with Esplora, builds the BTC PSBT with BDK, selects required RGB UTXOs from the
+daemon stock, writes the RGB commitment, and returns the unsigned PSBT for
+external signing. The daemon still does not hold BTC private keys.
+
+Current gaps before exposing this beyond trusted local testing:
+
+- Legacy allowlist is IP-based only; add reverse-proxy policy, mTLS or HMAC
+  request signing before using it across hosts.
+- `allowed_ips` currently matches exact IPs only, not CIDR ranges.
+- `/transfer/psbt` supports exactly one RGB assignment for now.
+- `/transfer/callback` requires `desc` and `transfer_id`; it does not yet infer
+  prepared state from a raw transaction alone.
+- `/transfer/callback` commits RGB state but does not broadcast the BTC
+  transaction.
+- Pending UTXO reservation is minimal; production use needs stronger
+  double-spend/pending-transfer guards.
+- Legacy `/asset/list` returns daemon catalog metadata but not historical total
+  supply.
+- Legacy `/asset` maps `address` directly to daemon `account_id`; descriptor
+  accounts use an internal `legacy-desc:<sha256(desc)>` id.
+- wallet-service-v2 routes for stock backup/upload, stake, redeem, split,
+  foreign transfer, retry/rescan and tx detail are not implemented in this
+  compatibility layer.
+- Error bodies are compatibility-shaped enough for debugging, but not a full
+  wallet-service-v2 error-code clone.
 
 L1 pending/recovery is daemon-owned background work. The public HTTP API does
 not expose `/v1/pending/list` or `/v1/recover` to clients.
@@ -276,7 +317,7 @@ Make sure the server firewall/security group allows inbound TCP `8787` only from
 
 ## RNA balance request
 
-Querying RNA balance is signed but does not charge RNA. If the caller profile does not exist yet, the daemon creates it and grants `new_profile_grant`.
+Querying RNA balance is signed but does not charge RNA. If the caller profile does not exist yet, the daemon creates it with `0` RNA.
 
 ```http
 POST /v1/rna/balance
@@ -295,8 +336,8 @@ Response:
 ```json
 {
   "account_id": "bc1pcaller...",
-  "rna_balance": 10000,
-  "new_profile_grant": 10000,
+  "rna_balance": 0,
+  "new_profile_grant": 0,
   "issue_fee": 1000,
   "transfer_fee": 100,
   "query_fee": 1

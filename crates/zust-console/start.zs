@@ -1,4 +1,5 @@
 root::add("local/rgb-service", "http://3.1.207.115:8091");
+root::add("local/rgb-service-data", "/home/ubuntu/rgb-service-data");
 root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 root::add("local/signer-node", "417c33530ab6097e5e2538ffd16e833ee4337318015f201452a540c49adb4158");
 root::add("local/signer-request", {
