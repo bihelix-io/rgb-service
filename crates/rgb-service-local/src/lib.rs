@@ -9,26 +9,26 @@ use std::{
 };
 
 use amplify::confinement::{Confined, U32 as U32MAX};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bitcoin::{Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
 use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
 use nonasync::persistence::CloneNoPersistence;
 use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rgb_schemata::NonInflatableAsset;
 use rgbstd::{
-    ContractId, GenesisSeal, Identity, Operation, Opout, OutputSeal, Transition, Txid as RgbTxid,
     containers::{
         BuilderSeal, Consignment, ConsignmentExt, Fascia, FileContent, Transfer, ValidTransfer,
     },
     contract::{AllocatedState, ContractBuilder, IssuerWrapper},
-    indexers::{AnyResolver, esplora_blocking::esplora_client},
-    persistence::{StashReadProvider, Stock, fjall::FjallBinStore},
+    indexers::{esplora_blocking::esplora_client, AnyResolver},
+    persistence::{fjall::FjallBinStore, fs::FsBinStore, StashReadProvider, Stock},
     stl::{AssetSpec, ContractTerms, Name, Ticker},
     txout::CloseMethod,
     validation::{
         ResolveWitness, ValidationConfig, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
     vm::WitnessOrd,
+    ContractId, GenesisSeal, Identity, Operation, Opout, OutputSeal, Transition, Txid as RgbTxid,
 };
 use serde::{Deserialize, Serialize};
 use strict_types::{StrictDeserialize, StrictSerialize};
@@ -378,6 +378,52 @@ pub fn issue_rgb20_fixed_with_chain_source(
     })
 }
 
+// wallet-service-v2 migration: read legacy fs-backed RGB stocks and persist
+// them into the daemon's fjall-backed per-account stock store.
+pub fn import_rgb20_stock_from_fs(source_stock_dir: &Path, target_stock_dir: &Path) -> Result<()> {
+    let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
+        .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
+    let mut stock: Stock = Stock::load(source_provider, true).map_err(|err| {
+        anyhow!(
+            "load legacy RGB stock {}: {err:?}",
+            source_stock_dir.display()
+        )
+    })?;
+    let target_store = LocalRgbStore::open(target_stock_dir)?;
+    let target_provider = target_store.rgb_stock_store()?;
+    stock
+        .make_persistent(target_provider, true)
+        .map_err(|err| {
+            anyhow!(
+                "persist migrated RGB stock {}: {err:?}",
+                target_stock_dir.display()
+            )
+        })?;
+    stock.store().map_err(|err| {
+        anyhow!(
+            "store migrated RGB stock {}: {err:?}",
+            target_stock_dir.display()
+        )
+    })
+}
+
+// wallet-service-v2 migration: inspect allocations directly from legacy stock
+// files for dry-run balance reconciliation before importing.
+pub fn list_legacy_rgb20_assets_for_utxos(
+    source_stock_dir: &Path,
+    utxos: impl IntoIterator<Item = Rgb20TrackedUtxo>,
+) -> Result<Vec<Rgb20AssetAllocation>> {
+    let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
+        .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
+    let stock: Stock = Stock::load(source_provider, true).map_err(|err| {
+        anyhow!(
+            "load legacy RGB stock {}: {err:?}",
+            source_stock_dir.display()
+        )
+    })?;
+    list_rgb20_assets_from_stock(&stock, utxos)
+}
+
 pub fn select_rgb20_inputs(
     stock_dir: &Path,
     wallet_outpoints: impl IntoIterator<Item = OutPoint>,
@@ -401,12 +447,15 @@ pub fn select_rgb20_inputs(
     let mut state = contract
         .fungible("assetOwner", &available_rgb)
         .map_err(|err| anyhow!("failed to list RGB assetOwner state: {err:?}"))?
-        .fold(BTreeMap::<_, Vec<rgbstd::Amount>>::new(), |mut map, allocation| {
-            map.entry(allocation.seal)
-                .or_default()
-                .push(allocation.state);
-            map
-        })
+        .fold(
+            BTreeMap::<_, Vec<rgbstd::Amount>>::new(),
+            |mut map, allocation| {
+                map.entry(allocation.seal)
+                    .or_default()
+                    .push(allocation.state);
+                map
+            },
+        )
         .into_iter()
         .map(|(seal, amounts)| {
             (
@@ -589,13 +638,7 @@ pub fn list_rgb20_contracts(stock_dir: &Path) -> Result<Vec<Rgb20ContractInfo>> 
                     spec.precision,
                 )
             })
-            .unwrap_or_else(|| {
-                (
-                    String::new(),
-                    String::new(),
-                    rgbstd::Precision::Indivisible,
-                )
-            });
+            .unwrap_or_else(|| (String::new(), String::new(), rgbstd::Precision::Indivisible));
         contracts.push(Rgb20ContractInfo {
             contract_id: contract.id,
             ticker,
@@ -611,6 +654,13 @@ pub fn list_rgb20_assets_for_utxos(
     utxos: impl IntoIterator<Item = Rgb20TrackedUtxo>,
 ) -> Result<Vec<Rgb20AssetAllocation>> {
     let stock = open_or_create_stock(stock_dir)?;
+    list_rgb20_assets_from_stock(&stock, utxos)
+}
+
+fn list_rgb20_assets_from_stock(
+    stock: &Stock,
+    utxos: impl IntoIterator<Item = Rgb20TrackedUtxo>,
+) -> Result<Vec<Rgb20AssetAllocation>> {
     let utxos = utxos.into_iter().collect::<Vec<_>>();
     let rgb_to_wallet = utxos
         .iter()
@@ -649,13 +699,7 @@ pub fn list_rgb20_assets_for_utxos(
                         spec.precision,
                     )
                 })
-                .unwrap_or_else(|| {
-                    (
-                        String::new(),
-                        String::new(),
-                        rgbstd::Precision::Indivisible,
-                    )
-                });
+                .unwrap_or_else(|| (String::new(), String::new(), rgbstd::Precision::Indivisible));
             assets.push(Rgb20AssetAllocation {
                 contract_id: contract.id,
                 outpoint: utxo.outpoint,
@@ -1119,7 +1163,10 @@ fn replay_pending_rgb_operation(
     Ok(())
 }
 
-fn chain_source_from_esplora_urls(network: Network, esplora_urls: &[String]) -> Result<ChainSource> {
+fn chain_source_from_esplora_urls(
+    network: Network,
+    esplora_urls: &[String],
+) -> Result<ChainSource> {
     let url = normalized_esplora_urls(esplora_urls)
         .into_iter()
         .next()

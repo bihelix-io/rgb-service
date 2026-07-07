@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::auth::{AccountScoped, AssetSpendAuthorization, AssetSpendAuthorized};
 
@@ -74,6 +75,18 @@ pub struct RgbContractInfo {
     pub ticker: String,
     pub name: String,
     pub precision: u8,
+    #[serde(default)]
+    pub supply: Option<u64>,
+    #[serde(default)]
+    pub issue_utxo: String,
+    #[serde(default)]
+    pub contract_type: String,
+    #[serde(default)]
+    pub issuer_desc: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub ext: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -83,6 +96,18 @@ pub struct RgbAssetInfo {
     pub ticker: String,
     pub name: String,
     pub precision: u8,
+    #[serde(default)]
+    pub supply: Option<u64>,
+    #[serde(default)]
+    pub issue_utxo: String,
+    #[serde(default)]
+    pub contract_type: String,
+    #[serde(default)]
+    pub issuer_desc: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub ext: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -138,6 +163,10 @@ pub struct RgbAllocation {
     pub amount: u64,
     pub layer: AssetLayer,
     pub status: AllocationStatus,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub confirmed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

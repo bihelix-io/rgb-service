@@ -22,6 +22,7 @@ psrgbt = { workspace = true }
 rgb-schemata = { workspace = true }
 rgbstd = { workspace = true, features = [
     "esplora_blocking",
+    "fs",
     "fjall",
     "serde",
 ] }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     fs::OpenOptions,
     io::Write,
@@ -37,7 +37,8 @@ use rgb_service_api::{
     TrackedUtxo,
 };
 use rgb_service_local::{
-    build_rgb20_transfer_consignment, encode_fascia_bytes, issue_rgb20_fixed_with_chain_source,
+    build_rgb20_transfer_consignment, encode_fascia_bytes, import_rgb20_stock_from_fs,
+    issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
     list_rgb20_assets_for_utxos, list_rgb20_contracts, prepare_rgb20_psbt,
     scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
     ChainSource, EsploraConfig, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
@@ -47,6 +48,10 @@ use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal};
 
 mod legacy;
+
+// wallet-service-v2 migration: legacy RGB stock directories are nested under
+// each descriptor-derived account id using this historical RGB runtime path.
+const WALLET_V2_RGB_PATH: &str = "0_11_1_rc_3";
 
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
@@ -112,12 +117,232 @@ impl RnaConfig {
     }
 }
 
+// wallet-service-v2 migration: dry-run helper used to compare the SQL-derived
+// UTXO ownership map with allocations stored in the legacy RGB stock files.
+fn export_wallet_v2_file_balances(
+    sql_path: &Path,
+    wallet_v2_data_dir: &Path,
+    out_path: &Path,
+) -> rgb_service_api::Result<WalletV2FileBalanceExportSummary> {
+    let text = fs::read_to_string(sql_path)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
+    let mut accounts = Vec::new();
+    let mut transfers = HashMap::<String, WalletV2Transfer>::new();
+    let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
+    let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
+
+    for line in text.lines() {
+        if let Some(account) = parse_wallet_v2_account_insert(line)? {
+            accounts.push(account);
+            continue;
+        }
+        if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
+            transfers.insert(transfer.id.clone(), transfer);
+            continue;
+        }
+        if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
+            rgb_assigns.push(rgb_assign);
+            continue;
+        }
+        if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
+            issue_utxos.push(issue_utxo);
+        }
+    }
+
+    let mut sql_utxos_by_desc = HashMap::<String, Vec<TrackedUtxo>>::new();
+    for issue_utxo in issue_utxos {
+        sql_utxos_by_desc
+            .entry(issue_utxo.desc)
+            .or_default()
+            .push(TrackedUtxo {
+                outpoint: issue_utxo.outpoint,
+                address: None,
+                confirmed: true,
+            });
+    }
+    for rgb_assign in rgb_assigns {
+        let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
+            continue;
+        };
+        if !transfer.confirmed {
+            continue;
+        }
+        let Some(desc) = rgb_assign.desc else {
+            continue;
+        };
+        let outpoint = if rgb_assign.rgb_seal.contains(':') {
+            rgb_assign.rgb_seal
+        } else {
+            format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
+        };
+        sql_utxos_by_desc
+            .entry(desc)
+            .or_default()
+            .push(TrackedUtxo {
+                outpoint,
+                address: Some(rgb_assign.address),
+                confirmed: true,
+            });
+    }
+
+    if let Some(parent) = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| RgbServiceError::Backend(format!("create export dir: {err}")))?;
+    }
+    let mut out = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(out_path)
+        .map_err(|err| RgbServiceError::Backend(format!("open export CSV: {err}")))?;
+    writeln!(
+        out,
+        "desc_id,primary_address,outpoint,address,contract_id,amount_raw,confirmed"
+    )
+    .map_err(|err| RgbServiceError::Backend(format!("write export CSV header: {err}")))?;
+
+    let mut summary = WalletV2FileBalanceExportSummary::default();
+    for account in accounts {
+        summary.accounts += 1;
+        let source_stock_dir = wallet_v2_data_dir
+            .join(&account.desc_id)
+            .join(WALLET_V2_RGB_PATH);
+        if !source_stock_dir.exists() {
+            summary.stocks_missing += 1;
+            continue;
+        }
+        summary.stocks_found += 1;
+        let tracked = sql_utxos_by_desc
+            .remove(&account.desc)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|utxo| {
+                let outpoint = OutPoint::from_str(&utxo.outpoint).map_err(|err| {
+                    RgbServiceError::Backend(format!(
+                        "invalid wallet-v2 RGB outpoint {}: {err}",
+                        utxo.outpoint
+                    ))
+                })?;
+                Ok(Rgb20TrackedUtxo {
+                    outpoint,
+                    address: utxo.address,
+                    confirmed: utxo.confirmed,
+                })
+            })
+            .collect::<rgb_service_api::Result<Vec<_>>>()?;
+        summary.utxos += tracked.len();
+        if tracked.is_empty() {
+            continue;
+        }
+        let allocations = list_legacy_rgb20_assets_for_utxos(&source_stock_dir, tracked)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        for allocation in allocations {
+            summary.allocations += 1;
+            writeln!(
+                out,
+                "{},{},{},{},{},{},{}",
+                csv_field(&account.desc_id),
+                csv_field(account.addresses.first().map(String::as_str).unwrap_or("")),
+                csv_field(&allocation.outpoint.to_string()),
+                csv_field(allocation.address.as_deref().unwrap_or("")),
+                csv_field(&allocation.contract_id.to_string()),
+                allocation.amount_raw,
+                allocation.confirmed
+            )
+            .map_err(|err| RgbServiceError::Backend(format!("write export CSV row: {err}")))?;
+        }
+    }
+
+    Ok(summary)
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = env::args()
-        .nth(1)
-        .ok_or("usage: rgb-service <config.toml>")?;
-    let config = load_config(&config_path)?;
+    let args = env::args().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "export-wallet-v2-file-balances")
+    {
+        let sql_path = args.get(2).ok_or(
+            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
+        )?;
+        let data_dir = args.get(3).ok_or(
+            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
+        )?;
+        let out_path = args.get(4).ok_or(
+            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
+        )?;
+        let summary = export_wallet_v2_file_balances(
+            Path::new(sql_path),
+            Path::new(data_dir),
+            Path::new(out_path),
+        )?;
+        println!(
+            "exported wallet-service-v2 file balances: accounts={} stocks_found={} stocks_missing={} utxos={} allocations={} out={}",
+            summary.accounts,
+            summary.stocks_found,
+            summary.stocks_missing,
+            summary.utxos,
+            summary.allocations,
+            out_path
+        );
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "import-wallet-v2-catalog")
+    {
+        let config_path = args
+            .get(2)
+            .ok_or("usage: rgb-service import-wallet-v2-catalog <config.toml> <wallet-v2.sql>")?;
+        let sql_path = args
+            .get(3)
+            .ok_or("usage: rgb-service import-wallet-v2-catalog <config.toml> <wallet-v2.sql>")?;
+        let config = load_config(config_path)?;
+        fs::create_dir_all(&config.service.data_dir)?;
+        let service = LocalDaemonService::new(config).await?;
+        let imported = service.import_wallet_v2_catalog(Path::new(sql_path))?;
+        println!("imported wallet-service-v2 catalog entries: {imported}");
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|arg| arg == "import-wallet-v2") {
+        let config_path = args
+            .get(2)
+            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
+        let sql_path = args
+            .get(3)
+            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
+        let data_dir = args
+            .get(4)
+            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
+        let config = load_config(config_path)?;
+        fs::create_dir_all(&config.service.data_dir)?;
+        let service = LocalDaemonService::new(config).await?;
+        let summary = service.import_wallet_v2(Path::new(sql_path), Path::new(data_dir))?;
+        println!(
+            "imported wallet-service-v2: catalog_entries={} accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={}",
+            summary.catalog_entries,
+            summary.accounts,
+            summary.addresses,
+            summary.utxos,
+            summary.stocks_imported,
+            summary.stocks_missing
+        );
+        return Ok(());
+    }
+    let config_path = args.get(1).ok_or("usage: rgb-service <config.toml>")?;
+    let config = load_config(config_path)?;
     fs::create_dir_all(&config.service.data_dir)?;
 
     println!(
@@ -503,6 +728,126 @@ struct PreparedTransferRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct TokenCatalogEntry {
+    contract_id: String,
+    ticker: String,
+    name: String,
+    precision: u8,
+    supply: Option<u64>,
+    issue_utxo: String,
+    contract_type: String,
+    issuer_desc: String,
+    created_at: String,
+    ext: Option<Value>,
+}
+
+// wallet-service-v2 migration: compact row models parsed from the SQL dump.
+#[derive(Clone, Debug)]
+struct WalletV2Account {
+    desc: String,
+    desc_id: String,
+    addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct WalletV2Transfer {
+    id: String,
+    txid: String,
+    confirmed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WalletV2RgbAssign {
+    transfer_id: String,
+    desc: Option<String>,
+    address: String,
+    rgb_seal: String,
+}
+
+#[derive(Clone, Debug)]
+struct WalletV2IssueUtxo {
+    desc: String,
+    outpoint: String,
+}
+
+#[derive(Default)]
+struct WalletV2ImportSummary {
+    catalog_entries: usize,
+    accounts: usize,
+    addresses: usize,
+    utxos: usize,
+    stocks_imported: usize,
+    stocks_missing: usize,
+}
+
+#[derive(Default)]
+struct WalletV2FileBalanceExportSummary {
+    accounts: usize,
+    stocks_found: usize,
+    stocks_missing: usize,
+    utxos: usize,
+    allocations: usize,
+}
+
+impl TokenCatalogEntry {
+    fn empty(contract_id: String, ticker: String, name: String, precision: u8) -> Self {
+        Self {
+            contract_id,
+            ticker,
+            name,
+            precision,
+            supply: None,
+            issue_utxo: String::new(),
+            contract_type: String::new(),
+            issuer_desc: String::new(),
+            created_at: String::new(),
+            ext: None,
+        }
+    }
+
+    fn into_contract_info(self) -> RgbContractInfo {
+        RgbContractInfo {
+            contract_id: self.contract_id.clone(),
+            schema: self.contract_type_schema(),
+            asset_id: Some(self.contract_id.clone()),
+            ticker: self.ticker,
+            name: self.name,
+            precision: self.precision,
+            supply: self.supply,
+            issue_utxo: self.issue_utxo,
+            contract_type: self.contract_type,
+            issuer_desc: self.issuer_desc,
+            created_at: self.created_at,
+            ext: self.ext,
+        }
+    }
+
+    fn into_asset_info(self) -> RgbAssetInfo {
+        RgbAssetInfo {
+            asset_id: self.contract_id.clone(),
+            contract_id: self.contract_id,
+            ticker: self.ticker,
+            name: self.name,
+            precision: self.precision,
+            supply: self.supply,
+            issue_utxo: self.issue_utxo,
+            contract_type: self.contract_type,
+            issuer_desc: self.issuer_desc,
+            created_at: self.created_at,
+            ext: self.ext,
+        }
+    }
+
+    fn contract_type_schema(&self) -> String {
+        if self.contract_type.trim().is_empty() {
+            "rgb20".to_string()
+        } else {
+            self.contract_type.to_ascii_lowercase()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LnChannelRecord {
     account_id: String,
     channel_id: String,
@@ -831,6 +1176,279 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(err.to_string()))
     }
 
+    fn put_token_catalog_entry(&self, entry: &TokenCatalogEntry) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("token_catalog", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec(entry).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, entry.contract_id.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn get_token_catalog_entry(
+        &self,
+        contract_id: &str,
+    ) -> rgb_service_api::Result<Option<TokenCatalogEntry>> {
+        let keyspace = self
+            .db
+            .keyspace("token_catalog", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let Some(bytes) = keyspace
+            .get(contract_id.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .map(|bytes| bytes.as_ref().to_vec())
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn list_token_catalog_entries(&self) -> rgb_service_api::Result<Vec<TokenCatalogEntry>> {
+        let keyspace = self
+            .db
+            .keyspace("token_catalog", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut entries = Vec::new();
+        for item in keyspace.as_ref().prefix(b"") {
+            let value = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            entries.push(
+                serde_json::from_slice(value.as_ref())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))?,
+            );
+        }
+        entries.sort_by(|a: &TokenCatalogEntry, b: &TokenCatalogEntry| {
+            a.ticker
+                .cmp(&b.ticker)
+                .then_with(|| a.contract_id.cmp(&b.contract_id))
+        });
+        Ok(entries)
+    }
+
+    fn catalog_entry_for_contract(
+        &self,
+        contract_id: String,
+        ticker: String,
+        name: String,
+        precision: u8,
+    ) -> rgb_service_api::Result<TokenCatalogEntry> {
+        Ok(self
+            .get_token_catalog_entry(&contract_id)?
+            .unwrap_or_else(|| TokenCatalogEntry::empty(contract_id, ticker, name, precision)))
+    }
+
+    fn import_wallet_v2_catalog(&self, sql_path: &Path) -> rgb_service_api::Result<usize> {
+        let text = fs::read_to_string(sql_path)
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
+        let mut imported = 0;
+        for line in text.lines() {
+            let Some(entry) = parse_wallet_v2_asset_list_insert(line)? else {
+                continue;
+            };
+            self.put_token_catalog_entry(&entry)?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    fn put_legacy_address_account(
+        &self,
+        address: &str,
+        account_id: &str,
+    ) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("legacy_address_accounts", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, address.as_bytes(), account_id.as_bytes());
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    pub(crate) fn put_legacy_account_desc(
+        &self,
+        account_id: &str,
+        desc: &str,
+    ) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("legacy_account_descs", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, account_id.as_bytes(), desc.as_bytes());
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    pub(crate) fn resolve_legacy_account_id_for_address(
+        &self,
+        address: &str,
+    ) -> rgb_service_api::Result<Option<String>> {
+        let keyspace = self
+            .db
+            .keyspace("legacy_address_accounts", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        keyspace
+            .get(address.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .map(|bytes| {
+                String::from_utf8(bytes.as_ref().to_vec())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn resolve_legacy_desc_for_account_id(
+        &self,
+        account_id: &str,
+    ) -> rgb_service_api::Result<Option<String>> {
+        let keyspace = self
+            .db
+            .keyspace("legacy_account_descs", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        keyspace
+            .get(account_id.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .map(|bytes| {
+                String::from_utf8(bytes.as_ref().to_vec())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))
+            })
+            .transpose()
+    }
+
+    // wallet-service-v2 migration: imports legacy catalog metadata, address ->
+    // account mappings, tracked RGB UTXOs, and per-account RGB stock files.
+    fn import_wallet_v2(
+        &self,
+        sql_path: &Path,
+        wallet_v2_data_dir: &Path,
+    ) -> rgb_service_api::Result<WalletV2ImportSummary> {
+        let text = fs::read_to_string(sql_path)
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
+        let mut summary = WalletV2ImportSummary::default();
+        let mut accounts = Vec::new();
+        let mut transfers = HashMap::<String, WalletV2Transfer>::new();
+        let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
+        let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
+        for line in text.lines() {
+            if let Some(entry) = parse_wallet_v2_asset_list_insert(line)? {
+                if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
+                    issue_utxos.push(issue_utxo);
+                }
+                self.put_token_catalog_entry(&entry)?;
+                summary.catalog_entries += 1;
+                continue;
+            }
+            if let Some(account) = parse_wallet_v2_account_insert(line)? {
+                accounts.push(account);
+                continue;
+            }
+            if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
+                transfers.insert(transfer.id.clone(), transfer);
+                continue;
+            }
+            if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
+                rgb_assigns.push(rgb_assign);
+            }
+        }
+
+        let mut sql_utxos_by_account = HashMap::<String, Vec<TrackedUtxo>>::new();
+        for issue_utxo in issue_utxos {
+            sql_utxos_by_account
+                .entry(legacy::legacy_account_id(&issue_utxo.desc))
+                .or_default()
+                .push(TrackedUtxo {
+                    outpoint: issue_utxo.outpoint,
+                    address: None,
+                    confirmed: true,
+                });
+        }
+        for rgb_assign in rgb_assigns {
+            let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
+                continue;
+            };
+            if !transfer.confirmed {
+                continue;
+            }
+            let Some(desc) = rgb_assign.desc else {
+                continue;
+            };
+            let outpoint = if rgb_assign.rgb_seal.contains(':') {
+                rgb_assign.rgb_seal
+            } else {
+                format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
+            };
+            sql_utxos_by_account
+                .entry(legacy::legacy_account_id(&desc))
+                .or_default()
+                .push(TrackedUtxo {
+                    outpoint,
+                    address: Some(rgb_assign.address),
+                    confirmed: true,
+                });
+        }
+
+        for account in accounts {
+            let account_id = legacy::legacy_account_id(&account.desc);
+            self.get_or_create_profile(&account_id)?;
+            self.put_legacy_account_desc(&account_id, &account.desc)?;
+            for address in &account.addresses {
+                self.put_legacy_address_account(address, &account_id)?;
+            }
+            summary.accounts += 1;
+            summary.addresses += account.addresses.len();
+            if let Some(utxos) = sql_utxos_by_account.remove(&account_id) {
+                for utxo in utxos {
+                    self.put_account_utxo(&account_id, utxo)?;
+                    summary.utxos += 1;
+                }
+            }
+            let source_stock_dir = wallet_v2_data_dir
+                .join(&account.desc_id)
+                .join(WALLET_V2_RGB_PATH);
+            if source_stock_dir.exists() {
+                import_rgb20_stock_from_fs(&source_stock_dir, &self.account_stock_dir(&account_id))
+                    .map_err(|err| {
+                        RgbServiceError::Backend(format!(
+                            "import wallet-v2 RGB stock {}: {err:#}",
+                            source_stock_dir.display()
+                        ))
+                    })?;
+                summary.stocks_imported += 1;
+            } else {
+                summary.stocks_missing += 1;
+            }
+            if summary.accounts % 500 == 0 {
+                println!(
+                    "wallet-v2 import progress: accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={}",
+                    summary.accounts,
+                    summary.addresses,
+                    summary.utxos,
+                    summary.stocks_imported,
+                    summary.stocks_missing
+                );
+            }
+        }
+        Ok(summary)
+    }
+
     fn issue_utxo(allocation_outpoint: String, mut utxos: Vec<TrackedUtxo>) -> TrackedUtxo {
         utxos
             .drain(..)
@@ -888,6 +1506,28 @@ impl LocalDaemonService {
         serde_json::from_slice(&bytes).map_err(|err| RgbServiceError::Backend(err.to_string()))
     }
 
+    fn legacy_find_prepared_transfer_account_id(
+        &self,
+        transfer_id: &str,
+    ) -> rgb_service_api::Result<Option<String>> {
+        let keyspace = self
+            .db
+            .keyspace("prepared_transfers", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let suffix = format!(":{transfer_id}");
+        for item in keyspace.as_ref().prefix(b"") {
+            let key = item
+                .key()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let key = String::from_utf8(key.to_vec())
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            if let Some(account_id) = key.strip_suffix(&suffix) {
+                return Ok(Some(account_id.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
     fn legacy_list_assets(&self, account_id: &str) -> rgb_service_api::Result<ListAssetsResponse> {
         let stock_dir = self.account_stock_dir(account_id);
         let account_utxos = self.account_rgb20_utxos(account_id)?;
@@ -907,13 +1547,15 @@ impl LocalDaemonService {
                 .iter()
                 .any(|asset| asset.contract_id == allocation.contract_id.to_string())
             {
-                assets.push(RgbAssetInfo {
-                    asset_id: allocation.contract_id.to_string(),
-                    contract_id: allocation.contract_id.to_string(),
-                    ticker: allocation.ticker.clone(),
-                    name: allocation.name.clone(),
-                    precision: allocation.precision,
-                });
+                assets.push(
+                    self.catalog_entry_for_contract(
+                        allocation.contract_id.to_string(),
+                        allocation.ticker.clone(),
+                        allocation.name.clone(),
+                        allocation.precision,
+                    )?
+                    .into_asset_info(),
+                );
             }
             utxo_assets
                 .entry(outpoint.clone())
@@ -924,6 +1566,8 @@ impl LocalDaemonService {
                     amount: allocation.amount_raw,
                     layer: AssetLayer::L1,
                     status: AllocationStatus::Available,
+                    address: allocation.address.clone(),
+                    confirmed: Some(allocation.confirmed),
                 });
         }
         self.remove_account_utxos(
@@ -1626,13 +2270,15 @@ impl RgbServiceApi for LocalDaemonService {
                 .any(|asset| asset.contract_id == allocation.contract_id.to_string())
             {
             } else {
-                assets.push(RgbAssetInfo {
-                    asset_id: allocation.contract_id.to_string(),
-                    contract_id: allocation.contract_id.to_string(),
-                    ticker: allocation.ticker.clone(),
-                    name: allocation.name.clone(),
-                    precision: allocation.precision,
-                });
+                assets.push(
+                    self.catalog_entry_for_contract(
+                        allocation.contract_id.to_string(),
+                        allocation.ticker.clone(),
+                        allocation.name.clone(),
+                        allocation.precision,
+                    )?
+                    .into_asset_info(),
+                );
             }
             utxo_assets
                 .entry(outpoint.clone())
@@ -1643,6 +2289,8 @@ impl RgbServiceApi for LocalDaemonService {
                     amount: allocation.amount_raw,
                     layer: AssetLayer::L1,
                     status: AllocationStatus::Available,
+                    address: allocation.address.clone(),
+                    confirmed: Some(allocation.confirmed),
                 });
         }
         self.remove_account_utxos(
@@ -1662,6 +2310,13 @@ impl RgbServiceApi for LocalDaemonService {
         let mut seen = BTreeSet::<String>::new();
         let mut contracts = Vec::<RgbContractInfo>::new();
         let mut assets = Vec::<RgbAssetInfo>::new();
+        for entry in self.list_token_catalog_entries()? {
+            if !seen.insert(entry.contract_id.clone()) {
+                continue;
+            }
+            contracts.push(entry.clone().into_contract_info());
+            assets.push(entry.into_asset_info());
+        }
         for stock_dir in self.account_stock_dirs()? {
             let stock_contracts = list_rgb20_contracts(&stock_dir)
                 .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
@@ -1670,21 +2325,14 @@ impl RgbServiceApi for LocalDaemonService {
                 if !seen.insert(contract_id.clone()) {
                     continue;
                 }
-                contracts.push(RgbContractInfo {
-                    contract_id: contract_id.clone(),
-                    schema: "rgb20".to_string(),
-                    asset_id: Some(contract_id.clone()),
-                    ticker: contract.ticker.clone(),
-                    name: contract.name.clone(),
-                    precision: contract.precision,
-                });
-                assets.push(RgbAssetInfo {
-                    asset_id: contract_id.clone(),
+                let entry = self.catalog_entry_for_contract(
                     contract_id,
-                    ticker: contract.ticker,
-                    name: contract.name,
-                    precision: contract.precision,
-                });
+                    contract.ticker,
+                    contract.name,
+                    contract.precision,
+                )?;
+                contracts.push(entry.clone().into_contract_info());
+                assets.push(entry.into_asset_info());
             }
         }
         Ok(TokenListResponse { contracts, assets })
@@ -1748,6 +2396,8 @@ impl RgbServiceApi for LocalDaemonService {
                 amount: allocation.amount_raw,
                 layer: AssetLayer::L1,
                 status: AllocationStatus::Available,
+                address: allocation.address.clone(),
+                confirmed: Some(allocation.confirmed),
             };
             response_allocations.push(response_allocation.clone());
             utxo_assets
@@ -2313,6 +2963,268 @@ impl RgbServiceApi for LocalDaemonService {
             ],
         })
     }
+}
+
+// wallet-service-v2 migration: SQL dump parsers for the old wallet schema.
+fn parse_wallet_v2_asset_list_insert(
+    line: &str,
+) -> rgb_service_api::Result<Option<TokenCatalogEntry>> {
+    const PREFIX: &str = "INSERT INTO \"public\".\"asset_list\" ";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    let marker = ") VALUES (";
+    let columns_end = rest.find(marker).ok_or_else(|| {
+        RgbServiceError::Backend("invalid wallet-v2 asset_list insert columns".to_string())
+    })?;
+    let columns = parse_sql_columns(&rest[..columns_end])?;
+    let mut values = &rest[columns_end + marker.len()..];
+    values = values.strip_suffix(';').unwrap_or(values);
+    values = values.strip_suffix(')').unwrap_or(values);
+    let values = split_sql_values(values)?;
+    if columns.len() != values.len() {
+        return Err(RgbServiceError::Backend(format!(
+            "wallet-v2 asset_list insert column/value mismatch: {} columns, {} values",
+            columns.len(),
+            values.len()
+        )));
+    }
+    let row = columns
+        .into_iter()
+        .zip(values)
+        .collect::<HashMap<String, Option<String>>>();
+    let contract_id = required_sql_string(&row, "contract_id")?;
+    let precision = optional_sql_string(&row, "precision")
+        .parse::<u8>()
+        .map_err(|err| RgbServiceError::Backend(format!("invalid asset precision: {err}")))?;
+    let supply = match optional_sql_string(&row, "supply").trim() {
+        "" => None,
+        value => Some(
+            value
+                .parse::<u64>()
+                .map_err(|err| RgbServiceError::Backend(format!("invalid asset supply: {err}")))?,
+        ),
+    };
+    let ext = row
+        .get("ext")
+        .and_then(|value| value.as_ref())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.clone())));
+    Ok(Some(TokenCatalogEntry {
+        contract_id,
+        ticker: optional_sql_string(&row, "ticker"),
+        name: optional_sql_string(&row, "name"),
+        precision,
+        supply,
+        issue_utxo: optional_sql_string(&row, "utxo"),
+        contract_type: optional_sql_string(&row, "contract_type"),
+        issuer_desc: optional_sql_string(&row, "desc"),
+        created_at: optional_sql_string(&row, "create_time"),
+        ext,
+    }))
+}
+
+fn parse_wallet_v2_account_insert(line: &str) -> rgb_service_api::Result<Option<WalletV2Account>> {
+    const PREFIX: &str = "INSERT INTO \"public\".\"account\" ";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 account insert")?;
+    let desc = required_sql_string(&row, "desc")?;
+    let address_array = required_sql_string(&row, "address")?;
+    Ok(Some(WalletV2Account {
+        desc_id: wallet_v2_desc_id(&desc)?,
+        desc,
+        addresses: parse_pg_text_array(&address_array),
+    }))
+}
+
+fn parse_wallet_v2_transfer_insert(
+    line: &str,
+) -> rgb_service_api::Result<Option<WalletV2Transfer>> {
+    const PREFIX: &str = "INSERT INTO \"public\".\"transfer\" ";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 transfer insert")?;
+    Ok(Some(WalletV2Transfer {
+        id: required_sql_string(&row, "id")?,
+        txid: required_sql_string(&row, "txid")?,
+        confirmed: optional_sql_string(&row, "status") == "2",
+    }))
+}
+
+fn parse_wallet_v2_rgb_assign_insert(
+    line: &str,
+) -> rgb_service_api::Result<Option<WalletV2RgbAssign>> {
+    const PREFIX: &str = "INSERT INTO \"public\".\"rgb_assign\" ";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 rgb_assign insert")?;
+    Ok(Some(WalletV2RgbAssign {
+        transfer_id: required_sql_string(&row, "transfer_id")?,
+        desc: row.get("desc").and_then(|value| value.clone()),
+        address: optional_sql_string(&row, "address"),
+        rgb_seal: required_sql_string(&row, "rgb_seal")?,
+    }))
+}
+
+fn parse_wallet_v2_issue_utxo_insert(
+    line: &str,
+) -> rgb_service_api::Result<Option<WalletV2IssueUtxo>> {
+    const PREFIX: &str = "INSERT INTO \"public\".\"asset_list\" ";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return Ok(None);
+    };
+    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 asset_list insert")?;
+    let outpoint = optional_sql_string(&row, "utxo");
+    if outpoint.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(WalletV2IssueUtxo {
+        desc: required_sql_string(&row, "desc")?,
+        outpoint,
+    }))
+}
+
+fn parse_wallet_v2_insert_row(
+    rest: &str,
+    context: &str,
+) -> rgb_service_api::Result<HashMap<String, Option<String>>> {
+    let marker = ") VALUES (";
+    let columns_end = rest
+        .find(marker)
+        .ok_or_else(|| RgbServiceError::Backend(format!("invalid {context} columns")))?;
+    let columns = parse_sql_columns(&rest[..columns_end])?;
+    let mut values = &rest[columns_end + marker.len()..];
+    values = values.strip_suffix(';').unwrap_or(values);
+    values = values.strip_suffix(')').unwrap_or(values);
+    let values = split_sql_values(values)?;
+    if columns.len() != values.len() {
+        return Err(RgbServiceError::Backend(format!(
+            "{context} column/value mismatch: {} columns, {} values",
+            columns.len(),
+            values.len()
+        )));
+    }
+    Ok(columns
+        .into_iter()
+        .zip(values)
+        .collect::<HashMap<String, Option<String>>>())
+}
+
+fn parse_pg_text_array(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .unwrap_or(value);
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_matches('"').to_string())
+        .collect()
+}
+
+fn wallet_v2_desc_id(desc: &str) -> rgb_service_api::Result<String> {
+    let fingerprint = desc
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(fingerprint, _)| fingerprint)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .ok_or_else(|| {
+            RgbServiceError::Backend("wallet-v2 descriptor missing fingerprint".to_string())
+        })?;
+    let checksum = desc
+        .rsplit_once('#')
+        .map(|(_, checksum)| checksum)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| {
+            RgbServiceError::Backend("wallet-v2 descriptor missing checksum".to_string())
+        })?;
+    Ok(format!("{fingerprint}_{checksum}"))
+}
+
+fn parse_sql_columns(input: &str) -> rgb_service_api::Result<Vec<String>> {
+    let input = input
+        .trim()
+        .strip_prefix('(')
+        .ok_or_else(|| RgbServiceError::Backend("invalid SQL column list".to_string()))?;
+    Ok(input
+        .split(',')
+        .map(|column| column.trim().trim_matches('"').to_string())
+        .collect())
+}
+
+fn split_sql_values(input: &str) -> rgb_service_api::Result<Vec<Option<String>>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_quote {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    current.push('\'');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' => {
+                if current.trim().eq_ignore_ascii_case("e") {
+                    current.clear();
+                }
+                in_quote = true;
+            }
+            ',' => {
+                values.push(sql_value(current.trim()));
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if in_quote {
+        return Err(RgbServiceError::Backend(
+            "unterminated SQL string in asset_list insert".to_string(),
+        ));
+    }
+    values.push(sql_value(current.trim()));
+    Ok(values)
+}
+
+fn sql_value(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn required_sql_string(
+    row: &HashMap<String, Option<String>>,
+    key: &str,
+) -> rgb_service_api::Result<String> {
+    row.get(key)
+        .and_then(|value| value.clone())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| RgbServiceError::Backend(format!("wallet-v2 asset_list missing {key}")))
+}
+
+fn optional_sql_string(row: &HashMap<String, Option<String>>, key: &str) -> String {
+    row.get(key)
+        .and_then(|value| value.clone())
+        .unwrap_or_default()
 }
 
 fn json_value_to_dynamic(value: &Value) -> rgb_service_api::Result<Dynamic> {

@@ -25,11 +25,11 @@ use bdk_wallet::{
     descriptor::ExtendedDescriptor,
     file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet,
 };
-use rgb_service_api::{RgbServiceApi, RgbServiceError, TrackedUtxo};
+use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
 use rgb_service_local::{prepare_rgb20_psbt, select_rgb20_inputs, Rgb20PsbtAssignment};
 use serde::{Deserialize, Serialize};
 
-use crate::{hex_encode, LegacyConfig, LocalDaemonService};
+use crate::{LegacyConfig, LocalDaemonService};
 
 const LEGACY_BDK_MAGIC: &[u8] = b"RgbDaemonLegacyBdk";
 const BDK_FILE: &str = "bdk_wallet";
@@ -48,6 +48,8 @@ pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> 
         .route("/asset/list", get(asset_list))
         .route("/asset", get(query_asset))
         .route("/asset/internal/issue", post(issue_asset))
+        .route("/estimate/gas", get(estimate_gas))
+        .route("/get_fee", get(get_mempool_info))
         .route("/transfer/psbt", post(transfer_psbt))
         .route("/transfer/callback", post(transfer_callback))
         .route("/transfer/cancel", post(transfer_cancel))
@@ -101,53 +103,90 @@ async fn create_account(
     let account_id = legacy_account_id(&req.desc);
     let _wallet = open_legacy_wallet(&state.service, &req.desc)?;
     state.service.get_or_create_profile(&account_id)?;
+    state
+        .service
+        .put_legacy_account_desc(&account_id, &req.desc)?;
     Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
 struct AssetListQuery {
     contract_id: Option<String>,
+    address: Option<String>,
+    desc: Option<String>,
 }
 
 #[derive(Serialize)]
 struct LegacyAssetInfo {
-    id: u64,
     ticker: String,
-    name: String,
-    precision: u8,
+    name: Option<String>,
+    precision: i16,
     contract_id: String,
-    supply: String,
+    supply: i64,
+    utxo: String,
+    contract_type: String,
+    ext: Option<serde_json::Value>,
+    ext_uptime: Option<String>,
 }
 
 async fn asset_list(
     State(state): State<LegacyState>,
     Query(query): Query<AssetListQuery>,
 ) -> Result<Json<Vec<LegacyAssetInfo>>, LegacyHttpError> {
-    let response = state.service.token_list().await?;
-    let mut id = 1u64;
-    let assets = response
-        .assets
+    let issuer_desc = legacy_asset_list_issuer_desc(&state.service, &query)?;
+    let mut entries = state.service.list_token_catalog_entries()?;
+    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let assets = entries
         .into_iter()
-        .filter(|asset| {
+        .filter(|entry| {
             query
                 .contract_id
                 .as_deref()
-                .is_none_or(|contract_id| contract_id == asset.contract_id)
+                .is_none_or(|contract_id| contract_id == entry.contract_id)
+                && issuer_desc
+                    .as_deref()
+                    .is_none_or(|desc| desc == entry.issuer_desc)
         })
-        .map(|asset| {
-            let item = LegacyAssetInfo {
-                id,
-                ticker: asset.ticker,
-                name: asset.name,
-                precision: asset.precision,
-                contract_id: asset.contract_id,
-                supply: "0".to_string(),
-            };
-            id += 1;
-            item
-        })
+        .map(|entry| entry.into_asset_info())
+        .map(legacy_asset_info)
         .collect();
     Ok(Json(assets))
+}
+
+fn legacy_asset_list_issuer_desc(
+    service: &LocalDaemonService,
+    query: &AssetListQuery,
+) -> Result<Option<String>, LegacyHttpError> {
+    if let Some(desc) = query.desc.clone() {
+        return Ok(Some(desc));
+    }
+    let Some(address) = query.address.as_deref() else {
+        return Ok(None);
+    };
+    let account_id = service
+        .resolve_legacy_account_id_for_address(address)?
+        .ok_or_else(|| RgbServiceError::NotFound(format!("legacy address not found: {address}")))?;
+    service
+        .resolve_legacy_desc_for_account_id(&account_id)?
+        .map(Some)
+        .ok_or_else(|| {
+            RgbServiceError::NotFound(format!("legacy desc not found for account: {account_id}"))
+                .into()
+        })
+}
+
+fn legacy_asset_info(asset: RgbAssetInfo) -> LegacyAssetInfo {
+    LegacyAssetInfo {
+        ticker: asset.ticker,
+        name: Some(asset.name),
+        precision: i16::from(asset.precision),
+        contract_id: asset.contract_id,
+        supply: asset.supply.unwrap_or_default() as i64,
+        utxo: asset.issue_utxo,
+        contract_type: asset.contract_type,
+        ext: asset.ext,
+        ext_uptime: None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -160,20 +199,19 @@ struct QueryAssetReq {
 #[derive(Serialize)]
 struct LegacyAllocation {
     contract_id: String,
-    ticker: String,
-    name: String,
+    ticker: Option<String>,
     rgb_amount: u64,
     address: Option<String>,
     status: String,
-    decimal: u8,
-    txid: String,
+    decimal: Option<i16>,
+    txid: Option<String>,
 }
 
 async fn query_asset(
     State(state): State<LegacyState>,
     Query(query): Query<QueryAssetReq>,
 ) -> Result<Json<BTreeMap<String, Vec<LegacyAllocation>>>, LegacyHttpError> {
-    let account_id = legacy_query_account_id(&query)?;
+    let account_id = legacy_query_account_id(&state.service, &query)?;
     let list = state.service.legacy_list_assets(&account_id)?;
     let metadata = list
         .assets
@@ -183,6 +221,13 @@ async fn query_asset(
     let mut result = BTreeMap::<String, Vec<LegacyAllocation>>::new();
     for (outpoint, allocations) in list.utxo_assets {
         for allocation in allocations {
+            if query
+                .address
+                .as_deref()
+                .is_some_and(|address| allocation.address.as_deref() != Some(address))
+            {
+                continue;
+            }
             if query
                 .contract_id
                 .as_deref()
@@ -198,24 +243,68 @@ async fn query_asset(
                 .or_default()
                 .push(LegacyAllocation {
                     contract_id: asset.contract_id.clone(),
-                    ticker: asset.ticker.clone(),
-                    name: asset.name.clone(),
+                    ticker: Some(asset.ticker.clone()),
                     rgb_amount: allocation.amount,
-                    address: None,
-                    status: format!("{:?}", allocation.status),
-                    decimal: asset.precision,
-                    txid: outpoint.split(':').next().unwrap_or_default().to_string(),
+                    address: allocation.address,
+                    status: if allocation.confirmed.unwrap_or(true) {
+                        "Confirmed".to_string()
+                    } else {
+                        "Pending".to_string()
+                    },
+                    decimal: Some(i16::from(asset.precision)),
+                    txid: outpoint.split(':').next().map(ToString::to_string),
                 });
         }
     }
     Ok(Json(result))
 }
 
-fn legacy_query_account_id(query: &QueryAssetReq) -> Result<String, LegacyHttpError> {
+#[derive(Serialize)]
+struct LegacyFeeInfo {
+    ticker: &'static str,
+    contract_id: String,
+    amount: u64,
+    precision: u8,
+}
+
+async fn estimate_gas(
+    State(state): State<LegacyState>,
+) -> Result<Json<Option<LegacyFeeInfo>>, LegacyHttpError> {
+    let fee = state
+        .service
+        .list_token_catalog_entries()?
+        .into_iter()
+        .find(|entry| entry.ticker == "RNA")
+        .map(|entry| LegacyFeeInfo {
+            ticker: "RNA",
+            contract_id: entry.contract_id,
+            amount: state.service.rna.transfer_fee,
+            precision: entry.precision,
+        });
+    Ok(Json(fee))
+}
+
+async fn get_mempool_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "fastestFee": 1,
+        "halfHourFee": 1,
+        "hourFee": 1,
+        "economyFee": 1,
+        "minimumFee": 1
+    }))
+}
+
+fn legacy_query_account_id(
+    service: &LocalDaemonService,
+    query: &QueryAssetReq,
+) -> Result<String, LegacyHttpError> {
     if let Some(desc) = query.desc.as_deref() {
         return Ok(legacy_account_id(desc));
     }
     if let Some(address) = query.address.as_deref() {
+        if let Some(account_id) = service.resolve_legacy_account_id_for_address(address)? {
+            return Ok(account_id);
+        }
         return Ok(address.to_string());
     }
     Err(RgbServiceError::InvalidRequest("desc or address is required".to_string()).into())
@@ -285,8 +374,9 @@ async fn issue_asset(
 
 #[derive(Deserialize)]
 struct TransferReq {
-    desc: String,
+    desc: Option<String>,
     assign: Vec<TransferAssign>,
+    #[serde(alias = "feeRate")]
     fee_rate: u64,
 }
 
@@ -301,7 +391,6 @@ struct TransferAssign {
 #[derive(Serialize)]
 struct TransferPsbtResp {
     psbt: String,
-    transfer_id: String,
 }
 
 async fn transfer_psbt(
@@ -311,8 +400,12 @@ async fn transfer_psbt(
     if req.assign.is_empty() {
         return Err(RgbServiceError::InvalidRequest("assign is empty".to_string()).into());
     }
-    let account_id = legacy_account_id(&req.desc);
-    let mut wallet = open_legacy_wallet(&state.service, &req.desc)?;
+    let desc = req
+        .desc
+        .as_deref()
+        .ok_or_else(|| RgbServiceError::InvalidRequest("desc is required".to_string()))?;
+    let account_id = legacy_account_id(desc);
+    let mut wallet = open_legacy_wallet(&state.service, desc)?;
     sync_legacy_wallet(&state.service, &mut wallet)?;
 
     let rgb_assignments =
@@ -420,8 +513,7 @@ async fn transfer_psbt(
     )?;
     wallet.persist()?;
     Ok(Json(TransferPsbtResp {
-        psbt: hex_encode(&prepared.psbt.serialize()),
-        transfer_id,
+        psbt: prepared.psbt.to_string(),
     }))
 }
 
@@ -489,11 +581,15 @@ async fn transfer_callback(
         }
     };
     let transfer_id = req.transfer_id.unwrap_or_else(|| txid.clone());
-    let account_id = req
-        .desc
-        .as_deref()
-        .map(legacy_account_id)
-        .ok_or_else(|| RgbServiceError::InvalidRequest("desc is required".to_string()))?;
+    let account_id = match req.desc.as_deref() {
+        Some(desc) => legacy_account_id(desc),
+        None => state
+            .service
+            .legacy_find_prepared_transfer_account_id(&transfer_id)?
+            .ok_or_else(|| {
+                RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
+            })?,
+    };
     state.service.legacy_commit_prepared_transfer(
         &account_id,
         &transfer_id,
@@ -601,7 +697,7 @@ fn legacy_wallet_dir(data_dir: &Path, desc: &str) -> PathBuf {
         .join(legacy_account_hash(desc))
 }
 
-fn legacy_account_id(desc: &str) -> String {
+pub(crate) fn legacy_account_id(desc: &str) -> String {
     format!("legacy-desc:{}", legacy_account_hash(desc))
 }
 
