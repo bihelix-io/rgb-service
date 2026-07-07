@@ -77,6 +77,9 @@ async fn legacy_allowlist_middleware(
 }
 
 fn legacy_ip_allowed(config: &LegacyConfig, ip: IpAddr) -> bool {
+    if config.allowed_ips.is_empty() {
+        return true;
+    }
     if config.allow_loopback && ip.is_loopback() {
         return true;
     }

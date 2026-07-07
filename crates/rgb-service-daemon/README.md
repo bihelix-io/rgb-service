@@ -229,9 +229,8 @@ external signing. The daemon still does not hold BTC private keys.
 
 Current gaps before exposing this beyond trusted local testing:
 
-- Legacy allowlist is IP-based only; add reverse-proxy policy, mTLS or HMAC
-  request signing before using it across hosts.
-- `allowed_ips` currently matches exact IPs only, not CIDR ranges.
+- Legacy allowlist is IP-based only. Empty `allowed_ips` means no IP
+  restriction; once compatibility is verified, set exact caller IPs here.
 - `/transfer/psbt` supports exactly one RGB assignment for now.
 - `/transfer/callback` requires `desc` and `transfer_id`; it does not yet infer
   prepared state from a raw transaction alone.
