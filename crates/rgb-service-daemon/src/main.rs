@@ -7,11 +7,18 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use axum::serve;
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, State},
+    http::Request,
+    middleware::{self, Next},
+    response::Response,
+    serve,
+};
 use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::{sha256, Hash, HashEngine},
@@ -392,8 +399,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service
             .logger
             .info("legacy wallet-service-v2 compatible routes enabled");
-        app = app.merge(legacy::router(service, legacy_config));
+        app = app.merge(legacy::router(Arc::clone(&service), legacy_config));
     }
+    app = app.route_layer(middleware::from_fn_with_state(
+        Arc::clone(&service),
+        access_log_middleware,
+    ));
     let listener = TcpListener::bind(bind).await?;
 
     serve(
@@ -422,6 +433,47 @@ fn load_config(path: &str) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
     }
     config.rna.validate()?;
     Ok(config)
+}
+
+async fn access_log_middleware(
+    State(service): State<Arc<LocalDaemonService>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let method = req.method().clone();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let forwarded_for = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let latency_ms = started.elapsed().as_millis();
+    service.logger.info(format!(
+        "access remote={} forwarded_for={} method={} path={} status={} latency_ms={} user_agent={}",
+        remote.ip(),
+        forwarded_for,
+        method,
+        path,
+        status,
+        latency_ms,
+        user_agent
+    ));
+    response
 }
 
 fn spawn_recovery_scanner(service: Arc<LocalDaemonService>) {
