@@ -267,6 +267,36 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+fn wallet_v2_import_usage() -> &'static str {
+    "usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir> [--offset N] [--limit N]"
+}
+
+fn parse_wallet_v2_import_range(
+    args: &[String],
+) -> Result<WalletV2ImportRange, Box<dyn std::error::Error>> {
+    let mut range = WalletV2ImportRange::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--offset" => {
+                index += 1;
+                let value = args.get(index).ok_or(wallet_v2_import_usage())?;
+                range.offset = value.parse::<usize>()?;
+            }
+            "--limit" => {
+                index += 1;
+                let value = args.get(index).ok_or(wallet_v2_import_usage())?;
+                range.limit = Some(value.parse::<usize>()?);
+            }
+            value => {
+                return Err(format!("unknown import-wallet-v2 option: {value}").into());
+            }
+        }
+        index += 1;
+    }
+    Ok(range)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
@@ -317,27 +347,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.get(1).is_some_and(|arg| arg == "import-wallet-v2") {
-        let config_path = args
-            .get(2)
-            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
-        let sql_path = args
-            .get(3)
-            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
-        let data_dir = args
-            .get(4)
-            .ok_or("usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir>")?;
+        let config_path = args.get(2).ok_or(wallet_v2_import_usage())?;
+        let sql_path = args.get(3).ok_or(wallet_v2_import_usage())?;
+        let data_dir = args.get(4).ok_or(wallet_v2_import_usage())?;
+        let range = parse_wallet_v2_import_range(&args[5..])?;
         let config = load_config(config_path)?;
         fs::create_dir_all(&config.service.data_dir)?;
         let service = LocalDaemonService::new(config).await?;
-        let summary = service.import_wallet_v2(Path::new(sql_path), Path::new(data_dir))?;
+        let summary = service.import_wallet_v2(Path::new(sql_path), Path::new(data_dir), range)?;
         println!(
-            "imported wallet-service-v2: catalog_entries={} accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={}",
+            "imported wallet-service-v2: catalog_entries={} accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={} offset={} limit={}",
             summary.catalog_entries,
             summary.accounts,
             summary.addresses,
             summary.utxos,
             summary.stocks_imported,
-            summary.stocks_missing
+            summary.stocks_missing,
+            range.offset,
+            range
+                .limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "all".to_string())
         );
         return Ok(());
     }
@@ -778,6 +808,12 @@ struct WalletV2ImportSummary {
     utxos: usize,
     stocks_imported: usize,
     stocks_missing: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WalletV2ImportRange {
+    offset: usize,
+    limit: Option<usize>,
 }
 
 #[derive(Default)]
@@ -1339,6 +1375,7 @@ impl LocalDaemonService {
         &self,
         sql_path: &Path,
         wallet_v2_data_dir: &Path,
+        range: WalletV2ImportRange,
     ) -> rgb_service_api::Result<WalletV2ImportSummary> {
         let text = fs::read_to_string(sql_path)
             .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
@@ -1405,7 +1442,8 @@ impl LocalDaemonService {
                 });
         }
 
-        for account in accounts {
+        let limit = range.limit.unwrap_or(usize::MAX);
+        for account in accounts.into_iter().skip(range.offset).take(limit) {
             let account_id = legacy::legacy_account_id(&account.desc);
             self.get_or_create_profile(&account_id)?;
             self.put_legacy_account_desc(&account_id, &account.desc)?;
