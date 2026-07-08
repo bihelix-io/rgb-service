@@ -15,6 +15,8 @@ query_fee = 1
 enabled = false
 allow_loopback = true
 allowed_ips = []
+sync_timeout_secs = 30
+reveal_address_count = 20
 # Keep legacy RGB RNA fee collection disabled until the BitPocket path is
 # verified end-to-end.
 rgb_fee_enabled = false

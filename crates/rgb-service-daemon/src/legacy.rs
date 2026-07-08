@@ -33,7 +33,6 @@ use crate::{LegacyConfig, LocalDaemonService, PreparedTransferRecipient};
 
 const LEGACY_BDK_MAGIC: &[u8] = b"RgbDaemonLegacyBdk";
 const BDK_FILE: &str = "bdk_wallet";
-const REVEAL_ADDRESS_COUNT: u32 = 1000;
 const DEFAULT_RGB_DUST_SATS: u64 = 1000;
 
 #[derive(Clone)]
@@ -105,7 +104,7 @@ async fn create_account(
     Json(req): Json<CreateAccountReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
     let account_id = legacy_account_id(&req.desc);
-    let _wallet = open_legacy_wallet(&state.service, &req.desc)?;
+    let _wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
     state.service.get_or_create_profile(&account_id)?;
     state
         .service
@@ -338,8 +337,8 @@ async fn issue_asset(
 ) -> Result<Json<IssueAssetResp>, LegacyHttpError> {
     let _ = (&req.terms, &req.issuer);
     let account_id = legacy_account_id(&req.desc);
-    let mut wallet = open_legacy_wallet(&state.service, &req.desc)?;
-    sync_legacy_wallet(&state.service, &mut wallet)?;
+    let mut wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
+    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
     let allocation_outpoint = match req.utxo {
         Some(utxo) => OutPoint::from_str(&utxo)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
@@ -417,8 +416,8 @@ async fn transfer_psbt(
         .as_deref()
         .ok_or_else(|| RgbServiceError::InvalidRequest("desc is required".to_string()))?;
     let account_id = legacy_account_id(desc);
-    let mut wallet = open_legacy_wallet(&state.service, desc)?;
-    sync_legacy_wallet(&state.service, &mut wallet)?;
+    let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
+    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
 
     maybe_add_legacy_rgb_fee_assignment(&state, &mut req.assign)?;
 
@@ -821,6 +820,7 @@ impl LegacyWallet {
 
 fn open_legacy_wallet(
     service: &LocalDaemonService,
+    config: &LegacyConfig,
     desc: &str,
 ) -> Result<LegacyWallet, LegacyHttpError> {
     let network = service.network()?;
@@ -842,16 +842,18 @@ fn open_legacy_wallet(
             .create_wallet(&mut db)
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?,
     };
-    let _ = wallet.reveal_addresses_to(KeychainKind::External, REVEAL_ADDRESS_COUNT);
+    let reveal_count = config.reveal_address_count.max(1);
+    let _ = wallet.reveal_addresses_to(KeychainKind::External, reveal_count);
     Ok(LegacyWallet { wallet, db })
 }
 
 fn sync_legacy_wallet(
     service: &LocalDaemonService,
+    config: &LegacyConfig,
     wallet: &mut LegacyWallet,
 ) -> Result<(), LegacyHttpError> {
     let client = bdk_esplora::esplora_client::Builder::new(&service.config.esplora_url)
-        .timeout(10)
+        .timeout(config.sync_timeout_secs.max(1))
         .build_blocking();
     let request = wallet.wallet.start_sync_with_revealed_spks().build();
     let update = client

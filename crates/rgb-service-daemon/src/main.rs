@@ -86,6 +86,10 @@ struct LegacyConfig {
     allow_loopback: bool,
     #[serde(default)]
     allowed_ips: Vec<String>,
+    #[serde(default = "default_legacy_sync_timeout_secs")]
+    sync_timeout_secs: u64,
+    #[serde(default = "default_legacy_reveal_address_count")]
+    reveal_address_count: u32,
     #[serde(default)]
     rgb_fee_enabled: bool,
     #[serde(default)]
@@ -102,6 +106,8 @@ impl Default for LegacyConfig {
             enabled: false,
             allow_loopback: default_legacy_allow_loopback(),
             allowed_ips: Vec::new(),
+            sync_timeout_secs: default_legacy_sync_timeout_secs(),
+            reveal_address_count: default_legacy_reveal_address_count(),
             rgb_fee_enabled: false,
             rgb_fee_collector_address: None,
             rgb_fee_contract_id: None,
@@ -112,6 +118,14 @@ impl Default for LegacyConfig {
 
 fn default_legacy_allow_loopback() -> bool {
     true
+}
+
+fn default_legacy_sync_timeout_secs() -> u64 {
+    30
+}
+
+fn default_legacy_reveal_address_count() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Deserialize)]
