@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::Request,
+    http::{header::CACHE_CONTROL, HeaderValue, Request},
     middleware::{self, Next},
     response::Response,
     serve,
@@ -486,7 +486,10 @@ async fn access_log_middleware(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("-")
         .to_string();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let status = response.status().as_u16();
     let latency_ms = started.elapsed().as_millis();
     service.logger.info(format!(
