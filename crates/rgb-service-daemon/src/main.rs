@@ -20,12 +20,13 @@ use axum::{
     serve,
 };
 use bdk_electrum::electrum_client::{self, ElectrumApi};
+use bdk_wallet::{descriptor::ExtendedDescriptor, file_store, ChangeSet, KeychainKind, Wallet};
 use bdk_esplora::esplora_client;
 use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::{sha256, Hash, HashEngine},
     secp256k1::{ecdsa, Message, PublicKey, Secp256k1},
-    OutPoint, Psbt, Transaction, Txid,
+    Address, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid,
 };
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson};
 use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
@@ -62,6 +63,7 @@ mod legacy;
 // wallet-service-v2 migration: legacy RGB stock directories are nested under
 // each descriptor-derived account id using this historical RGB runtime path.
 const WALLET_V2_RGB_PATH: &str = "0_11_1_rc_3";
+const WALLET_V2_BDK_MAGIC: &[u8] = b"LocalBtcWallet";
 
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
@@ -307,6 +309,366 @@ fn wallet_v2_import_usage() -> &'static str {
     "usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir> [--offset N] [--limit N]"
 }
 
+fn wallet_v2_inspect_usage() -> &'static str {
+    "usage: rgb-service inspect-wallet-v2-current-allocations <wallet-v2.sql> <wallet-v2-local-data-dir> <account-match>"
+}
+
+fn wallet_v2_repair_usage() -> &'static str {
+    "usage: rgb-service repair-wallet-v2-account-utxos <config.toml> <wallet-v2.sql> [--account ACCOUNT_ID_OR_DESC_OR_ADDRESS] [--skip-chain-check] [--write]"
+}
+
+fn decode_script_address_usage() -> &'static str {
+    "usage: rgb-service decode-script-address <script_pubkey_hex> [mainnet|testnet|signet|regtest]"
+}
+
+fn parse_bitcoin_network(name: Option<&str>) -> Result<Network, Box<dyn std::error::Error>> {
+    match name.unwrap_or("mainnet") {
+        "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+        "testnet" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(format!("unknown bitcoin network: {other}").into()),
+    }
+}
+
+fn decode_script_address(script_hex: &str, network: Network) -> rgb_service_api::Result<String> {
+    let bytes =
+        hex_decode(script_hex).map_err(|err| RgbServiceError::Backend(format!("decode hex: {err}")))?;
+    let script = ScriptBuf::from_bytes(bytes);
+    Address::from_script(&script, network)
+        .map(|address| address.to_string())
+        .map_err(|err| RgbServiceError::Backend(format!("script to address: {err}")))
+}
+
+fn inspect_wallet_v2_current_allocations(
+    sql_path: &Path,
+    wallet_v2_data_dir: &Path,
+    account_match: &str,
+) -> rgb_service_api::Result<()> {
+    let text = fs::read_to_string(sql_path)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
+    let mut matched = None;
+    for line in text.lines() {
+        let Some(account) = parse_wallet_v2_account_insert(line)? else {
+            continue;
+        };
+        if account.desc_id == account_match
+            || account.desc == account_match
+            || account.addresses.iter().any(|address| address == account_match)
+        {
+            matched = Some(account);
+            break;
+        }
+    }
+    let account = matched.ok_or_else(|| {
+        RgbServiceError::NotFound(format!("wallet-v2 account not found for {account_match}"))
+    })?;
+
+    let wallet_path = wallet_v2_data_dir.join(&account.desc_id).join("bdk_wallet");
+    let stock_dir = wallet_v2_data_dir
+        .join(&account.desc_id)
+        .join(WALLET_V2_RGB_PATH);
+    let descriptor = ExtendedDescriptor::from_str(&account.desc)
+        .map_err(|err| RgbServiceError::Backend(format!("parse descriptor: {err}")))?;
+    let network = Network::Bitcoin;
+    let (mut db, _) = file_store::Store::<ChangeSet>::load_or_create(
+        WALLET_V2_BDK_MAGIC,
+        wallet_path.clone(),
+    )
+    .map_err(|err| RgbServiceError::Backend(format!("open wallet-v2 BDK store: {err}")))?;
+    let wallet = Wallet::load()
+        .descriptor(KeychainKind::External, Some(descriptor.clone()))
+        .check_network(network)
+        .load_wallet(&mut db)
+        .map_err(|err| RgbServiceError::Backend(format!("load wallet-v2 BDK wallet: {err}")))?
+        .ok_or_else(|| {
+            RgbServiceError::Backend(format!(
+                "wallet-v2 BDK wallet missing at {}",
+                wallet_path.display()
+            ))
+        })?;
+
+    let tracked = wallet
+        .list_unspent()
+        .map(|utxo| Rgb20TrackedUtxo {
+            outpoint: utxo.outpoint,
+            address: Address::from_script(&utxo.txout.script_pubkey, network)
+                .ok()
+                .map(|address| address.to_string()),
+            confirmed: utxo.chain_position.is_confirmed(),
+        })
+        .collect::<Vec<_>>();
+    let allocations = list_legacy_rgb20_assets_for_utxos(&stock_dir, tracked.clone())
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+
+    println!("desc_id={}", account.desc_id);
+    println!(
+        "primary_address={}",
+        account.addresses.first().map(String::as_str).unwrap_or("")
+    );
+    println!("wallet_path={}", wallet_path.display());
+    println!("stock_dir={}", stock_dir.display());
+    println!("current_utxos={}", tracked.len());
+    for utxo in &tracked {
+        println!(
+            "utxo outpoint={} address={} confirmed={}",
+            utxo.outpoint,
+            utxo.address.as_deref().unwrap_or(""),
+            utxo.confirmed
+        );
+    }
+    println!("current_rgb_allocations={}", allocations.len());
+    for allocation in allocations {
+        println!(
+            "allocation outpoint={} address={} contract_id={} amount_raw={} confirmed={}",
+            allocation.outpoint,
+            allocation.address.as_deref().unwrap_or(""),
+            allocation.contract_id,
+            allocation.amount_raw,
+            allocation.confirmed
+        );
+    }
+    Ok(())
+}
+
+fn wallet_v2_account_matches(account: &WalletV2Account, account_match: &str) -> bool {
+    account.desc_id == account_match
+        || account.desc == account_match
+        || legacy::legacy_account_id(&account.desc) == account_match
+        || account.addresses.iter().any(|address| address == account_match)
+}
+
+fn parse_wallet_v2_rgb_assign_vout(rgb_seal: &str, transfer_txid: &str) -> Option<u32> {
+    if let Ok(vout) = rgb_seal.parse::<u32>() {
+        return Some(vout);
+    }
+    let (txid, vout) = rgb_seal.split_once(':')?;
+    if txid != transfer_txid {
+        return None;
+    }
+    vout.parse::<u32>().ok()
+}
+
+fn parse_wallet_v2_open_rgb_vouts(fascia_json: &str) -> rgb_service_api::Result<BTreeSet<u32>> {
+    let fascia: Value = serde_json::from_str(fascia_json)
+        .map_err(|err| RgbServiceError::Backend(format!("parse wallet-v2 fascia JSON: {err}")))?;
+    let mut vouts = BTreeSet::new();
+    let Some(bundles) = fascia.get("bundles").and_then(Value::as_object) else {
+        return Ok(vouts);
+    };
+    for bundle in bundles.values() {
+        let Some(transitions) = bundle.get("knownTransitions").and_then(Value::as_array) else {
+            continue;
+        };
+        for transition in transitions {
+            let Some(assignments) = transition
+                .get("transition")
+                .and_then(|value| value.get("assignments"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for assignment in assignments.values() {
+                let Some(items) = assignment.get("items").and_then(Value::as_array) else {
+                    continue;
+                };
+                for item in items {
+                    let Some(seal) = item.get("seal").and_then(Value::as_object) else {
+                        continue;
+                    };
+                    if seal.get("txid").is_some_and(|txid| !txid.is_null()) {
+                        continue;
+                    }
+                    let Some(vout) = seal.get("vout").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    vouts.insert(vout as u32);
+                }
+            }
+        }
+    }
+    Ok(vouts)
+}
+
+fn parse_wallet_v2_psbt_output_addresses(
+    psbt_json: &str,
+    network: Network,
+) -> rgb_service_api::Result<HashMap<u32, String>> {
+    let psbt: Value = serde_json::from_str(psbt_json)
+        .map_err(|err| RgbServiceError::Backend(format!("parse wallet-v2 PSBT JSON: {err}")))?;
+    let outputs = psbt
+        .get("unsigned_tx")
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            RgbServiceError::Backend("wallet-v2 PSBT JSON missing unsigned_tx.output".to_string())
+        })?;
+    let mut addresses = HashMap::new();
+    for (vout, output) in outputs.iter().enumerate() {
+        let Some(script_hex) = output.get("script_pubkey").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Ok(address) = decode_script_address(script_hex, network) {
+            addresses.insert(vout as u32, address);
+        }
+    }
+    Ok(addresses)
+}
+
+fn rebuild_wallet_v2_owned_utxos(
+    sql_path: &Path,
+    network: Network,
+    options: &WalletV2RepairOptions,
+) -> rgb_service_api::Result<(HashMap<String, Vec<TrackedUtxo>>, WalletV2RepairSummary)> {
+    let text = fs::read_to_string(sql_path)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
+    let mut accounts = Vec::new();
+    let mut transfers = HashMap::<String, WalletV2Transfer>::new();
+    let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
+    let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
+
+    for line in text.lines() {
+        if let Some(account) = parse_wallet_v2_account_insert(line)? {
+            accounts.push(account);
+            continue;
+        }
+        if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
+            transfers.insert(transfer.id.clone(), transfer);
+            continue;
+        }
+        if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
+            rgb_assigns.push(rgb_assign);
+            continue;
+        }
+        if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
+            issue_utxos.push(issue_utxo);
+        }
+    }
+
+    let matched_accounts = accounts
+        .iter()
+        .filter(|account| {
+            match options.account_match.as_deref() {
+                Some(account_match) => wallet_v2_account_matches(account, account_match),
+                None => true,
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut desc_to_account = HashMap::new();
+    for account in &matched_accounts {
+        desc_to_account.insert(account.desc.clone(), legacy::legacy_account_id(&account.desc));
+    }
+
+    let mut by_account = HashMap::<String, BTreeMap<String, TrackedUtxo>>::new();
+    let mut summary = WalletV2RepairSummary {
+        accounts_scanned: accounts.len(),
+        accounts_matched: matched_accounts.len(),
+        ..WalletV2RepairSummary::default()
+    };
+
+    for issue_utxo in issue_utxos {
+        let Some(account_id) = desc_to_account.get(&issue_utxo.desc) else {
+            continue;
+        };
+        let utxo = TrackedUtxo {
+            outpoint: issue_utxo.outpoint.clone(),
+            address: None,
+            confirmed: true,
+        };
+        by_account
+            .entry(account_id.clone())
+            .or_default()
+            .insert(utxo.outpoint.clone(), utxo);
+        summary.issue_utxos += 1;
+    }
+
+    let mut rgb_assign_vouts_by_transfer = HashMap::<String, BTreeSet<u32>>::new();
+    for rgb_assign in &rgb_assigns {
+        let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
+            continue;
+        };
+        if let Some(vout) = parse_wallet_v2_rgb_assign_vout(&rgb_assign.rgb_seal, &transfer.txid) {
+            rgb_assign_vouts_by_transfer
+                .entry(rgb_assign.transfer_id.clone())
+                .or_default()
+                .insert(vout);
+        }
+        let Some(desc) = &rgb_assign.desc else {
+            continue;
+        };
+        let Some(account_id) = desc_to_account.get(desc) else {
+            continue;
+        };
+        if !transfer.confirmed {
+            continue;
+        }
+        let outpoint = if rgb_assign.rgb_seal.contains(':') {
+            rgb_assign.rgb_seal.clone()
+        } else {
+            format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
+        };
+        let utxo = TrackedUtxo {
+            outpoint: outpoint.clone(),
+            address: Some(rgb_assign.address.clone()),
+            confirmed: true,
+        };
+        by_account
+            .entry(account_id.clone())
+            .or_default()
+            .insert(outpoint, utxo);
+        summary.receiver_utxos += 1;
+    }
+
+    for transfer in transfers.values() {
+        if !transfer.confirmed {
+            continue;
+        }
+        summary.transfers_examined += 1;
+        let Some(sender_account_id) = desc_to_account.get(&transfer.sender) else {
+            continue;
+        };
+        let (Some(fascia_json), Some(psbt_json)) =
+            (transfer.fascia_json.as_deref(), transfer.psbt_json.as_deref())
+        else {
+            continue;
+        };
+        let open_vouts = parse_wallet_v2_open_rgb_vouts(fascia_json)?;
+        if open_vouts.is_empty() {
+            continue;
+        }
+        let output_addresses = parse_wallet_v2_psbt_output_addresses(psbt_json, network)?;
+        let claimed_vouts = rgb_assign_vouts_by_transfer
+            .get(&transfer.id)
+            .cloned()
+            .unwrap_or_default();
+        for vout in open_vouts {
+            if claimed_vouts.contains(&vout) {
+                continue;
+            }
+            let outpoint = format!("{}:{vout}", transfer.txid);
+            let utxo = TrackedUtxo {
+                outpoint: outpoint.clone(),
+                address: output_addresses.get(&vout).cloned(),
+                confirmed: true,
+            };
+            by_account
+                .entry(sender_account_id.clone())
+                .or_default()
+                .insert(outpoint, utxo);
+            summary.sender_change_utxos += 1;
+        }
+    }
+
+    let finalized = by_account
+        .into_iter()
+        .map(|(account_id, utxos)| (account_id, utxos.into_values().collect::<Vec<_>>()))
+        .collect::<HashMap<_, _>>();
+
+    Ok((finalized, summary))
+}
+
 fn parse_wallet_v2_import_range(
     args: &[String],
 ) -> Result<WalletV2ImportRange, Box<dyn std::error::Error>> {
@@ -331,6 +693,27 @@ fn parse_wallet_v2_import_range(
         index += 1;
     }
     Ok(range)
+}
+
+fn parse_wallet_v2_repair_options(
+    args: &[String],
+) -> Result<WalletV2RepairOptions, Box<dyn std::error::Error>> {
+    let mut options = WalletV2RepairOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--account" => {
+                index += 1;
+                let value = args.get(index).ok_or(wallet_v2_repair_usage())?;
+                options.account_match = Some(value.clone());
+            }
+            "--skip-chain-check" => options.skip_chain_check = true,
+            "--write" => options.write = true,
+            value => return Err(format!("unknown repair-wallet-v2-account-utxos option: {value}").into()),
+        }
+        index += 1;
+    }
+    Ok(options)
 }
 
 #[tokio::main]
@@ -363,6 +746,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary.allocations,
             out_path
         );
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "inspect-wallet-v2-current-allocations")
+    {
+        let sql_path = args.get(2).ok_or(wallet_v2_inspect_usage())?;
+        let data_dir = args.get(3).ok_or(wallet_v2_inspect_usage())?;
+        let account_match = args.get(4).ok_or(wallet_v2_inspect_usage())?;
+        inspect_wallet_v2_current_allocations(
+            Path::new(sql_path),
+            Path::new(data_dir),
+            account_match,
+        )?;
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|arg| arg == "decode-script-address") {
+        let script_hex = args.get(2).ok_or(decode_script_address_usage())?;
+        let network = parse_bitcoin_network(args.get(3).map(String::as_str))?;
+        println!("{}", decode_script_address(script_hex, network)?);
         return Ok(());
     }
     if args
@@ -404,6 +807,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .limit
                 .map(|limit| limit.to_string())
                 .unwrap_or_else(|| "all".to_string())
+        );
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "repair-wallet-v2-account-utxos")
+    {
+        let config_path = args.get(2).ok_or(wallet_v2_repair_usage())?;
+        let sql_path = args.get(3).ok_or(wallet_v2_repair_usage())?;
+        let options = parse_wallet_v2_repair_options(&args[4..])?;
+        let config = load_config(config_path)?;
+        fs::create_dir_all(&config.service.data_dir)?;
+        let network = parse_network(&config.service.network)
+            .map_err(|err| RgbServiceError::Backend(format!("parse service.network: {err}")))?;
+        let (rebuilt, mut summary) =
+            rebuild_wallet_v2_owned_utxos(Path::new(sql_path), network, &options)?;
+        let service = if options.skip_chain_check && !options.write {
+            None
+        } else {
+            Some(LocalDaemonService::new(config).await?)
+        };
+        for (account_id, utxos) in rebuilt {
+            let mut live = Vec::new();
+            for utxo in utxos {
+                if !options.skip_chain_check {
+                    let outpoint = OutPoint::from_str(&utxo.outpoint)
+                        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+                    if utxo.confirmed
+                        && !service
+                            .as_ref()
+                            .expect("service exists when chain checks are enabled")
+                            .chain_outpoint_unspent(outpoint)?
+                    {
+                        continue;
+                    }
+                }
+                live.push(utxo);
+            }
+            summary.current_unspent_utxos += live.len();
+            if options.write {
+                service
+                    .as_ref()
+                    .expect("service exists when writes are enabled")
+                    .replace_account_utxos(&account_id, live.clone())?;
+                summary.written_utxos += live.len();
+            }
+            if !live.is_empty() {
+                println!(
+                    "wallet-v2 repaired account_id={} live_utxos={} mode={}",
+                    account_id,
+                    live.len(),
+                    if options.write { "write" } else { "dry-run" }
+                );
+            }
+        }
+        println!(
+            "wallet-v2 repair summary: accounts_scanned={} accounts_matched={} transfers_examined={} issue_utxos={} receiver_utxos={} sender_change_utxos={} current_unspent_utxos={} written_utxos={} mode={}",
+            summary.accounts_scanned,
+            summary.accounts_matched,
+            summary.transfers_examined,
+            summary.issue_utxos,
+            summary.receiver_utxos,
+            summary.sender_change_utxos,
+            summary.current_unspent_utxos,
+            summary.written_utxos,
+            if options.write { "write" } else { "dry-run" }
         );
         return Ok(());
     }
@@ -889,7 +1358,10 @@ struct WalletV2Account {
 struct WalletV2Transfer {
     id: String,
     txid: String,
+    sender: String,
     confirmed: bool,
+    psbt_json: Option<String>,
+    fascia_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -922,6 +1394,13 @@ struct WalletV2ImportRange {
     limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct WalletV2RepairOptions {
+    account_match: Option<String>,
+    skip_chain_check: bool,
+    write: bool,
+}
+
 #[derive(Default)]
 struct WalletV2FileBalanceExportSummary {
     accounts: usize,
@@ -929,6 +1408,18 @@ struct WalletV2FileBalanceExportSummary {
     stocks_missing: usize,
     utxos: usize,
     allocations: usize,
+}
+
+#[derive(Default)]
+struct WalletV2RepairSummary {
+    accounts_scanned: usize,
+    accounts_matched: usize,
+    transfers_examined: usize,
+    issue_utxos: usize,
+    receiver_utxos: usize,
+    sender_change_utxos: usize,
+    current_unspent_utxos: usize,
+    written_utxos: usize,
 }
 
 impl TokenCatalogEntry {
@@ -1296,6 +1787,23 @@ impl LocalDaemonService {
             );
         }
         Ok(utxos)
+    }
+
+    fn replace_account_utxos(
+        &self,
+        account_id: &str,
+        utxos: Vec<TrackedUtxo>,
+    ) -> rgb_service_api::Result<()> {
+        let existing = self.list_account_utxos(account_id)?;
+        let existing_outpoints = existing
+            .into_iter()
+            .map(|utxo| utxo.outpoint)
+            .collect::<BTreeSet<_>>();
+        self.remove_account_utxos(account_id, existing_outpoints)?;
+        for utxo in utxos {
+            self.put_account_utxo(account_id, utxo)?;
+        }
+        Ok(())
     }
 
     fn account_rgb20_utxos(
@@ -3317,7 +3825,10 @@ fn parse_wallet_v2_transfer_insert(
     Ok(Some(WalletV2Transfer {
         id: required_sql_string(&row, "id")?,
         txid: required_sql_string(&row, "txid")?,
+        sender: required_sql_string(&row, "sender")?,
         confirmed: optional_sql_string(&row, "status") == "2",
+        psbt_json: row.get("psbt").and_then(|value| value.clone()),
+        fascia_json: row.get("fascia").and_then(|value| value.clone()),
     }))
 }
 
