@@ -307,7 +307,7 @@ fn csv_field(value: &str) -> String {
 }
 
 fn wallet_v2_import_usage() -> &'static str {
-    "usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir> [--offset N] [--limit N]"
+    "usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir> [--offset N] [--limit N] [--skip-chain-check]"
 }
 
 fn wallet_v2_inspect_usage() -> &'static str {
@@ -687,6 +687,7 @@ fn parse_wallet_v2_import_range(
                 let value = args.get(index).ok_or(wallet_v2_import_usage())?;
                 range.limit = Some(value.parse::<usize>()?);
             }
+            "--skip-chain-check" => range.skip_chain_check = true,
             value => {
                 return Err(format!("unknown import-wallet-v2 option: {value}").into());
             }
@@ -1393,6 +1394,7 @@ struct WalletV2ImportSummary {
 struct WalletV2ImportRange {
     offset: usize,
     limit: Option<usize>,
+    skip_chain_check: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2172,7 +2174,7 @@ impl LocalDaemonService {
                     }
                     let outpoint = OutPoint::from_str(&utxo.outpoint)
                         .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-                    if utxo.confirmed && !self.chain_outpoint_unspent(outpoint)? {
+                    if !range.skip_chain_check && utxo.confirmed && !self.chain_outpoint_unspent(outpoint)? {
                         continue;
                     }
                     self.put_account_utxo(&account_id, utxo)?;
