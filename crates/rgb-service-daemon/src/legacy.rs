@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -29,7 +29,7 @@ use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
 use rgb_service_local::{prepare_rgb20_psbt, select_rgb20_inputs, Rgb20PsbtAssignment};
 use serde::{Deserialize, Serialize};
 
-use crate::{LegacyConfig, LocalDaemonService};
+use crate::{LegacyConfig, LocalDaemonService, PreparedTransferRecipient};
 
 const LEGACY_BDK_MAGIC: &[u8] = b"RgbDaemonLegacyBdk";
 const BDK_FILE: &str = "bdk_wallet";
@@ -39,6 +39,7 @@ const DEFAULT_RGB_DUST_SATS: u64 = 1000;
 #[derive(Clone)]
 struct LegacyState {
     service: Arc<LocalDaemonService>,
+    config: LegacyConfig,
 }
 
 pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> Router {
@@ -54,10 +55,10 @@ pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> 
         .route("/transfer/callback", post(transfer_callback))
         .route("/transfer/cancel", post(transfer_cancel))
         .route_layer(middleware::from_fn_with_state(
-            config,
+            config.clone(),
             legacy_allowlist_middleware,
         ))
-        .with_state(LegacyState { service })
+        .with_state(LegacyState { service, config })
 }
 
 async fn legacy_allowlist_middleware(
@@ -396,9 +397,16 @@ struct TransferPsbtResp {
     psbt: String,
 }
 
+#[derive(Clone)]
+struct LegacyParsedRgbAssignment {
+    recipient_index: usize,
+    contract_id: rgb_service_local::rgbstd::ContractId,
+    amount: u64,
+}
+
 async fn transfer_psbt(
     State(state): State<LegacyState>,
-    Json(req): Json<TransferReq>,
+    Json(mut req): Json<TransferReq>,
 ) -> Result<Json<TransferPsbtResp>, LegacyHttpError> {
     if req.assign.is_empty() {
         return Err(RgbServiceError::InvalidRequest("assign is empty".to_string()).into());
@@ -411,38 +419,39 @@ async fn transfer_psbt(
     let mut wallet = open_legacy_wallet(&state.service, desc)?;
     sync_legacy_wallet(&state.service, &mut wallet)?;
 
-    let rgb_assignments =
-        req.assign
-            .iter()
-            .enumerate()
-            .flat_map(|(recipient_index, assign)| {
-                assign.rgb_assign.iter().map(move |(contract_id, amount)| {
-                    (recipient_index, contract_id.clone(), *amount)
-                })
-            })
-            .collect::<Vec<_>>();
-    if rgb_assignments.len() != 1 {
+    maybe_add_legacy_rgb_fee_assignment(&state, &mut req.assign)?;
+
+    let rgb_assignments = parse_legacy_rgb_assignments(&req.assign)?;
+    if rgb_assignments.is_empty() {
         return Err(RgbServiceError::InvalidRequest(
-            "legacy transfer/psbt currently supports exactly one RGB assignment".to_string(),
+            "legacy transfer/psbt requires at least one RGB assignment".to_string(),
         )
         .into());
     }
-    let (rgb_recipient_index, contract_id, rgb_amount) = rgb_assignments[0].clone();
-    let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&contract_id)
-        .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
 
     let wallet_outpoints = wallet
         .wallet
         .list_unspent()
         .map(|utxo| utxo.outpoint)
         .collect::<Vec<_>>();
-    let rgb_inputs = select_rgb20_inputs(
-        &state.service.account_stock_dir(&account_id),
-        wallet_outpoints,
-        contract_id,
-        rgb_amount,
-    )
-    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+    let rgb_totals = aggregate_legacy_rgb_amounts(&rgb_assignments)?;
+    let mut rgb_inputs = BTreeSet::new();
+    for (contract_id, amount) in &rgb_totals {
+        let have = legacy_rgb_balance(&state.service, &account_id, contract_id)?;
+        if have < *amount {
+            return Err(legacy_rgb_insufficient_error(contract_id, *amount, have));
+        }
+        for outpoint in select_rgb20_inputs(
+            &state.service.account_stock_dir(&account_id),
+            wallet_outpoints.clone(),
+            *contract_id,
+            *amount,
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?
+        {
+            rgb_inputs.insert(outpoint);
+        }
+    }
 
     let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
         .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
@@ -487,32 +496,56 @@ async fn transfer_psbt(
     let psbt = builder
         .finish()
         .map_err(|err| RgbServiceError::Backend(format!("failed to build BTC PSBT: {err}")))?;
-    let recipient_vout = find_recipient_vout(
-        &psbt,
-        &recipient_scripts[rgb_recipient_index].0,
-        recipient_scripts[rgb_recipient_index].1,
-    )?;
-    let change_vout = find_change_vout(&psbt, &change_script, recipient_vout)?;
+    let recipient_vouts = find_recipient_vouts(&psbt, &recipient_scripts)?;
+    let rgb_recipient_vouts = rgb_assignments
+        .iter()
+        .map(|assignment| {
+            recipient_vouts[assignment.recipient_index].ok_or_else(|| {
+                RgbServiceError::Backend("built PSBT is missing RGB recipient output".to_string())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let change_vout = find_change_vout(&psbt, &change_script, &rgb_recipient_vouts)?;
+    let psbt_assignments =
+        rgb_assignments
+            .iter()
+            .zip(rgb_recipient_vouts.iter())
+            .map(|(assignment, vout)| Rgb20PsbtAssignment {
+                contract_id: assignment.contract_id,
+                amount: assignment.amount,
+                vout: *vout,
+            });
     let prepared = prepare_rgb20_psbt(
         &state.service.account_stock_dir(&account_id),
         psbt,
         change_vout,
-        [Rgb20PsbtAssignment {
-            contract_id,
-            amount: rgb_amount,
-            vout: recipient_vout,
-        }],
+        psbt_assignments,
     )
     .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
 
     let transfer_id = legacy_transfer_id(&prepared.psbt);
+    let recipients = rgb_assignments
+        .iter()
+        .zip(rgb_recipient_vouts.iter())
+        .map(|(assignment, vout)| PreparedTransferRecipient {
+            asset_id: assignment.contract_id.to_string(),
+            recipient_account_id: legacy_account_id_from_recipient(
+                &req.assign[assignment.recipient_index].address,
+            ),
+            recipient_vout: *vout,
+        })
+        .collect::<Vec<_>>();
+    let first_recipient = recipients.first().ok_or_else(|| {
+        RgbServiceError::InvalidRequest("legacy transfer/psbt requires recipient".to_string())
+    })?;
     state.service.legacy_put_prepared_transfer(
         &account_id,
         &transfer_id,
-        contract_id.to_string(),
-        legacy_account_id_from_recipient(&req.assign[rgb_recipient_index].address),
-        recipient_vout,
+        first_recipient.asset_id.clone(),
+        first_recipient.recipient_account_id.clone(),
+        first_recipient.recipient_vout,
         &prepared.fascia,
+        recipients,
     )?;
     wallet.persist()?;
     Ok(Json(TransferPsbtResp {
@@ -520,31 +553,175 @@ async fn transfer_psbt(
     }))
 }
 
-fn find_recipient_vout(psbt: &Psbt, script: &ScriptBuf, sats: u64) -> Result<u32, LegacyHttpError> {
-    psbt.unsigned_tx
-        .output
+fn maybe_add_legacy_rgb_fee_assignment(
+    state: &LegacyState,
+    assignments: &mut Vec<TransferAssign>,
+) -> Result<(), LegacyHttpError> {
+    if !state.config.rgb_fee_enabled {
+        return Ok(());
+    }
+    if assignments
+        .iter()
+        .all(|assign| assign.rgb_assign.is_empty())
+    {
+        return Ok(());
+    }
+    let collector = state
+        .config
+        .rgb_fee_collector_address
+        .as_deref()
+        .filter(|address| !address.trim().is_empty())
+        .ok_or_else(|| {
+            RgbServiceError::InvalidRequest(
+                "legacy RGB fee collector address is not configured".to_string(),
+            )
+        })?;
+    let contract_id = legacy_rna_fee_contract_id(state)?;
+    let amount = state
+        .config
+        .rgb_fee_amount
+        .unwrap_or(state.service.rna.transfer_fee);
+    assignments.push(TransferAssign {
+        address: collector.to_string(),
+        sats: Some(DEFAULT_RGB_DUST_SATS),
+        rgb_assign: HashMap::from([(contract_id, amount)]),
+    });
+    Ok(())
+}
+
+fn legacy_rna_fee_contract_id(state: &LegacyState) -> Result<String, LegacyHttpError> {
+    if let Some(contract_id) = state
+        .config
+        .rgb_fee_contract_id
+        .as_deref()
+        .filter(|contract_id| !contract_id.trim().is_empty())
+    {
+        rgb_service_local::rgbstd::ContractId::from_str(contract_id)
+            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+        return Ok(contract_id.to_string());
+    }
+    state
+        .service
+        .list_token_catalog_entries()?
+        .into_iter()
+        .find(|entry| entry.ticker == "RNA")
+        .map(|entry| entry.contract_id)
+        .ok_or_else(|| {
+            RgbServiceError::NotFound("RNA asset not found in catalog".to_string()).into()
+        })
+}
+
+fn parse_legacy_rgb_assignments(
+    assignments: &[TransferAssign],
+) -> Result<Vec<LegacyParsedRgbAssignment>, LegacyHttpError> {
+    assignments
         .iter()
         .enumerate()
-        .find(|(_, output)| {
-            output.script_pubkey == *script && (sats == 0 || output.value == Amount::from_sat(sats))
+        .flat_map(|(recipient_index, assign)| {
+            assign
+                .rgb_assign
+                .iter()
+                .map(move |(contract_id, amount)| (recipient_index, contract_id, amount))
         })
-        .map(|(vout, _)| vout as u32)
-        .ok_or_else(|| {
-            RgbServiceError::Backend("built PSBT is missing recipient output".to_string()).into()
+        .map(|(recipient_index, contract_id, amount)| {
+            let contract_id = rgb_service_local::rgbstd::ContractId::from_str(contract_id)
+                .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+            Ok(LegacyParsedRgbAssignment {
+                recipient_index,
+                contract_id,
+                amount: *amount,
+            })
         })
+        .collect()
+}
+
+fn aggregate_legacy_rgb_amounts(
+    assignments: &[LegacyParsedRgbAssignment],
+) -> Result<HashMap<rgb_service_local::rgbstd::ContractId, u64>, LegacyHttpError> {
+    let mut totals = HashMap::new();
+    for assignment in assignments {
+        totals
+            .entry(assignment.contract_id)
+            .and_modify(|amount: &mut u64| {
+                *amount = amount.saturating_add(assignment.amount);
+            })
+            .or_insert(assignment.amount);
+    }
+    Ok(totals)
+}
+
+fn legacy_rgb_balance(
+    service: &LocalDaemonService,
+    account_id: &str,
+    contract_id: &rgb_service_local::rgbstd::ContractId,
+) -> Result<u64, LegacyHttpError> {
+    let list = service.legacy_list_assets(account_id)?;
+    let contract_id = contract_id.to_string();
+    Ok(list
+        .utxo_assets
+        .values()
+        .flat_map(|allocations| allocations.iter())
+        .filter(|allocation| allocation.asset_id == contract_id)
+        .map(|allocation| allocation.amount)
+        .sum())
+}
+
+fn legacy_rgb_insufficient_error(
+    contract_id: &rgb_service_local::rgbstd::ContractId,
+    need: u64,
+    have: u64,
+) -> LegacyHttpError {
+    LegacyHttpError::with_code(
+        RgbServiceError::InvalidRequest(format!(
+            "insufficient rgb balance: contract {contract_id}, need {need}, have {have}"
+        )),
+        22,
+    )
+}
+
+fn find_recipient_vouts(
+    psbt: &Psbt,
+    recipients: &[(ScriptBuf, u64)],
+) -> Result<Vec<Option<u32>>, LegacyHttpError> {
+    let mut used = HashSet::new();
+    recipients
+        .iter()
+        .map(|(script, sats)| {
+            if *sats == 0 {
+                return Ok(None);
+            }
+            let vout = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .enumerate()
+                .find(|(vout, output)| {
+                    !used.contains(vout)
+                        && output.script_pubkey == *script
+                        && output.value == Amount::from_sat(*sats)
+                })
+                .map(|(vout, _)| vout)
+                .ok_or_else(|| {
+                    RgbServiceError::Backend("built PSBT is missing recipient output".to_string())
+                })?;
+            used.insert(vout);
+            Ok(Some(vout as u32))
+        })
+        .collect::<Result<Vec<_>, RgbServiceError>>()
+        .map_err(Into::into)
 }
 
 fn find_change_vout(
     psbt: &Psbt,
     change_script: &ScriptBuf,
-    recipient_vout: u32,
+    recipient_vouts: &[u32],
 ) -> Result<u32, LegacyHttpError> {
     psbt.unsigned_tx
         .output
         .iter()
         .enumerate()
         .find(|(vout, output)| {
-            *vout as u32 != recipient_vout
+            !recipient_vouts.contains(&(*vout as u32))
                 && output.script_pubkey == *change_script
                 && output.value > Amount::ZERO
         })
@@ -716,17 +893,32 @@ fn legacy_transfer_id(psbt: &Psbt) -> String {
     psbt.unsigned_tx.compute_txid().to_string()
 }
 
-struct LegacyHttpError(RgbServiceError);
+struct LegacyHttpError {
+    err: RgbServiceError,
+    legacy_code: Option<u8>,
+}
+
+impl LegacyHttpError {
+    fn with_code(err: RgbServiceError, legacy_code: u8) -> Self {
+        Self {
+            err,
+            legacy_code: Some(legacy_code),
+        }
+    }
+}
 
 impl From<RgbServiceError> for LegacyHttpError {
     fn from(err: RgbServiceError) -> Self {
-        Self(err)
+        Self {
+            err,
+            legacy_code: None,
+        }
     }
 }
 
 impl IntoResponse for LegacyHttpError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
+        let status = match &self.err {
             RgbServiceError::Unauthorized(_) | RgbServiceError::SignatureRequired(_) => {
                 StatusCode::UNAUTHORIZED
             }
@@ -739,10 +931,11 @@ impl IntoResponse for LegacyHttpError {
             RgbServiceError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             RgbServiceError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (
-            status,
-            Json(serde_json::json!({ "message": self.0.to_string() })),
-        )
-            .into_response()
+        let message = self.err.to_string();
+        let body = match self.legacy_code {
+            Some(code) => serde_json::json!({ "code": code, "message": message }),
+            None => serde_json::json!({ "message": message }),
+        };
+        (status, Json(body)).into_response()
     }
 }

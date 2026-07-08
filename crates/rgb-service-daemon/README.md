@@ -89,6 +89,15 @@ esplora_url = "http://127.0.0.1:3002"
 issue_fee = 1000
 transfer_fee = 100
 query_fee = 1
+
+[legacy]
+enabled = false
+allow_loopback = true
+allowed_ips = []
+rgb_fee_enabled = false
+# rgb_fee_collector_address = "bc1q..."
+rgb_fee_contract_id = "rgb:nykNCHhT-BgKdtCi-ilF89kf-JilBhg0-JfInd9k-7MyyYOE"
+rgb_fee_amount = 100
 ```
 
 Example mainnet server configuration:
@@ -227,11 +236,18 @@ with Esplora, builds the BTC PSBT with BDK, selects required RGB UTXOs from the
 daemon stock, writes the RGB commitment, and returns the unsigned PSBT for
 external signing. The daemon still does not hold BTC private keys.
 
+Legacy RGB RNA fee collection is implemented but disabled by default. When
+`[legacy].rgb_fee_enabled = true`, `/transfer/psbt` appends a dust output to
+`rgb_fee_collector_address`, assigns the configured RNA fee to that output, and
+prepares all requested RGB assignments in one RGB PSBT. Leave it disabled until
+the BitPocket routing path has been verified.
+
 Current gaps before exposing this beyond trusted local testing:
 
 - Legacy allowlist is IP-based only. Empty `allowed_ips` means no IP
   restriction; once compatibility is verified, set exact caller IPs here.
-- `/transfer/psbt` supports exactly one RGB assignment for now.
+- `/transfer/psbt` supports multiple RGB assignments, including optional RNA
+  RGB fee collection when `[legacy].rgb_fee_enabled = true`.
 - `/transfer/callback` requires `desc` and `transfer_id`; it does not yet infer
   prepared state from a raw transaction alone.
 - `/transfer/callback` commits RGB state but does not broadcast the BTC

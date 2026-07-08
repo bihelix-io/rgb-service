@@ -86,6 +86,14 @@ struct LegacyConfig {
     allow_loopback: bool,
     #[serde(default)]
     allowed_ips: Vec<String>,
+    #[serde(default)]
+    rgb_fee_enabled: bool,
+    #[serde(default)]
+    rgb_fee_collector_address: Option<String>,
+    #[serde(default)]
+    rgb_fee_contract_id: Option<String>,
+    #[serde(default)]
+    rgb_fee_amount: Option<u64>,
 }
 
 impl Default for LegacyConfig {
@@ -94,6 +102,10 @@ impl Default for LegacyConfig {
             enabled: false,
             allow_loopback: default_legacy_allow_loopback(),
             allowed_ips: Vec::new(),
+            rgb_fee_enabled: false,
+            rgb_fee_collector_address: None,
+            rgb_fee_contract_id: None,
+            rgb_fee_amount: None,
         }
     }
 }
@@ -807,6 +819,28 @@ struct PreparedTransferRecord {
     recipient_account_id: String,
     recipient_vout: u32,
     fascia: Vec<u8>,
+    #[serde(default)]
+    recipients: Vec<PreparedTransferRecipient>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PreparedTransferRecipient {
+    asset_id: String,
+    recipient_account_id: String,
+    recipient_vout: u32,
+}
+
+impl PreparedTransferRecord {
+    fn recipients_or_legacy(&self) -> Vec<PreparedTransferRecipient> {
+        if !self.recipients.is_empty() {
+            return self.recipients.clone();
+        }
+        vec![PreparedTransferRecipient {
+            asset_id: self.asset_id.clone(),
+            recipient_account_id: self.recipient_account_id.clone(),
+            recipient_vout: self.recipient_vout,
+        }]
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1681,6 +1715,7 @@ impl LocalDaemonService {
         recipient_account_id: String,
         recipient_vout: u32,
         fascia: &rgb_service_local::rgbstd::containers::Fascia,
+        recipients: Vec<PreparedTransferRecipient>,
     ) -> rgb_service_api::Result<()> {
         let fascia = encode_fascia_bytes(fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
@@ -1692,6 +1727,7 @@ impl LocalDaemonService {
                 recipient_account_id,
                 recipient_vout,
                 fascia,
+                recipients,
             },
         )
     }
@@ -1712,23 +1748,25 @@ impl LocalDaemonService {
         stage_sender_fascia(&stock_dir, txid, &fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         self.register_pending_stock_dir(&stock_dir)?;
-        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&record.asset_id)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
-        let consignment = build_rgb20_transfer_consignment(
-            &stock_dir,
-            fascia,
-            contract_id,
-            txid,
-            record.recipient_vout,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
-        stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+        for recipient in record.recipients_or_legacy() {
+            let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&recipient.asset_id)
+                .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+            let consignment = build_rgb20_transfer_consignment(
+                &stock_dir,
+                fascia.clone(),
+                contract_id,
+                txid,
+                recipient.recipient_vout,
+            )
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        self.register_pending_stock_dir(&receiver_stock_dir)?;
-        let receiver_outpoint = format!("{}:{}", txid, record.recipient_vout);
-        let receiver_utxo = Self::issue_utxo(receiver_outpoint, utxos);
-        self.put_account_utxo(&record.recipient_account_id, receiver_utxo)?;
+            let receiver_stock_dir = self.account_stock_dir(&recipient.recipient_account_id);
+            stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            self.register_pending_stock_dir(&receiver_stock_dir)?;
+            let receiver_outpoint = format!("{}:{}", txid, recipient.recipient_vout);
+            let receiver_utxo = Self::issue_utxo(receiver_outpoint, utxos.clone());
+            self.put_account_utxo(&recipient.recipient_account_id, receiver_utxo)?;
+        }
         Ok(())
     }
 
@@ -2566,6 +2604,11 @@ impl RgbServiceApi for LocalDaemonService {
                 recipient_account_id: payload.recipient.clone(),
                 recipient_vout,
                 fascia,
+                recipients: vec![PreparedTransferRecipient {
+                    asset_id: payload.asset_id.clone(),
+                    recipient_account_id: payload.recipient.clone(),
+                    recipient_vout,
+                }],
             };
             self.put_prepared_transfer(&account_id, &transfer_id, &record)?;
             Ok(PrepareTransferResponse {
@@ -2591,23 +2634,25 @@ impl RgbServiceApi for LocalDaemonService {
         stage_sender_fascia(&stock_dir, txid, &fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         self.register_pending_stock_dir(&stock_dir)?;
-        let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&record.asset_id)
-            .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
-        let consignment = build_rgb20_transfer_consignment(
-            &stock_dir,
-            fascia,
-            contract_id,
-            txid,
-            record.recipient_vout,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let receiver_stock_dir = self.account_stock_dir(&record.recipient_account_id);
-        stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+        for recipient in record.recipients_or_legacy() {
+            let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&recipient.asset_id)
+                .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
+            let consignment = build_rgb20_transfer_consignment(
+                &stock_dir,
+                fascia.clone(),
+                contract_id,
+                txid,
+                recipient.recipient_vout,
+            )
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        self.register_pending_stock_dir(&receiver_stock_dir)?;
-        let receiver_outpoint = format!("{}:{}", req.payload.txid, record.recipient_vout);
-        let receiver_utxo = Self::issue_utxo(receiver_outpoint, req.payload.utxos.clone());
-        self.put_account_utxo(&record.recipient_account_id, receiver_utxo)?;
+            let receiver_stock_dir = self.account_stock_dir(&recipient.recipient_account_id);
+            stage_receiver_transfer(&receiver_stock_dir, txid, &consignment)
+                .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            self.register_pending_stock_dir(&receiver_stock_dir)?;
+            let receiver_outpoint = format!("{}:{}", req.payload.txid, recipient.recipient_vout);
+            let receiver_utxo = Self::issue_utxo(receiver_outpoint, req.payload.utxos.clone());
+            self.put_account_utxo(&recipient.recipient_account_id, receiver_utxo)?;
+        }
         Ok(CommitTransferResponse {
             transfer_id: req.payload.transfer_id,
             operation_id: txid.to_string(),
