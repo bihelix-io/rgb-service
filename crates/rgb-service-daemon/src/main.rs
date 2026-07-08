@@ -64,6 +64,7 @@ mod legacy;
 // each descriptor-derived account id using this historical RGB runtime path.
 const WALLET_V2_RGB_PATH: &str = "0_11_1_rc_3";
 const WALLET_V2_BDK_MAGIC: &[u8] = b"LocalBtcWallet";
+const ELECTRUM_TIMEOUT_SECS: u8 = 10;
 
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
@@ -1881,7 +1882,10 @@ impl LocalDaemonService {
         outpoint: OutPoint,
     ) -> rgb_service_api::Result<bool> {
         let client = self.electrum_with_retry("electrum client", || {
-            electrum_client::Client::new(&normalize_electrum_url(url))
+            let config = electrum_client::ConfigBuilder::new()
+                .timeout(Some(ELECTRUM_TIMEOUT_SECS))
+                .build();
+            electrum_client::Client::from_config(&normalize_electrum_url(url), config)
         })?;
         let funding_tx =
             self.electrum_with_retry("electrum tx fetch", || client.transaction_get(&outpoint.txid))?;
