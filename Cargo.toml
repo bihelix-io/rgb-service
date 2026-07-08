@@ -14,6 +14,7 @@ members = [
     "crates/ln-rgb-lightning",
     "crates/zust-console",
     "crates/rgb-schemas",
+    "crates/wallet-v2-reader",
 ]
 resolver = "2"
 

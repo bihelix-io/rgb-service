@@ -19,7 +19,7 @@ use rgbstd::{
     containers::{
         BuilderSeal, Consignment, ConsignmentExt, Fascia, FileContent, Transfer, ValidTransfer,
     },
-    contract::{AllocatedState, ContractBuilder, IssuerWrapper},
+    contract::{AllocatedState, ContractBuilder, FilterIncludeAll, IssuerWrapper},
     indexers::{esplora_blocking::esplora_client, AnyResolver},
     persistence::{fjall::FjallBinStore, fs::FsBinStore, StashReadProvider, Stock},
     stl::{AssetSpec, ContractTerms, Name, Ticker},
@@ -421,6 +421,111 @@ pub fn import_rgb20_stock_from_fs(source_stock_dir: &Path, target_stock_dir: &Pa
     })
 }
 
+pub fn import_selected_rgb20_contracts_from_fs(
+    source_stock_dir: &Path,
+    target_stock_dir: &Path,
+    network: Network,
+    chain_source: &ChainSource,
+    contract_ids: impl IntoIterator<Item = ContractId>,
+) -> Result<Vec<Rgb20ContractInfo>> {
+    let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
+        .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
+    let source_stock: Stock = Stock::load(source_provider, true).map_err(|err| {
+        anyhow!(
+            "load legacy RGB stock {}: {err:?}",
+            source_stock_dir.display()
+        )
+    })?;
+
+    let mut imported = Vec::new();
+    with_rgb_stock_write_lock(target_stock_dir, || {
+        let mut target_stock = open_or_create_stock(target_stock_dir)?;
+        for contract_id in contract_ids {
+            let Ok(contract_data) = source_stock.contract_data(contract_id) else {
+                continue;
+            };
+
+            let spec = contract_data
+                .global("spec")
+                .next()
+                .map(|strict_val| AssetSpec::from_strict_val_unchecked(&strict_val));
+            let (ticker, name, precision) = spec
+                .map(|spec| {
+                    (
+                        spec.ticker.to_string(),
+                        spec.name.to_string(),
+                        spec.precision.decimals(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new(), 0));
+
+            let opids = contract_data
+                .fungible("assetOwner", FilterIncludeAll)
+                .map_err(|err| anyhow!("load fungible state for {contract_id}: {err:?}"))?
+                .map(|allocation| allocation.opout.op)
+                .collect::<BTreeSet<_>>();
+
+            if opids.is_empty() {
+                let contract = source_stock
+                    .export_contract(contract_id)
+                    .map_err(|err| anyhow!("export contract {contract_id}: {err:?}"))?;
+                let resolver = rgb_resolver_with_consignment(
+                    network,
+                    chain_source,
+                    &contract,
+                    std::iter::empty::<Transaction>(),
+                )?;
+                let validation = ValidationConfig {
+                    chain_net: network_to_rgb(network),
+                    trusted_typesystem: contract.types.clone(),
+                    ..Default::default()
+                };
+                let valid = contract
+                    .validate(&resolver, &validation)
+                    .map_err(|err| anyhow!("validate contract {contract_id}: {err:?}"))?;
+                target_stock
+                    .import_contract(valid, resolver)
+                    .map_err(|err| anyhow!("import contract {contract_id}: {err:?}"))?;
+            } else {
+                let transfer = source_stock
+                    .transfer(contract_id, [], [], opids.iter().copied(), None)
+                    .map_err(|err| anyhow!("export transfer branch {contract_id}: {err:?}"))?;
+                let resolver = rgb_resolver_with_consignment(
+                    network,
+                    chain_source,
+                    &transfer,
+                    std::iter::empty::<Transaction>(),
+                )?;
+                let validation = ValidationConfig {
+                    chain_net: network_to_rgb(network),
+                    trusted_typesystem: transfer.types.clone(),
+                    ..Default::default()
+                };
+                let valid = transfer
+                    .validate(&resolver, &validation)
+                    .map_err(|err| anyhow!("validate transfer {contract_id}: {err:?}"))?;
+                target_stock
+                    .accept_transfer(valid, resolver)
+                    .map_err(|err| anyhow!("accept transfer {contract_id}: {err:?}"))?;
+            }
+
+            imported.push(Rgb20ContractInfo {
+                contract_id,
+                ticker,
+                name,
+                precision,
+            });
+        }
+
+        target_stock
+            .store()
+            .map_err(|err| anyhow!("persist target RGB stock: {err:?}"))?;
+        Ok(())
+    })?;
+
+    Ok(imported)
+}
+
 // wallet-service-v2 migration: inspect allocations directly from legacy stock
 // files for dry-run balance reconciliation before importing.
 pub fn list_legacy_rgb20_assets_for_utxos(
@@ -436,6 +541,79 @@ pub fn list_legacy_rgb20_assets_for_utxos(
         )
     })?;
     list_rgb20_assets_from_stock(&stock, utxos)
+}
+
+pub fn list_legacy_rgb20_assets_for_contracts(
+    source_stock_dir: &Path,
+    contract_ids: impl IntoIterator<Item = ContractId>,
+) -> Result<Vec<Rgb20AssetAllocation>> {
+    let selected = contract_ids
+        .into_iter()
+        .collect::<HashSet<ContractId>>();
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
+        .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
+    let stock: Stock = Stock::load(source_provider, true).map_err(|err| {
+        anyhow!(
+            "load legacy RGB stock {}: {err:?}",
+            source_stock_dir.display()
+        )
+    })?;
+
+    let mut assets = Vec::new();
+    for contract in stock
+        .contracts()
+        .map_err(|err| anyhow!("failed to list RGB contracts: {err:?}"))?
+    {
+        if !selected.contains(&contract.id) {
+            continue;
+        }
+
+        let contract_data = stock
+            .contract_data(contract.id)
+            .map_err(|err| anyhow!("failed to load RGB contract data: {err:?}"))?;
+
+        let spec = contract_data
+            .global("spec")
+            .next()
+            .map(|strict_val| AssetSpec::from_strict_val_unchecked(&strict_val));
+
+        let Ok(allocations) = contract_data.fungible("assetOwner", FilterIncludeAll) else {
+            continue;
+        };
+
+        for allocation in allocations {
+            let amount_raw = allocation.state.value();
+            let (ticker, name, precision) = spec
+                .as_ref()
+                .map(|spec| (
+                    spec.ticker.to_string(),
+                    spec.name.to_string(),
+                    spec.precision,
+                ))
+                .unwrap_or_else(|| (String::new(), String::new(), rgbstd::Precision::Indivisible));
+
+            assets.push(Rgb20AssetAllocation {
+                contract_id: contract.id,
+                outpoint: allocation.seal.to_outpoint(),
+                address: None,
+                amount: allocation.state,
+                amount_raw,
+                amount_display: rgbstd::CoinAmount::new(allocation.state, precision).to_string(),
+                amount_encoding: allocation.state.to_string(),
+                ticker,
+                name,
+                precision: precision.decimals(),
+                witness: allocation.witness,
+                confirmed: true,
+            });
+        }
+    }
+
+    Ok(assets)
 }
 
 pub fn select_rgb20_inputs(

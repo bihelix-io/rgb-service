@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
     fs::OpenOptions,
     io::Write,
@@ -20,7 +20,6 @@ use axum::{
     serve,
 };
 use bdk_electrum::electrum_client::{self, ElectrumApi};
-use bdk_wallet::{descriptor::ExtendedDescriptor, file_store, ChangeSet, KeychainKind, Wallet};
 use bdk_esplora::esplora_client;
 use bitcoin::{
     consensus::{deserialize, serialize},
@@ -48,11 +47,18 @@ use rgb_service_api::{
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
-    import_rgb20_stock_from_fs, issue_rgb20_fixed_with_chain_source,
-    list_legacy_rgb20_assets_for_utxos, list_rgb20_assets_for_utxos, list_rgb20_contracts,
-    normalize_electrum_url, prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks,
-    stage_receiver_transfer, stage_sender_fascia, ChainSource, Rgb20IssueRequest,
-    Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    import_rgb20_stock_from_fs,
+    issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
+    list_rgb20_assets_for_utxos, list_rgb20_contracts, normalize_electrum_url, prepare_rgb20_psbt,
+    rgbstd::{
+        contract::FilterIncludeAll,
+        persistence::{fs::FsBinStore, StashReadProvider, Stock},
+        stl::AssetSpec,
+        vm::WitnessOrd,
+        ContractId as RgbContractId,
+    },
+    scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
+    ChainSource, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,7 +69,16 @@ mod legacy;
 // wallet-service-v2 migration: legacy RGB stock directories are nested under
 // each descriptor-derived account id using this historical RGB runtime path.
 const WALLET_V2_RGB_PATH: &str = "0_11_1_rc_3";
-const WALLET_V2_BDK_MAGIC: &[u8] = b"LocalBtcWallet";
+// Historical bdk_wallet 1.1.0 file-store magic bytes. The daemon's bdk_wallet
+// 2.x cannot read these files directly, so recovery now shells out to the
+// bundled `wallet-v2-reader` binary. The magic strings are retained as the
+// canonical identifiers of the legacy on-disk formats.
+#[allow(dead_code)]
+const WALLET_V2_BDK_MAGIC_LOCAL: &[u8] = b"LocalBtcWallet";
+#[allow(dead_code)]
+const WALLET_V2_BDK_MAGIC_RGB: &[u8] = b"RgbWallet";
+#[allow(dead_code)]
+const WALLET_V2_BDK_MAGICS: [&[u8]; 2] = [WALLET_V2_BDK_MAGIC_LOCAL, WALLET_V2_BDK_MAGIC_RGB];
 const ELECTRUM_TIMEOUT_SECS: u8 = 10;
 
 #[derive(Debug, Deserialize)]
@@ -156,258 +171,385 @@ impl RnaConfig {
     }
 }
 
-// wallet-service-v2 migration: dry-run helper used to compare the SQL-derived
-// UTXO ownership map with allocations stored in the legacy RGB stock files.
-fn export_wallet_v2_file_balances(
-    sql_path: &Path,
-    wallet_v2_data_dir: &Path,
-    out_path: &Path,
-) -> rgb_service_api::Result<WalletV2FileBalanceExportSummary> {
-    let text = fs::read_to_string(sql_path)
-        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
-    let mut accounts = Vec::new();
-    let mut transfers = HashMap::<String, WalletV2Transfer>::new();
-    let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
-    let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
-
-    for line in text.lines() {
-        if let Some(account) = parse_wallet_v2_account_insert(line)? {
-            accounts.push(account);
-            continue;
-        }
-        if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
-            transfers.insert(transfer.id.clone(), transfer);
-            continue;
-        }
-        if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
-            rgb_assigns.push(rgb_assign);
-            continue;
-        }
-        if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
-            issue_utxos.push(issue_utxo);
-        }
-    }
-
-    let mut sql_utxos_by_desc = HashMap::<String, Vec<TrackedUtxo>>::new();
-    for issue_utxo in issue_utxos {
-        sql_utxos_by_desc
-            .entry(issue_utxo.desc)
-            .or_default()
-            .push(TrackedUtxo {
-                outpoint: issue_utxo.outpoint,
-                address: None,
-                confirmed: true,
-            });
-    }
-    for rgb_assign in rgb_assigns {
-        let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
-            continue;
-        };
-        if !transfer.confirmed {
-            continue;
-        }
-        let Some(desc) = rgb_assign.desc else {
-            continue;
-        };
-        let outpoint = if rgb_assign.rgb_seal.contains(':') {
-            rgb_assign.rgb_seal
-        } else {
-            format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
-        };
-        sql_utxos_by_desc
-            .entry(desc)
-            .or_default()
-            .push(TrackedUtxo {
-                outpoint,
-                address: Some(rgb_assign.address),
-                confirmed: true,
-            });
-    }
-
-    if let Some(parent) = out_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|err| RgbServiceError::Backend(format!("create export dir: {err}")))?;
-    }
-    let mut out = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(out_path)
-        .map_err(|err| RgbServiceError::Backend(format!("open export CSV: {err}")))?;
-    writeln!(
-        out,
-        "desc_id,primary_address,outpoint,address,contract_id,amount_raw,confirmed"
-    )
-    .map_err(|err| RgbServiceError::Backend(format!("write export CSV header: {err}")))?;
-
-    let mut summary = WalletV2FileBalanceExportSummary::default();
-    for account in accounts {
-        summary.accounts += 1;
-        let source_stock_dir = wallet_v2_data_dir
-            .join(&account.desc_id)
-            .join(WALLET_V2_RGB_PATH);
-        if !source_stock_dir.exists() {
-            summary.stocks_missing += 1;
-            continue;
-        }
-        summary.stocks_found += 1;
-        let tracked = sql_utxos_by_desc
-            .remove(&account.desc)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|utxo| {
-                let outpoint = OutPoint::from_str(&utxo.outpoint).map_err(|err| {
-                    RgbServiceError::Backend(format!(
-                        "invalid wallet-v2 RGB outpoint {}: {err}",
-                        utxo.outpoint
-                    ))
-                })?;
-                Ok(Rgb20TrackedUtxo {
-                    outpoint,
-                    address: utxo.address,
-                    confirmed: utxo.confirmed,
-                })
-            })
-            .collect::<rgb_service_api::Result<Vec<_>>>()?;
-        summary.utxos += tracked.len();
-        if tracked.is_empty() {
-            continue;
-        }
-        let allocations = list_legacy_rgb20_assets_for_utxos(&source_stock_dir, tracked)
-            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        for allocation in allocations {
-            summary.allocations += 1;
-            writeln!(
-                out,
-                "{},{},{},{},{},{},{}",
-                csv_field(&account.desc_id),
-                csv_field(account.addresses.first().map(String::as_str).unwrap_or("")),
-                csv_field(&allocation.outpoint.to_string()),
-                csv_field(allocation.address.as_deref().unwrap_or("")),
-                csv_field(&allocation.contract_id.to_string()),
-                allocation.amount_raw,
-                allocation.confirmed
-            )
-            .map_err(|err| RgbServiceError::Backend(format!("write export CSV row: {err}")))?;
-        }
-    }
-
-    Ok(summary)
-}
-
-fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
-
-fn wallet_v2_import_usage() -> &'static str {
-    "usage: rgb-service import-wallet-v2 <config.toml> <wallet-v2.sql> <wallet-v2-local-data-dir> [--offset N] [--limit N] [--skip-chain-check]"
-}
-
-fn wallet_v2_inspect_usage() -> &'static str {
-    "usage: rgb-service inspect-wallet-v2-current-allocations <wallet-v2.sql> <wallet-v2-local-data-dir> <account-match>"
-}
-
-fn wallet_v2_repair_usage() -> &'static str {
-    "usage: rgb-service repair-wallet-v2-account-utxos <config.toml> <wallet-v2.sql> [--account ACCOUNT_ID_OR_DESC_OR_ADDRESS] [--skip-chain-check] [--write]"
+fn wallet_v2_data_dir_usage() -> &'static str {
+    "usage: rgb-service import-wallet-v2-data-dir <config.toml> <wallet-v2-local-data-dir> [--limit N] [--dry-run]"
 }
 
 fn decode_script_address_usage() -> &'static str {
     "usage: rgb-service decode-script-address <script_pubkey_hex> [mainnet|testnet|signet|regtest]"
 }
 
-fn parse_bitcoin_network(name: Option<&str>) -> Result<Network, Box<dyn std::error::Error>> {
-    match name.unwrap_or("mainnet") {
-        "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
-        "testnet" => Ok(Network::Testnet),
-        "signet" => Ok(Network::Signet),
-        "regtest" => Ok(Network::Regtest),
-        other => Err(format!("unknown bitcoin network: {other}").into()),
+fn inspect_daemon_legacy_usage() -> &'static str {
+    "usage: rgb-service inspect-daemon-legacy-account <config.toml> <account_id_or_address>"
+}
+
+fn trace_wallet_v2_contract_usage() -> &'static str {
+    "usage: rgb-service trace-wallet-v2-contract <wallet-v2-local-data-dir> <contract_id>"
+}
+
+fn inspect_wallet_v2_witness_output_usage() -> &'static str {
+    "usage: rgb-service inspect-wallet-v2-witness-output <wallet-v2-local-data-dir> <txid> <vout>"
+}
+
+fn wallet_v2_inspect_stock_usage() -> &'static str {
+    "usage: rgb-service inspect-wallet-v2-stock <wallet-v2-local-data-dir> <desc_id-or-address> [network]"
+}
+
+#[derive(Clone)]
+struct WalletV2ContractAllocationRecord {
+    source: String,
+    outpoint: OutPoint,
+    amount_raw: u64,
+    witness: Option<Txid>,
+}
+
+#[derive(Clone)]
+struct WalletV2ContractWitnessRecord {
+    ord: Option<WitnessOrd>,
+    tx: Option<Transaction>,
+    sources: BTreeSet<String>,
+}
+
+fn witness_ord_height(ord: Option<WitnessOrd>) -> u32 {
+    match ord {
+        Some(WitnessOrd::Mined(pos)) => pos.height().into(),
+        Some(WitnessOrd::Tentative) => u32::MAX - 2,
+        Some(WitnessOrd::Ignored) => u32::MAX - 1,
+        Some(WitnessOrd::Archived) => u32::MAX,
+        None => 0,
     }
 }
 
-fn decode_script_address(script_hex: &str, network: Network) -> rgb_service_api::Result<String> {
-    let bytes =
-        hex_decode(script_hex).map_err(|err| RgbServiceError::Backend(format!("decode hex: {err}")))?;
-    let script = ScriptBuf::from_bytes(bytes);
-    Address::from_script(&script, network)
-        .map(|address| address.to_string())
-        .map_err(|err| RgbServiceError::Backend(format!("script to address: {err}")))
-}
-
-fn inspect_wallet_v2_current_allocations(
-    sql_path: &Path,
+fn trace_wallet_v2_contract(
     wallet_v2_data_dir: &Path,
-    account_match: &str,
+    contract_id: RgbContractId,
 ) -> rgb_service_api::Result<()> {
-    let text = fs::read_to_string(sql_path)
-        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
-    let mut matched = None;
-    for line in text.lines() {
-        let Some(account) = parse_wallet_v2_account_insert(line)? else {
+    let mut all_allocations = Vec::<WalletV2ContractAllocationRecord>::new();
+    let mut witness_records = BTreeMap::<Txid, WalletV2ContractWitnessRecord>::new();
+    let mut ticker = String::new();
+    let mut name = String::new();
+    let mut precision = 0u8;
+    let mut scanned_stocks = 0usize;
+    let mut matched_stocks = 0usize;
+
+    let entries = fs::read_dir(wallet_v2_data_dir)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 entry: {err}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 file type: {err}")))?;
+        if !file_type.is_dir() {
             continue;
+        }
+        let source = entry.file_name().to_string_lossy().to_string();
+        let stock_dir = entry.path().join(WALLET_V2_RGB_PATH);
+        if !stock_dir.is_dir() {
+            continue;
+        }
+        scanned_stocks += 1;
+
+        let provider = FsBinStore::new(stock_dir.clone())
+            .map_err(|err| RgbServiceError::Backend(format!("open legacy RGB stock: {err:?}")))?;
+        let stock: Stock = match Stock::load(provider, true) {
+            Ok(stock) => stock,
+            Err(_) => continue,
         };
-        if account.desc_id == account_match
-            || account.desc == account_match
-            || account.addresses.iter().any(|address| address == account_match)
-        {
-            matched = Some(account);
-            break;
+        let contract_data = match stock.contract_data(contract_id) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        matched_stocks += 1;
+
+        if ticker.is_empty() {
+            if let Some(spec_val) = contract_data.global("spec").next() {
+                let spec = AssetSpec::from_strict_val_unchecked(&spec_val);
+                ticker = spec.ticker.to_string();
+                name = spec.name.to_string();
+                precision = spec.precision.decimals();
+            }
+        }
+
+        let allocations = contract_data
+            .fungible("assetOwner", FilterIncludeAll)
+            .map_err(|err| {
+                RgbServiceError::Backend(format!("load contract fungible state: {err:?}"))
+            })?;
+        let stash = stock.as_stash_provider();
+
+        for allocation in allocations {
+            all_allocations.push(WalletV2ContractAllocationRecord {
+                source: source.clone(),
+                outpoint: allocation.seal.to_outpoint(),
+                amount_raw: allocation.state.value(),
+                witness: allocation.witness,
+            });
+
+            let Some(txid) = allocation.witness else {
+                continue;
+            };
+            let record =
+                witness_records
+                    .entry(txid)
+                    .or_insert_with(|| WalletV2ContractWitnessRecord {
+                        ord: contract_data.witness_info(txid).map(|info| info.ord),
+                        tx: None,
+                        sources: BTreeSet::new(),
+                    });
+            record.sources.insert(source.clone());
+            if record.ord.is_none() {
+                record.ord = contract_data.witness_info(txid).map(|info| info.ord);
+            }
+            if record.tx.is_none() {
+                if let Ok(witness) = stash.witness(txid) {
+                    if let Some(tx) = witness.public.tx() {
+                        record.tx = Some(tx.clone());
+                    }
+                }
+            }
         }
     }
-    let account = matched.ok_or_else(|| {
-        RgbServiceError::NotFound(format!("wallet-v2 account not found for {account_match}"))
-    })?;
 
-    let wallet_path = wallet_v2_data_dir.join(&account.desc_id).join("bdk_wallet");
-    let stock_dir = wallet_v2_data_dir
-        .join(&account.desc_id)
-        .join(WALLET_V2_RGB_PATH);
-    let descriptor = ExtendedDescriptor::from_str(&account.desc)
-        .map_err(|err| RgbServiceError::Backend(format!("parse descriptor: {err}")))?;
-    let network = Network::Bitcoin;
-    let (mut db, _) = file_store::Store::<ChangeSet>::load_or_create(
-        WALLET_V2_BDK_MAGIC,
-        wallet_path.clone(),
-    )
-    .map_err(|err| RgbServiceError::Backend(format!("open wallet-v2 BDK store: {err}")))?;
-    let wallet = Wallet::load()
-        .descriptor(KeychainKind::External, Some(descriptor.clone()))
-        .check_network(network)
-        .load_wallet(&mut db)
-        .map_err(|err| RgbServiceError::Backend(format!("load wallet-v2 BDK wallet: {err}")))?
-        .ok_or_else(|| {
-            RgbServiceError::Backend(format!(
-                "wallet-v2 BDK wallet missing at {}",
-                wallet_path.display()
+    if all_allocations.is_empty() {
+        return Err(RgbServiceError::NotFound(format!(
+            "no allocations found for contract {contract_id}"
+        )));
+    }
+
+    let mut dedup =
+        BTreeMap::<(String, u64, Option<String>), WalletV2ContractAllocationRecord>::new();
+    for allocation in all_allocations {
+        dedup
+            .entry((
+                allocation.outpoint.to_string(),
+                allocation.amount_raw,
+                allocation.witness.map(|txid| txid.to_string()),
             ))
-        })?;
+            .or_insert(allocation);
+    }
+    let allocations = dedup.into_values().collect::<Vec<_>>();
 
-    let tracked = wallet
-        .list_unspent()
-        .map(|utxo| Rgb20TrackedUtxo {
-            outpoint: utxo.outpoint,
-            address: Address::from_script(&utxo.txout.script_pubkey, network)
-                .ok()
-                .map(|address| address.to_string()),
-            confirmed: utxo.chain_position.is_confirmed(),
+    let genesis = allocations
+        .iter()
+        .filter(|allocation| allocation.witness.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let genesis_total = genesis
+        .iter()
+        .map(|allocation| allocation.amount_raw)
+        .sum::<u64>();
+
+    let known_outpoints = allocations
+        .iter()
+        .map(|allocation| allocation.outpoint)
+        .collect::<HashSet<_>>();
+    let mut consumed = HashSet::<OutPoint>::new();
+    let mut witness_rows = witness_records
+        .into_iter()
+        .map(|(txid, record)| {
+            let outputs = allocations
+                .iter()
+                .filter(|allocation| allocation.witness == Some(txid))
+                .cloned()
+                .collect::<Vec<_>>();
+            let known_inputs = record
+                .tx
+                .as_ref()
+                .map(|tx| {
+                    tx.input
+                        .iter()
+                        .map(|input| input.previous_output)
+                        .filter(|outpoint| known_outpoints.contains(outpoint))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for input in &known_inputs {
+                consumed.insert(*input);
+            }
+            let output_total = outputs
+                .iter()
+                .map(|allocation| allocation.amount_raw)
+                .sum::<u64>();
+            (
+                txid,
+                record.ord,
+                known_inputs,
+                outputs,
+                output_total,
+                record.sources,
+            )
         })
         .collect::<Vec<_>>();
+    witness_rows.sort_by(|(txid_a, ord_a, ..), (txid_b, ord_b, ..)| {
+        witness_ord_height(*ord_a)
+            .cmp(&witness_ord_height(*ord_b))
+            .then_with(|| txid_a.to_string().cmp(&txid_b.to_string()))
+    });
+
+    let mut leaves = allocations
+        .iter()
+        .filter(|allocation| !consumed.contains(&allocation.outpoint))
+        .cloned()
+        .collect::<Vec<_>>();
+    leaves.sort_by(|a, b| {
+        b.amount_raw
+            .cmp(&a.amount_raw)
+            .then_with(|| a.outpoint.to_string().cmp(&b.outpoint.to_string()))
+    });
+    let leaf_total = leaves
+        .iter()
+        .map(|allocation| allocation.amount_raw)
+        .sum::<u64>();
+
+    println!("contract_id={contract_id}");
+    println!("ticker={ticker}");
+    println!("name={name}");
+    println!("precision={precision}");
+    println!("scanned_stocks={scanned_stocks}");
+    println!("matched_stocks={matched_stocks}");
+    println!("allocations_total={}", allocations.len());
+    println!("witness_tx_total={}", witness_rows.len());
+    println!("genesis_allocations={}", genesis.len());
+    println!("genesis_total_raw={genesis_total}");
+    for allocation in &genesis {
+        println!(
+            "genesis outpoint={} amount_raw={} source={}",
+            allocation.outpoint, allocation.amount_raw, allocation.source
+        );
+    }
+
+    for (txid, ord, known_inputs, outputs, output_total, sources) in &witness_rows {
+        println!(
+            "witness txid={} ord={:?} known_bazx_inputs={} outputs={} output_total_raw={} sources={}",
+            txid,
+            ord,
+            known_inputs.len(),
+            outputs.len(),
+            output_total,
+            sources.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+        for input in known_inputs {
+            if let Some(prev) = allocations
+                .iter()
+                .find(|allocation| allocation.outpoint == *input)
+            {
+                println!(
+                    "  input outpoint={} amount_raw={}",
+                    prev.outpoint, prev.amount_raw
+                );
+            } else {
+                println!("  input outpoint={} amount_raw=unknown", input);
+            }
+        }
+        for output in outputs {
+            println!(
+                "  output outpoint={} amount_raw={} source={}",
+                output.outpoint, output.amount_raw, output.source
+            );
+        }
+    }
+
+    println!("leaf_allocations={}", leaves.len());
+    println!("leaf_total_raw={leaf_total}");
+    for allocation in &leaves {
+        println!(
+            "leaf outpoint={} amount_raw={} witness={}",
+            allocation.outpoint,
+            allocation.amount_raw,
+            allocation
+                .witness
+                .map(|txid| txid.to_string())
+                .unwrap_or_default()
+        );
+    }
+
+    Ok(())
+}
+
+// wallet-service-v2 migration: list every RGB contract (ticker, name,
+// contract_id) found across all on-disk account stocks, grouped by account.
+// Used to discover contract ids without a SQL dump.
+fn list_wallet_v2_contracts(wallet_v2_data_dir: &Path) -> rgb_service_api::Result<()> {
+    let entries = fs::read_dir(wallet_v2_data_dir)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 entry: {err}")))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let source = entry.file_name().to_string_lossy().to_string();
+        if source == "priv" {
+            continue;
+        }
+        let stock_dir = entry.path().join(WALLET_V2_RGB_PATH);
+        if !stock_dir.is_dir() {
+            continue;
+        }
+        let provider = FsBinStore::new(stock_dir.clone())
+            .map_err(|err| RgbServiceError::Backend(format!("open legacy RGB stock: {err:?}")))?;
+        let stock: Stock = match Stock::load(provider, true) {
+            Ok(stock) => stock,
+            Err(_) => continue,
+        };
+        let contracts = stock
+            .contracts()
+            .map_err(|err| RgbServiceError::Backend(format!("list contracts: {err:?}")))?;
+        for info in contracts {
+            let contract_id = info.id;
+            let (ticker, name) = stock
+                .contract_data(contract_id)
+                .ok()
+                .and_then(|data| data.global("spec").next())
+                .map(|val| {
+                    let spec = AssetSpec::from_strict_val_unchecked(&val);
+                    (spec.ticker.to_string(), spec.name.to_string())
+                })
+                .unwrap_or_else(|| (String::new(), String::new()));
+            println!("account={source} contract_id={contract_id} ticker={ticker} name={name}");
+        }
+    }
+    Ok(())
+}
+
+// wallet-service-v2 migration: inspect a single account's RGB allocations
+// directly from the on-disk data directory (no SQL dump needed). Resolves the
+// account by desc_id, opens its BDK wallet via the bundled reader to recover
+// current UTXOs, then lists every fungible allocation on those UTXOs from the
+// RGB stock.
+fn inspect_wallet_v2_stock(
+    wallet_v2_data_dir: &Path,
+    account_match: &str,
+    network: Network,
+) -> rgb_service_api::Result<()> {
+    let account_dir = resolve_wallet_v2_account_dir(wallet_v2_data_dir, account_match)?;
+    let desc_id = account_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let wallet_path = account_dir.join("bdk_wallet");
+    let stock_dir = account_dir.join(WALLET_V2_RGB_PATH);
+    let recovered = read_wallet_v2_account(&wallet_path, network, 0)?;
+    let tracked: Vec<Rgb20TrackedUtxo> = recovered
+        .utxos
+        .into_iter()
+        .map(|utxo| {
+            let outpoint = OutPoint::from_str(&utxo.outpoint)
+                .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+            Ok(Rgb20TrackedUtxo {
+                outpoint,
+                address: utxo.address,
+                confirmed: utxo.is_confirmed,
+            })
+        })
+        .collect::<rgb_service_api::Result<_>>()?;
     let allocations = list_legacy_rgb20_assets_for_utxos(&stock_dir, tracked.clone())
         .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
 
-    println!("desc_id={}", account.desc_id);
-    println!(
-        "primary_address={}",
-        account.addresses.first().map(String::as_str).unwrap_or("")
-    );
-    println!("wallet_path={}", wallet_path.display());
+    println!("desc_id={desc_id}");
+    println!("descriptor={}", recovered.descriptor);
     println!("stock_dir={}", stock_dir.display());
     println!("current_utxos={}", tracked.len());
     for utxo in &tracked {
@@ -421,297 +563,285 @@ fn inspect_wallet_v2_current_allocations(
     println!("current_rgb_allocations={}", allocations.len());
     for allocation in allocations {
         println!(
-            "allocation outpoint={} address={} contract_id={} amount_raw={} confirmed={}",
+            "allocation outpoint={} address={} contract_id={} ticker={} name={} amount_raw={} amount_display={} confirmed={}",
             allocation.outpoint,
             allocation.address.as_deref().unwrap_or(""),
             allocation.contract_id,
+            allocation.ticker,
+            allocation.name,
             allocation.amount_raw,
+            allocation.amount_display,
             allocation.confirmed
         );
     }
     Ok(())
 }
 
-fn wallet_v2_account_matches(account: &WalletV2Account, account_match: &str) -> bool {
-    account.desc_id == account_match
-        || account.desc == account_match
-        || legacy::legacy_account_id(&account.desc) == account_match
-        || account.addresses.iter().any(|address| address == account_match)
-}
-
-fn parse_wallet_v2_rgb_assign_vout(rgb_seal: &str, transfer_txid: &str) -> Option<u32> {
-    if let Ok(vout) = rgb_seal.parse::<u32>() {
-        return Some(vout);
+// Resolve a wallet-service-v2 account directory by desc_id, descriptor, or any
+// of its derived addresses (the descriptor and addresses are recovered from
+// each `bdk_wallet` file via the bundled reader).
+fn resolve_wallet_v2_account_dir(
+    wallet_v2_data_dir: &Path,
+    account_match: &str,
+) -> rgb_service_api::Result<PathBuf> {
+    // fast path: exact desc_id directory match
+    let direct = wallet_v2_data_dir.join(account_match);
+    if direct.is_dir() {
+        return Ok(direct);
     }
-    let (txid, vout) = rgb_seal.split_once(':')?;
-    if txid != transfer_txid {
-        return None;
-    }
-    vout.parse::<u32>().ok()
-}
-
-fn parse_wallet_v2_open_rgb_vouts(fascia_json: &str) -> rgb_service_api::Result<BTreeSet<u32>> {
-    let fascia: Value = serde_json::from_str(fascia_json)
-        .map_err(|err| RgbServiceError::Backend(format!("parse wallet-v2 fascia JSON: {err}")))?;
-    let mut vouts = BTreeSet::new();
-    let Some(bundles) = fascia.get("bundles").and_then(Value::as_object) else {
-        return Ok(vouts);
-    };
-    for bundle in bundles.values() {
-        let Some(transitions) = bundle.get("knownTransitions").and_then(Value::as_array) else {
+    let entries = fs::read_dir(wallet_v2_data_dir)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 entry: {err}")))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        if name == "priv" {
+            continue;
+        }
+        let wallet_path = entry.path().join("bdk_wallet");
+        if !wallet_path.exists() {
+            continue;
+        }
+        let Ok(recovered) = read_wallet_v2_account(&wallet_path, Network::Bitcoin, 1) else {
             continue;
         };
-        for transition in transitions {
-            let Some(assignments) = transition
-                .get("transition")
-                .and_then(|value| value.get("assignments"))
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            for assignment in assignments.values() {
-                let Some(items) = assignment.get("items").and_then(Value::as_array) else {
-                    continue;
-                };
-                for item in items {
-                    let Some(seal) = item.get("seal").and_then(Value::as_object) else {
-                        continue;
-                    };
-                    if seal.get("txid").is_some_and(|txid| !txid.is_null()) {
-                        continue;
-                    }
-                    let Some(vout) = seal.get("vout").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    vouts.insert(vout as u32);
-                }
-            }
+        if recovered.descriptor == account_match
+            || recovered.addresses.iter().any(|a| a == account_match)
+        {
+            return Ok(entry.path());
         }
     }
-    Ok(vouts)
+    Err(RgbServiceError::NotFound(format!(
+        "wallet-v2 account not found for {account_match}"
+    )))
 }
 
-fn parse_wallet_v2_psbt_output_addresses(
-    psbt_json: &str,
-    network: Network,
-) -> rgb_service_api::Result<HashMap<u32, String>> {
-    let psbt: Value = serde_json::from_str(psbt_json)
-        .map_err(|err| RgbServiceError::Backend(format!("parse wallet-v2 PSBT JSON: {err}")))?;
-    let outputs = psbt
-        .get("unsigned_tx")
-        .and_then(|value| value.get("output"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            RgbServiceError::Backend("wallet-v2 PSBT JSON missing unsigned_tx.output".to_string())
+fn inspect_wallet_v2_witness_output(
+    wallet_v2_data_dir: &Path,
+    txid: Txid,
+    vout: usize,
+) -> rgb_service_api::Result<()> {
+    let entries = fs::read_dir(wallet_v2_data_dir)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 entry: {err}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 file type: {err}")))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let source = entry.file_name().to_string_lossy().to_string();
+        let stock_dir = entry.path().join(WALLET_V2_RGB_PATH);
+        if !stock_dir.is_dir() {
+            continue;
+        }
+        let provider = FsBinStore::new(stock_dir.clone())
+            .map_err(|err| RgbServiceError::Backend(format!("open legacy RGB stock: {err:?}")))?;
+        let stock: Stock = match Stock::load(provider, true) {
+            Ok(stock) => stock,
+            Err(_) => continue,
+        };
+        let stash = stock.as_stash_provider();
+        let Ok(witness) = stash.witness(txid) else {
+            continue;
+        };
+        let Some(tx) = witness.public.tx() else {
+            println!("source={source}");
+            println!("txid={txid}");
+            println!("witness_has_full_tx=false");
+            return Ok(());
+        };
+        let output = tx.output.get(vout).ok_or_else(|| {
+            RgbServiceError::NotFound(format!("tx {txid} has no output vout={vout}"))
         })?;
-    let mut addresses = HashMap::new();
-    for (vout, output) in outputs.iter().enumerate() {
-        let Some(script_hex) = output.get("script_pubkey").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Ok(address) = decode_script_address(script_hex, network) {
-            addresses.insert(vout as u32, address);
-        }
-    }
-    Ok(addresses)
-}
-
-fn rebuild_wallet_v2_owned_utxos(
-    sql_path: &Path,
-    network: Network,
-    options: &WalletV2RepairOptions,
-) -> rgb_service_api::Result<(HashMap<String, Vec<TrackedUtxo>>, WalletV2RepairSummary)> {
-    let text = fs::read_to_string(sql_path)
-        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
-    let mut accounts = Vec::new();
-    let mut transfers = HashMap::<String, WalletV2Transfer>::new();
-    let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
-    let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
-
-    for line in text.lines() {
-        if let Some(account) = parse_wallet_v2_account_insert(line)? {
-            accounts.push(account);
-            continue;
-        }
-        if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
-            transfers.insert(transfer.id.clone(), transfer);
-            continue;
-        }
-        if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
-            rgb_assigns.push(rgb_assign);
-            continue;
-        }
-        if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
-            issue_utxos.push(issue_utxo);
-        }
-    }
-
-    let matched_accounts = accounts
-        .iter()
-        .filter(|account| {
-            match options.account_match.as_deref() {
-                Some(account_match) => wallet_v2_account_matches(account, account_match),
-                None => true,
-            }
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut desc_to_account = HashMap::new();
-    for account in &matched_accounts {
-        desc_to_account.insert(account.desc.clone(), legacy::legacy_account_id(&account.desc));
-    }
-
-    let mut by_account = HashMap::<String, BTreeMap<String, TrackedUtxo>>::new();
-    let mut summary = WalletV2RepairSummary {
-        accounts_scanned: accounts.len(),
-        accounts_matched: matched_accounts.len(),
-        ..WalletV2RepairSummary::default()
-    };
-
-    for issue_utxo in issue_utxos {
-        let Some(account_id) = desc_to_account.get(&issue_utxo.desc) else {
-            continue;
-        };
-        let utxo = TrackedUtxo {
-            outpoint: issue_utxo.outpoint.clone(),
-            address: None,
-            confirmed: true,
-        };
-        by_account
-            .entry(account_id.clone())
-            .or_default()
-            .insert(utxo.outpoint.clone(), utxo);
-        summary.issue_utxos += 1;
-    }
-
-    let mut rgb_assign_vouts_by_transfer = HashMap::<String, BTreeSet<u32>>::new();
-    for rgb_assign in &rgb_assigns {
-        let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
-            continue;
-        };
-        if let Some(vout) = parse_wallet_v2_rgb_assign_vout(&rgb_assign.rgb_seal, &transfer.txid) {
-            rgb_assign_vouts_by_transfer
-                .entry(rgb_assign.transfer_id.clone())
-                .or_default()
-                .insert(vout);
-        }
-        let Some(desc) = &rgb_assign.desc else {
-            continue;
-        };
-        let Some(account_id) = desc_to_account.get(desc) else {
-            continue;
-        };
-        if !transfer.confirmed {
-            continue;
-        }
-        let outpoint = if rgb_assign.rgb_seal.contains(':') {
-            rgb_assign.rgb_seal.clone()
-        } else {
-            format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
-        };
-        let utxo = TrackedUtxo {
-            outpoint: outpoint.clone(),
-            address: Some(rgb_assign.address.clone()),
-            confirmed: true,
-        };
-        by_account
-            .entry(account_id.clone())
-            .or_default()
-            .insert(outpoint, utxo);
-        summary.receiver_utxos += 1;
-    }
-
-    for transfer in transfers.values() {
-        if !transfer.confirmed {
-            continue;
-        }
-        summary.transfers_examined += 1;
-        let Some(sender_account_id) = desc_to_account.get(&transfer.sender) else {
-            continue;
-        };
-        let (Some(fascia_json), Some(psbt_json)) =
-            (transfer.fascia_json.as_deref(), transfer.psbt_json.as_deref())
-        else {
-            continue;
-        };
-        let open_vouts = parse_wallet_v2_open_rgb_vouts(fascia_json)?;
-        if open_vouts.is_empty() {
-            continue;
-        }
-        let output_addresses = parse_wallet_v2_psbt_output_addresses(psbt_json, network)?;
-        let claimed_vouts = rgb_assign_vouts_by_transfer
-            .get(&transfer.id)
-            .cloned()
+        let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+            .map(|address| address.to_string())
             .unwrap_or_default();
-        for vout in open_vouts {
-            if claimed_vouts.contains(&vout) {
-                continue;
-            }
-            let outpoint = format!("{}:{vout}", transfer.txid);
-            let utxo = TrackedUtxo {
-                outpoint: outpoint.clone(),
-                address: output_addresses.get(&vout).cloned(),
-                confirmed: true,
-            };
-            by_account
-                .entry(sender_account_id.clone())
-                .or_default()
-                .insert(outpoint, utxo);
-            summary.sender_change_utxos += 1;
-        }
+        println!("source={source}");
+        println!("txid={txid}");
+        println!("vout={vout}");
+        println!("value_sat={}", output.value.to_sat());
+        println!("script_pubkey={}", output.script_pubkey);
+        println!("address={address}");
+        return Ok(());
     }
-
-    let finalized = by_account
-        .into_iter()
-        .map(|(account_id, utxos)| (account_id, utxos.into_values().collect::<Vec<_>>()))
-        .collect::<HashMap<_, _>>();
-
-    Ok((finalized, summary))
+    Err(RgbServiceError::NotFound(format!(
+        "witness tx not found in wallet-v2 stocks: {txid}"
+    )))
 }
 
-fn parse_wallet_v2_import_range(
+fn parse_bitcoin_network(name: Option<&str>) -> Result<Network, Box<dyn std::error::Error>> {
+    match name.unwrap_or("mainnet") {
+        "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+        "testnet" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(format!("unknown bitcoin network: {other}").into()),
+    }
+}
+
+fn decode_script_address(script_hex: &str, network: Network) -> rgb_service_api::Result<String> {
+    let bytes = hex_decode(script_hex)
+        .map_err(|err| RgbServiceError::Backend(format!("decode hex: {err}")))?;
+    let script = ScriptBuf::from_bytes(bytes);
+    Address::from_script(&script, network)
+        .map(|address| address.to_string())
+        .map_err(|err| RgbServiceError::Backend(format!("script to address: {err}")))
+}
+
+// wallet-service-v2 migration: an empty RGB `MemStash` strict-encodes to 20
+// zero bytes, so any stock whose `stash.dat` is larger holds real contracts.
+fn has_real_rgb_stock(stock_dir: &Path) -> bool {
+    fs::metadata(stock_dir.join("stash.dat"))
+        .map(|meta| meta.len() > 20)
+        .unwrap_or(false)
+}
+
+// wallet-service-v2 migration: recover descriptor + UTXOs from a legacy BDK
+// wallet file. These files are written by bdk_wallet 1.1.0 / bdk_file_store
+// 0.18.1, which the daemon's bdk_wallet 2.x cannot read (incompatible file
+// format). We shell out to the bundled `wallet-v2-reader` binary (pinned to
+// bdk_wallet 1.1.0) which emits the recovered state as JSON.
+#[derive(Debug, Deserialize)]
+struct WalletV2ReaderOutput {
+    descriptor: String,
+    utxos: Vec<WalletV2ReaderUtxo>,
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletV2ReaderUtxo {
+    outpoint: String,
+    address: Option<String>,
+    is_confirmed: bool,
+}
+
+fn wallet_v2_reader_bin() -> rgb_service_api::Result<PathBuf> {
+    // Resolve the sibling binary shipped alongside this daemon binary.
+    let current = env::current_exe()
+        .map_err(|err| RgbServiceError::Backend(format!("locate current exe: {err}")))?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| RgbServiceError::Backend("current exe has no parent dir".into()))?;
+    let candidate = dir.join("wallet-v2-reader");
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    Err(RgbServiceError::Backend(format!(
+        "wallet-v2-reader binary not found next to {} (build the wallet-v2-reader crate and ship \
+         it beside rgb-service)",
+        current.display()
+    )))
+}
+
+fn read_wallet_v2_account(
+    wallet_path: &Path,
+    network: Network,
+    reveal_count: u32,
+) -> rgb_service_api::Result<WalletV2ReaderOutput> {
+    let bin = wallet_v2_reader_bin()?;
+    let network_str = match network {
+        Network::Bitcoin => "bitcoin",
+        Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+    };
+    let output = std::process::Command::new(&bin)
+        .arg(wallet_path)
+        .arg(network_str)
+        .arg("--reveal-count")
+        .arg(reveal_count.to_string())
+        .output()
+        .map_err(|err| {
+            RgbServiceError::Backend(format!(
+                "spawn wallet-v2-reader {}: {err}",
+                bin.display()
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RgbServiceError::Backend(format!(
+            "wallet-v2-reader failed for {}: {stderr}",
+            wallet_path.display()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<WalletV2ReaderOutput>(stdout.trim())
+        .map_err(|err| RgbServiceError::Backend(format!("parse wallet-v2-reader output: {err}")))
+}
+
+fn inspect_daemon_legacy_account(
+    service: &LocalDaemonService,
+    account_or_address: &str,
+) -> rgb_service_api::Result<()> {
+    let account_id = service
+        .resolve_legacy_account_id_for_address(account_or_address)?
+        .unwrap_or_else(|| account_or_address.to_string());
+    let desc = service.resolve_legacy_desc_for_account_id(&account_id)?;
+    let stock_dir = service.account_stock_dir(&account_id);
+    let tracked = service.list_account_utxos(&account_id)?;
+    let rgb_utxos = tracked
+        .iter()
+        .map(|utxo| {
+            Ok(Rgb20TrackedUtxo {
+                outpoint: OutPoint::from_str(&utxo.outpoint)
+                    .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
+                address: utxo.address.clone(),
+                confirmed: utxo.confirmed,
+            })
+        })
+        .collect::<rgb_service_api::Result<Vec<_>>>()?;
+    let allocations = list_rgb20_assets_for_utxos(&stock_dir, rgb_utxos)
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+    println!("account_id={account_id}");
+    println!("resolved_desc={}", desc.unwrap_or_default());
+    println!("stock_dir={}", stock_dir.display());
+    println!("tracked_utxos={}", tracked.len());
+    for utxo in tracked {
+        println!(
+            "tracked outpoint={} address={} confirmed={}",
+            utxo.outpoint,
+            utxo.address.as_deref().unwrap_or(""),
+            utxo.confirmed
+        );
+    }
+    println!("allocations={}", allocations.len());
+    for allocation in allocations {
+        println!(
+            "allocation outpoint={} contract_id={} amount_raw={} address={} confirmed={}",
+            allocation.outpoint,
+            allocation.contract_id,
+            allocation.amount_raw,
+            allocation.address.as_deref().unwrap_or(""),
+            allocation.confirmed
+        );
+    }
+    Ok(())
+}
+
+fn parse_wallet_v2_data_dir_options(
     args: &[String],
-) -> Result<WalletV2ImportRange, Box<dyn std::error::Error>> {
-    let mut range = WalletV2ImportRange::default();
+) -> Result<WalletV2DataDirOptions, Box<dyn std::error::Error>> {
+    let mut options = WalletV2DataDirOptions::default();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--offset" => {
-                index += 1;
-                let value = args.get(index).ok_or(wallet_v2_import_usage())?;
-                range.offset = value.parse::<usize>()?;
-            }
             "--limit" => {
                 index += 1;
-                let value = args.get(index).ok_or(wallet_v2_import_usage())?;
-                range.limit = Some(value.parse::<usize>()?);
+                let value = args.get(index).ok_or(wallet_v2_data_dir_usage())?;
+                options.limit = Some(value.parse::<usize>()?);
             }
-            "--skip-chain-check" => range.skip_chain_check = true,
+            "--dry-run" => options.dry_run = true,
             value => {
-                return Err(format!("unknown import-wallet-v2 option: {value}").into());
+                return Err(format!("unknown import-wallet-v2-data-dir option: {value}").into());
             }
-        }
-        index += 1;
-    }
-    Ok(range)
-}
-
-fn parse_wallet_v2_repair_options(
-    args: &[String],
-) -> Result<WalletV2RepairOptions, Box<dyn std::error::Error>> {
-    let mut options = WalletV2RepairOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--account" => {
-                index += 1;
-                let value = args.get(index).ok_or(wallet_v2_repair_usage())?;
-                options.account_match = Some(value.clone());
-            }
-            "--skip-chain-check" => options.skip_chain_check = true,
-            "--write" => options.write = true,
-            value => return Err(format!("unknown repair-wallet-v2-account-utxos option: {value}").into()),
         }
         index += 1;
     }
@@ -723,48 +853,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args
         .get(1)
-        .is_some_and(|arg| arg == "export-wallet-v2-file-balances")
+        .is_some_and(|arg| arg == "trace-wallet-v2-contract")
     {
-        let sql_path = args.get(2).ok_or(
-            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
-        )?;
-        let data_dir = args.get(3).ok_or(
-            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
-        )?;
-        let out_path = args.get(4).ok_or(
-            "usage: rgb-service export-wallet-v2-file-balances <wallet-v2.sql> <wallet-v2-local-data-dir> <out.csv>",
-        )?;
-        let summary = export_wallet_v2_file_balances(
-            Path::new(sql_path),
-            Path::new(data_dir),
-            Path::new(out_path),
-        )?;
-        println!(
-            "exported wallet-service-v2 file balances: accounts={} stocks_found={} stocks_missing={} utxos={} allocations={} out={}",
-            summary.accounts,
-            summary.stocks_found,
-            summary.stocks_missing,
-            summary.utxos,
-            summary.allocations,
-            out_path
-        );
+        let data_dir = args.get(2).ok_or(trace_wallet_v2_contract_usage())?;
+        let contract_id = args.get(3).ok_or(trace_wallet_v2_contract_usage())?;
+        let contract_id = RgbContractId::from_str(contract_id)
+            .map_err(|err| RgbServiceError::Backend(format!("parse contract id: {err}")))?;
+        trace_wallet_v2_contract(Path::new(data_dir), contract_id)?;
         return Ok(());
     }
     if args
         .get(1)
-        .is_some_and(|arg| arg == "inspect-wallet-v2-current-allocations")
+        .is_some_and(|arg| arg == "inspect-wallet-v2-witness-output")
     {
-        let sql_path = args.get(2).ok_or(wallet_v2_inspect_usage())?;
-        let data_dir = args.get(3).ok_or(wallet_v2_inspect_usage())?;
-        let account_match = args.get(4).ok_or(wallet_v2_inspect_usage())?;
-        inspect_wallet_v2_current_allocations(
-            Path::new(sql_path),
-            Path::new(data_dir),
-            account_match,
-        )?;
+        let data_dir = args
+            .get(2)
+            .ok_or(inspect_wallet_v2_witness_output_usage())?;
+        let txid = args
+            .get(3)
+            .ok_or(inspect_wallet_v2_witness_output_usage())?;
+        let vout = args
+            .get(4)
+            .ok_or(inspect_wallet_v2_witness_output_usage())?;
+        let txid = Txid::from_str(txid)
+            .map_err(|err| RgbServiceError::Backend(format!("parse txid: {err}")))?;
+        let vout = vout
+            .parse::<usize>()
+            .map_err(|err| RgbServiceError::Backend(format!("parse vout: {err}")))?;
+        inspect_wallet_v2_witness_output(Path::new(data_dir), txid, vout)?;
         return Ok(());
     }
-    if args.get(1).is_some_and(|arg| arg == "decode-script-address") {
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "inspect-wallet-v2-stock")
+    {
+        let data_dir = args.get(2).ok_or(wallet_v2_inspect_stock_usage())?;
+        let account_match = args.get(3).ok_or(wallet_v2_inspect_stock_usage())?;
+        let network = parse_bitcoin_network(args.get(4).map(String::as_str))?;
+        inspect_wallet_v2_stock(Path::new(data_dir), account_match, network)?;
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "list-wallet-v2-contracts")
+    {
+        let data_dir = args.get(2).ok_or("usage: rgb-service list-wallet-v2-contracts <wallet-v2-local-data-dir>")?;
+        list_wallet_v2_contracts(Path::new(data_dir))?;
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "decode-script-address")
+    {
         let script_hex = args.get(2).ok_or(decode_script_address_usage())?;
         let network = parse_bitcoin_network(args.get(3).map(String::as_str))?;
         println!("{}", decode_script_address(script_hex, network)?);
@@ -772,109 +912,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args
         .get(1)
-        .is_some_and(|arg| arg == "import-wallet-v2-catalog")
+        .is_some_and(|arg| arg == "inspect-daemon-legacy-account")
     {
-        let config_path = args
-            .get(2)
-            .ok_or("usage: rgb-service import-wallet-v2-catalog <config.toml> <wallet-v2.sql>")?;
-        let sql_path = args
-            .get(3)
-            .ok_or("usage: rgb-service import-wallet-v2-catalog <config.toml> <wallet-v2.sql>")?;
+        let config_path = args.get(2).ok_or(inspect_daemon_legacy_usage())?;
+        let account_or_address = args.get(3).ok_or(inspect_daemon_legacy_usage())?;
         let config = load_config(config_path)?;
         fs::create_dir_all(&config.service.data_dir)?;
         let service = LocalDaemonService::new(config).await?;
-        let imported = service.import_wallet_v2_catalog(Path::new(sql_path))?;
-        println!("imported wallet-service-v2 catalog entries: {imported}");
-        return Ok(());
-    }
-    if args.get(1).is_some_and(|arg| arg == "import-wallet-v2") {
-        let config_path = args.get(2).ok_or(wallet_v2_import_usage())?;
-        let sql_path = args.get(3).ok_or(wallet_v2_import_usage())?;
-        let data_dir = args.get(4).ok_or(wallet_v2_import_usage())?;
-        let range = parse_wallet_v2_import_range(&args[5..])?;
-        let config = load_config(config_path)?;
-        fs::create_dir_all(&config.service.data_dir)?;
-        let service = LocalDaemonService::new(config).await?;
-        let summary = service.import_wallet_v2(Path::new(sql_path), Path::new(data_dir), range)?;
-        println!(
-            "imported wallet-service-v2: catalog_entries={} accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={} offset={} limit={}",
-            summary.catalog_entries,
-            summary.accounts,
-            summary.addresses,
-            summary.utxos,
-            summary.stocks_imported,
-            summary.stocks_missing,
-            range.offset,
-            range
-                .limit
-                .map(|limit| limit.to_string())
-                .unwrap_or_else(|| "all".to_string())
-        );
+        inspect_daemon_legacy_account(&service, account_or_address)?;
         return Ok(());
     }
     if args
         .get(1)
-        .is_some_and(|arg| arg == "repair-wallet-v2-account-utxos")
+        .is_some_and(|arg| arg == "import-wallet-v2-data-dir")
     {
-        let config_path = args.get(2).ok_or(wallet_v2_repair_usage())?;
-        let sql_path = args.get(3).ok_or(wallet_v2_repair_usage())?;
-        let options = parse_wallet_v2_repair_options(&args[4..])?;
+        let config_path = args.get(2).ok_or(wallet_v2_data_dir_usage())?;
+        let data_dir = args.get(3).ok_or(wallet_v2_data_dir_usage())?;
+        let options = parse_wallet_v2_data_dir_options(&args[4..])?;
         let config = load_config(config_path)?;
         fs::create_dir_all(&config.service.data_dir)?;
-        let network = parse_network(&config.service.network)
-            .map_err(|err| RgbServiceError::Backend(format!("parse service.network: {err}")))?;
-        let (rebuilt, mut summary) =
-            rebuild_wallet_v2_owned_utxos(Path::new(sql_path), network, &options)?;
-        let service = if options.skip_chain_check && !options.write {
-            None
-        } else {
-            Some(LocalDaemonService::new(config).await?)
-        };
-        for (account_id, utxos) in rebuilt {
-            let mut live = Vec::new();
-            for utxo in utxos {
-                if !options.skip_chain_check {
-                    let outpoint = OutPoint::from_str(&utxo.outpoint)
-                        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-                    if utxo.confirmed
-                        && !service
-                            .as_ref()
-                            .expect("service exists when chain checks are enabled")
-                            .chain_outpoint_unspent(outpoint)?
-                    {
-                        continue;
-                    }
-                }
-                live.push(utxo);
-            }
-            summary.current_unspent_utxos += live.len();
-            if options.write {
-                service
-                    .as_ref()
-                    .expect("service exists when writes are enabled")
-                    .replace_account_utxos(&account_id, live.clone())?;
-                summary.written_utxos += live.len();
-            }
-            if !live.is_empty() {
-                println!(
-                    "wallet-v2 repaired account_id={} live_utxos={} mode={}",
-                    account_id,
-                    live.len(),
-                    if options.write { "write" } else { "dry-run" }
-                );
-            }
-        }
+        let service = LocalDaemonService::new(config).await?;
+        let summary =
+            service.import_wallet_v2_data_dir(Path::new(data_dir), options)?;
         println!(
-            "wallet-v2 repair summary: accounts_scanned={} accounts_matched={} transfers_examined={} issue_utxos={} receiver_utxos={} sender_change_utxos={} current_unspent_utxos={} written_utxos={} mode={}",
-            summary.accounts_scanned,
-            summary.accounts_matched,
-            summary.transfers_examined,
-            summary.issue_utxos,
-            summary.receiver_utxos,
-            summary.sender_change_utxos,
-            summary.current_unspent_utxos,
-            summary.written_utxos,
-            if options.write { "write" } else { "dry-run" }
+            "imported wallet-v2 data-dir: accounts={} addresses={} utxos={} stocks_imported={} skipped_empty={} errors={} mode={}",
+            summary.accounts,
+            summary.addresses,
+            summary.utxos,
+            summary.stocks_imported,
+            summary.skipped_empty,
+            summary.errors,
+            if options.dry_run { "dry-run" } else { "write" }
         );
         return Ok(());
     }
@@ -1348,81 +1416,20 @@ struct TokenCatalogEntry {
     ext: Option<Value>,
 }
 
-// wallet-service-v2 migration: compact row models parsed from the SQL dump.
-#[derive(Clone, Debug)]
-struct WalletV2Account {
-    desc: String,
-    desc_id: String,
-    addresses: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct WalletV2Transfer {
-    id: String,
-    txid: String,
-    sender: String,
-    confirmed: bool,
-    psbt_json: Option<String>,
-    fascia_json: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct WalletV2RgbAssign {
-    transfer_id: String,
-    desc: Option<String>,
-    address: String,
-    rgb_seal: String,
-}
-
-#[derive(Clone, Debug)]
-struct WalletV2IssueUtxo {
-    desc: String,
-    outpoint: String,
-}
-
 #[derive(Default)]
-struct WalletV2ImportSummary {
-    catalog_entries: usize,
+struct WalletV2DataDirImportSummary {
     accounts: usize,
     addresses: usize,
     utxos: usize,
     stocks_imported: usize,
-    stocks_missing: usize,
+    skipped_empty: usize,
+    errors: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct WalletV2ImportRange {
-    offset: usize,
+struct WalletV2DataDirOptions {
     limit: Option<usize>,
-    skip_chain_check: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-struct WalletV2RepairOptions {
-    account_match: Option<String>,
-    skip_chain_check: bool,
-    write: bool,
-}
-
-#[derive(Default)]
-struct WalletV2FileBalanceExportSummary {
-    accounts: usize,
-    stocks_found: usize,
-    stocks_missing: usize,
-    utxos: usize,
-    allocations: usize,
-}
-
-#[derive(Default)]
-struct WalletV2RepairSummary {
-    accounts_scanned: usize,
-    accounts_matched: usize,
-    transfers_examined: usize,
-    issue_utxos: usize,
-    receiver_utxos: usize,
-    sender_change_utxos: usize,
-    current_unspent_utxos: usize,
-    written_utxos: usize,
+    dry_run: bool,
 }
 
 impl TokenCatalogEntry {
@@ -1792,23 +1799,6 @@ impl LocalDaemonService {
         Ok(utxos)
     }
 
-    fn replace_account_utxos(
-        &self,
-        account_id: &str,
-        utxos: Vec<TrackedUtxo>,
-    ) -> rgb_service_api::Result<()> {
-        let existing = self.list_account_utxos(account_id)?;
-        let existing_outpoints = existing
-            .into_iter()
-            .map(|utxo| utxo.outpoint)
-            .collect::<BTreeSet<_>>();
-        self.remove_account_utxos(account_id, existing_outpoints)?;
-        for utxo in utxos {
-            self.put_account_utxo(account_id, utxo)?;
-        }
-        Ok(())
-    }
-
     fn account_rgb20_utxos(
         &self,
         account_id: &str,
@@ -1889,8 +1879,9 @@ impl LocalDaemonService {
                 .build();
             electrum_client::Client::from_config(&normalize_electrum_url(url), config)
         })?;
-        let funding_tx =
-            self.electrum_with_retry("electrum tx fetch", || client.transaction_get(&outpoint.txid))?;
+        let funding_tx = self.electrum_with_retry("electrum tx fetch", || {
+            client.transaction_get(&outpoint.txid)
+        })?;
         let Some(output) = funding_tx.output.get(outpoint.vout as usize) else {
             return Ok(false);
         };
@@ -1919,22 +1910,6 @@ impl LocalDaemonService {
             let key = Self::account_utxo_key(account_id, &outpoint);
             tx.remove(&keyspace, key.as_bytes());
         }
-        tx.commit()
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-        self.db
-            .persist(PersistMode::SyncAll)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))
-    }
-
-    fn put_token_catalog_entry(&self, entry: &TokenCatalogEntry) -> rgb_service_api::Result<()> {
-        let keyspace = self
-            .db
-            .keyspace("token_catalog", KeyspaceCreateOptions::default)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-        let bytes =
-            serde_json::to_vec(entry).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-        let mut tx = self.db.write_tx();
-        tx.insert(&keyspace, entry.contract_id.as_bytes(), bytes);
         tx.commit()
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         self.db
@@ -1995,20 +1970,6 @@ impl LocalDaemonService {
         Ok(self
             .get_token_catalog_entry(&contract_id)?
             .unwrap_or_else(|| TokenCatalogEntry::empty(contract_id, ticker, name, precision)))
-    }
-
-    fn import_wallet_v2_catalog(&self, sql_path: &Path) -> rgb_service_api::Result<usize> {
-        let text = fs::read_to_string(sql_path)
-            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
-        let mut imported = 0;
-        for line in text.lines() {
-            let Some(entry) = parse_wallet_v2_asset_list_insert(line)? else {
-                continue;
-            };
-            self.put_token_catalog_entry(&entry)?;
-            imported += 1;
-        }
-        Ok(imported)
     }
 
     fn put_legacy_address_account(
@@ -2083,131 +2044,132 @@ impl LocalDaemonService {
             .transpose()
     }
 
-    // wallet-service-v2 migration: imports legacy catalog metadata, address ->
-    // account mappings, tracked RGB UTXOs, and per-account RGB stock files.
-    fn import_wallet_v2(
+    // wallet-service-v2 migration: import accounts purely from the on-disk data
+    // directory (no SQL dump). Descriptors are recovered directly from each
+    // account's `bdk_wallet` file, so this does not require a wallet-v2.sql.
+    // Only accounts holding a real RGB stock (stash.dat > empty) are imported.
+    fn import_wallet_v2_data_dir(
         &self,
-        sql_path: &Path,
         wallet_v2_data_dir: &Path,
-        range: WalletV2ImportRange,
-    ) -> rgb_service_api::Result<WalletV2ImportSummary> {
-        let text = fs::read_to_string(sql_path)
-            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 SQL dump: {err}")))?;
-        let mut summary = WalletV2ImportSummary::default();
-        let mut accounts = Vec::new();
-        let mut transfers = HashMap::<String, WalletV2Transfer>::new();
-        let mut rgb_assigns = Vec::<WalletV2RgbAssign>::new();
-        let mut issue_utxos = Vec::<WalletV2IssueUtxo>::new();
-        for line in text.lines() {
-            if let Some(entry) = parse_wallet_v2_asset_list_insert(line)? {
-                if let Some(issue_utxo) = parse_wallet_v2_issue_utxo_insert(line)? {
-                    issue_utxos.push(issue_utxo);
-                }
-                self.put_token_catalog_entry(&entry)?;
-                summary.catalog_entries += 1;
+        options: WalletV2DataDirOptions,
+    ) -> rgb_service_api::Result<WalletV2DataDirImportSummary> {
+        let network = self.network()?;
+        let reveal_count = default_legacy_reveal_address_count();
+        let entries = fs::read_dir(wallet_v2_data_dir)
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+        let mut summary = WalletV2DataDirImportSummary::default();
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let mut considered = 0usize;
+        for entry in entries {
+            let entry = entry
+                .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 dir entry: {err}")))?;
+            let path = entry.path();
+            // skip files and the legacy fee wallet (`priv/`)
+            if !path.is_dir() {
                 continue;
             }
-            if let Some(account) = parse_wallet_v2_account_insert(line)? {
-                accounts.push(account);
+            let name = entry.file_name();
+            if name == "priv" {
                 continue;
             }
-            if let Some(transfer) = parse_wallet_v2_transfer_insert(line)? {
-                transfers.insert(transfer.id.clone(), transfer);
+            let source_stock_dir = path.join(WALLET_V2_RGB_PATH);
+            if !has_real_rgb_stock(&source_stock_dir) {
+                summary.skipped_empty += 1;
                 continue;
             }
-            if let Some(rgb_assign) = parse_wallet_v2_rgb_assign_insert(line)? {
-                rgb_assigns.push(rgb_assign);
+            considered += 1;
+            if considered > limit {
+                break;
             }
-        }
-
-        let mut sql_utxos_by_account = HashMap::<String, Vec<TrackedUtxo>>::new();
-        for issue_utxo in issue_utxos {
-            sql_utxos_by_account
-                .entry(legacy::legacy_account_id(&issue_utxo.desc))
-                .or_default()
-                .push(TrackedUtxo {
-                    outpoint: issue_utxo.outpoint,
-                    address: None,
-                    confirmed: true,
-                });
-        }
-        for rgb_assign in rgb_assigns {
-            let Some(transfer) = transfers.get(&rgb_assign.transfer_id) else {
-                continue;
-            };
-            if !transfer.confirmed {
+            if let Err(err) = self.import_wallet_v2_data_dir_account(
+                &path,
+                &source_stock_dir,
+                network,
+                reveal_count,
+                options.dry_run,
+                &mut summary,
+            ) {
+                summary.errors += 1;
+                eprintln!(
+                    "wallet-v2 data-dir: account {} FAILED: {err:#}",
+                    path.display()
+                );
                 continue;
             }
-            let Some(desc) = rgb_assign.desc else {
-                continue;
-            };
-            let outpoint = if rgb_assign.rgb_seal.contains(':') {
-                rgb_assign.rgb_seal
-            } else {
-                format!("{}:{}", transfer.txid, rgb_assign.rgb_seal)
-            };
-            sql_utxos_by_account
-                .entry(legacy::legacy_account_id(&desc))
-                .or_default()
-                .push(TrackedUtxo {
-                    outpoint,
-                    address: Some(rgb_assign.address),
-                    confirmed: true,
-                });
-        }
-
-        let limit = range.limit.unwrap_or(usize::MAX);
-        for account in accounts.into_iter().skip(range.offset).take(limit) {
-            let account_id = legacy::legacy_account_id(&account.desc);
-            self.get_or_create_profile(&account_id)?;
-            self.put_legacy_account_desc(&account_id, &account.desc)?;
-            for address in &account.addresses {
-                self.put_legacy_address_account(address, &account_id)?;
-            }
-            summary.accounts += 1;
-            summary.addresses += account.addresses.len();
-            if let Some(utxos) = sql_utxos_by_account.remove(&account_id) {
-                let mut seen_outpoints = BTreeSet::<String>::new();
-                for utxo in utxos {
-                    if !seen_outpoints.insert(utxo.outpoint.clone()) {
-                        continue;
-                    }
-                    let outpoint = OutPoint::from_str(&utxo.outpoint)
-                        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-                    if !range.skip_chain_check && utxo.confirmed && !self.chain_outpoint_unspent(outpoint)? {
-                        continue;
-                    }
-                    self.put_account_utxo(&account_id, utxo)?;
-                    summary.utxos += 1;
-                }
-            }
-            let source_stock_dir = wallet_v2_data_dir
-                .join(&account.desc_id)
-                .join(WALLET_V2_RGB_PATH);
-            if source_stock_dir.exists() {
-                import_rgb20_stock_from_fs(&source_stock_dir, &self.account_stock_dir(&account_id))
-                    .map_err(|err| {
-                        RgbServiceError::Backend(format!(
-                            "import wallet-v2 RGB stock {}: {err:#}",
-                            source_stock_dir.display()
-                        ))
-                    })?;
-                summary.stocks_imported += 1;
-            } else {
-                summary.stocks_missing += 1;
-            }
-            if summary.accounts % 500 == 0 {
+            if summary.accounts % 50 == 0 {
                 println!(
-                    "wallet-v2 import progress: accounts={} addresses={} utxos={} stocks_imported={} stocks_missing={}",
+                    "wallet-v2 data-dir progress: accounts={} addresses={} utxos={} stocks_imported={} skipped_empty={} errors={}",
                     summary.accounts,
                     summary.addresses,
                     summary.utxos,
                     summary.stocks_imported,
-                    summary.stocks_missing
+                    summary.skipped_empty,
+                    summary.errors
                 );
             }
         }
         Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_wallet_v2_data_dir_account(
+        &self,
+        account_dir: &Path,
+        source_stock_dir: &Path,
+        network: Network,
+        reveal_count: u32,
+        dry_run: bool,
+        summary: &mut WalletV2DataDirImportSummary,
+    ) -> rgb_service_api::Result<()> {
+        let wallet_path = account_dir.join("bdk_wallet");
+        // Legacy files are bdk_wallet 1.1.0 format; the bundled
+        // `wallet-v2-reader` (pinned to 1.1.0) recovers descriptor, UTXOs and
+        // revealed addresses as JSON.
+        let recovered = read_wallet_v2_account(&wallet_path, network, reveal_count)?;
+        let desc = recovered.descriptor;
+        let account_id = legacy::legacy_account_id(&desc);
+
+        if dry_run {
+            println!(
+                "wallet-v2 data-dir DRY-RUN desc_id={} account_id={} desc={} utxos={} addresses={} stock={}",
+                account_dir.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                account_id,
+                desc,
+                recovered.utxos.len(),
+                recovered.addresses.len(),
+                source_stock_dir.display()
+            );
+            summary.accounts += 1;
+            summary.addresses += recovered.addresses.len();
+            summary.utxos += recovered.utxos.len();
+            return Ok(());
+        }
+
+        self.get_or_create_profile(&account_id)?;
+        self.put_legacy_account_desc(&account_id, &desc)?;
+        for address in &recovered.addresses {
+            self.put_legacy_address_account(address, &account_id)?;
+            summary.addresses += 1;
+        }
+        for utxo in recovered.utxos {
+            let tracked = TrackedUtxo {
+                outpoint: utxo.outpoint,
+                address: utxo.address,
+                confirmed: utxo.is_confirmed,
+            };
+            self.put_account_utxo(&account_id, tracked)?;
+            summary.utxos += 1;
+        }
+        import_rgb20_stock_from_fs(source_stock_dir, &self.account_stock_dir(&account_id))
+            .map_err(|err| {
+                RgbServiceError::Backend(format!(
+                    "import wallet-v2 RGB stock {}: {err:#}",
+                    source_stock_dir.display()
+                ))
+            })?;
+        summary.stocks_imported += 1;
+        summary.accounts += 1;
+        Ok(())
     }
 
     fn issue_utxo(allocation_outpoint: String, mut utxos: Vec<TrackedUtxo>) -> TrackedUtxo {
@@ -3735,271 +3697,6 @@ impl RgbServiceApi for LocalDaemonService {
             ],
         })
     }
-}
-
-// wallet-service-v2 migration: SQL dump parsers for the old wallet schema.
-fn parse_wallet_v2_asset_list_insert(
-    line: &str,
-) -> rgb_service_api::Result<Option<TokenCatalogEntry>> {
-    const PREFIX: &str = "INSERT INTO \"public\".\"asset_list\" ";
-    let Some(rest) = line.strip_prefix(PREFIX) else {
-        return Ok(None);
-    };
-    let marker = ") VALUES (";
-    let columns_end = rest.find(marker).ok_or_else(|| {
-        RgbServiceError::Backend("invalid wallet-v2 asset_list insert columns".to_string())
-    })?;
-    let columns = parse_sql_columns(&rest[..columns_end])?;
-    let mut values = &rest[columns_end + marker.len()..];
-    values = values.strip_suffix(';').unwrap_or(values);
-    values = values.strip_suffix(')').unwrap_or(values);
-    let values = split_sql_values(values)?;
-    if columns.len() != values.len() {
-        return Err(RgbServiceError::Backend(format!(
-            "wallet-v2 asset_list insert column/value mismatch: {} columns, {} values",
-            columns.len(),
-            values.len()
-        )));
-    }
-    let row = columns
-        .into_iter()
-        .zip(values)
-        .collect::<HashMap<String, Option<String>>>();
-    let contract_id = required_sql_string(&row, "contract_id")?;
-    let precision = optional_sql_string(&row, "precision")
-        .parse::<u8>()
-        .map_err(|err| RgbServiceError::Backend(format!("invalid asset precision: {err}")))?;
-    let supply = match optional_sql_string(&row, "supply").trim() {
-        "" => None,
-        value => Some(
-            value
-                .parse::<u64>()
-                .map_err(|err| RgbServiceError::Backend(format!("invalid asset supply: {err}")))?,
-        ),
-    };
-    let ext = row
-        .get("ext")
-        .and_then(|value| value.as_ref())
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.clone())));
-    Ok(Some(TokenCatalogEntry {
-        contract_id,
-        ticker: optional_sql_string(&row, "ticker"),
-        name: optional_sql_string(&row, "name"),
-        precision,
-        supply,
-        issue_utxo: optional_sql_string(&row, "utxo"),
-        contract_type: optional_sql_string(&row, "contract_type"),
-        issuer_desc: optional_sql_string(&row, "desc"),
-        created_at: optional_sql_string(&row, "create_time"),
-        ext,
-    }))
-}
-
-fn parse_wallet_v2_account_insert(line: &str) -> rgb_service_api::Result<Option<WalletV2Account>> {
-    const PREFIX: &str = "INSERT INTO \"public\".\"account\" ";
-    let Some(rest) = line.strip_prefix(PREFIX) else {
-        return Ok(None);
-    };
-    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 account insert")?;
-    let desc = required_sql_string(&row, "desc")?;
-    let address_array = required_sql_string(&row, "address")?;
-    Ok(Some(WalletV2Account {
-        desc_id: wallet_v2_desc_id(&desc)?,
-        desc,
-        addresses: parse_pg_text_array(&address_array),
-    }))
-}
-
-fn parse_wallet_v2_transfer_insert(
-    line: &str,
-) -> rgb_service_api::Result<Option<WalletV2Transfer>> {
-    const PREFIX: &str = "INSERT INTO \"public\".\"transfer\" ";
-    let Some(rest) = line.strip_prefix(PREFIX) else {
-        return Ok(None);
-    };
-    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 transfer insert")?;
-    Ok(Some(WalletV2Transfer {
-        id: required_sql_string(&row, "id")?,
-        txid: required_sql_string(&row, "txid")?,
-        sender: required_sql_string(&row, "sender")?,
-        confirmed: optional_sql_string(&row, "status") == "2",
-        psbt_json: row.get("psbt").and_then(|value| value.clone()),
-        fascia_json: row.get("fascia").and_then(|value| value.clone()),
-    }))
-}
-
-fn parse_wallet_v2_rgb_assign_insert(
-    line: &str,
-) -> rgb_service_api::Result<Option<WalletV2RgbAssign>> {
-    const PREFIX: &str = "INSERT INTO \"public\".\"rgb_assign\" ";
-    let Some(rest) = line.strip_prefix(PREFIX) else {
-        return Ok(None);
-    };
-    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 rgb_assign insert")?;
-    Ok(Some(WalletV2RgbAssign {
-        transfer_id: required_sql_string(&row, "transfer_id")?,
-        desc: row.get("desc").and_then(|value| value.clone()),
-        address: optional_sql_string(&row, "address"),
-        rgb_seal: required_sql_string(&row, "rgb_seal")?,
-    }))
-}
-
-fn parse_wallet_v2_issue_utxo_insert(
-    line: &str,
-) -> rgb_service_api::Result<Option<WalletV2IssueUtxo>> {
-    const PREFIX: &str = "INSERT INTO \"public\".\"asset_list\" ";
-    let Some(rest) = line.strip_prefix(PREFIX) else {
-        return Ok(None);
-    };
-    let row = parse_wallet_v2_insert_row(rest, "wallet-v2 asset_list insert")?;
-    let outpoint = optional_sql_string(&row, "utxo");
-    if outpoint.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(WalletV2IssueUtxo {
-        desc: required_sql_string(&row, "desc")?,
-        outpoint,
-    }))
-}
-
-fn parse_wallet_v2_insert_row(
-    rest: &str,
-    context: &str,
-) -> rgb_service_api::Result<HashMap<String, Option<String>>> {
-    let marker = ") VALUES (";
-    let columns_end = rest
-        .find(marker)
-        .ok_or_else(|| RgbServiceError::Backend(format!("invalid {context} columns")))?;
-    let columns = parse_sql_columns(&rest[..columns_end])?;
-    let mut values = &rest[columns_end + marker.len()..];
-    values = values.strip_suffix(';').unwrap_or(values);
-    values = values.strip_suffix(')').unwrap_or(values);
-    let values = split_sql_values(values)?;
-    if columns.len() != values.len() {
-        return Err(RgbServiceError::Backend(format!(
-            "{context} column/value mismatch: {} columns, {} values",
-            columns.len(),
-            values.len()
-        )));
-    }
-    Ok(columns
-        .into_iter()
-        .zip(values)
-        .collect::<HashMap<String, Option<String>>>())
-}
-
-fn parse_pg_text_array(value: &str) -> Vec<String> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-        .unwrap_or(value);
-    if value.trim().is_empty() {
-        return Vec::new();
-    }
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_matches('"').to_string())
-        .collect()
-}
-
-fn wallet_v2_desc_id(desc: &str) -> rgb_service_api::Result<String> {
-    let fingerprint = desc
-        .split_once('[')
-        .and_then(|(_, rest)| rest.split_once('/'))
-        .map(|(fingerprint, _)| fingerprint)
-        .filter(|fingerprint| !fingerprint.is_empty())
-        .ok_or_else(|| {
-            RgbServiceError::Backend("wallet-v2 descriptor missing fingerprint".to_string())
-        })?;
-    let checksum = desc
-        .rsplit_once('#')
-        .map(|(_, checksum)| checksum)
-        .filter(|checksum| !checksum.is_empty())
-        .ok_or_else(|| {
-            RgbServiceError::Backend("wallet-v2 descriptor missing checksum".to_string())
-        })?;
-    Ok(format!("{fingerprint}_{checksum}"))
-}
-
-fn parse_sql_columns(input: &str) -> rgb_service_api::Result<Vec<String>> {
-    let input = input
-        .trim()
-        .strip_prefix('(')
-        .ok_or_else(|| RgbServiceError::Backend("invalid SQL column list".to_string()))?;
-    Ok(input
-        .split(',')
-        .map(|column| column.trim().trim_matches('"').to_string())
-        .collect())
-}
-
-fn split_sql_values(input: &str) -> rgb_service_api::Result<Vec<Option<String>>> {
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if in_quote {
-            if ch == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    current.push('\'');
-                    chars.next();
-                } else {
-                    in_quote = false;
-                }
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '\'' => {
-                if current.trim().eq_ignore_ascii_case("e") {
-                    current.clear();
-                }
-                in_quote = true;
-            }
-            ',' => {
-                values.push(sql_value(current.trim()));
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if in_quote {
-        return Err(RgbServiceError::Backend(
-            "unterminated SQL string in asset_list insert".to_string(),
-        ));
-    }
-    values.push(sql_value(current.trim()));
-    Ok(values)
-}
-
-fn sql_value(value: &str) -> Option<String> {
-    if value.eq_ignore_ascii_case("null") {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn required_sql_string(
-    row: &HashMap<String, Option<String>>,
-    key: &str,
-) -> rgb_service_api::Result<String> {
-    row.get(key)
-        .and_then(|value| value.clone())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| RgbServiceError::Backend(format!("wallet-v2 asset_list missing {key}")))
-}
-
-fn optional_sql_string(row: &HashMap<String, Option<String>>, key: &str) -> String {
-    row.get(key)
-        .and_then(|value| value.clone())
-        .unwrap_or_default()
 }
 
 fn json_value_to_dynamic(value: &Value) -> rgb_service_api::Result<Dynamic> {
