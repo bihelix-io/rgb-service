@@ -416,8 +416,6 @@ async fn transfer_psbt(
         .as_deref()
         .ok_or_else(|| RgbServiceError::InvalidRequest("desc is required".to_string()))?;
     let account_id = legacy_account_id(desc);
-    let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
-    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
 
     maybe_add_legacy_rgb_fee_assignment(&state, &mut req.assign)?;
 
@@ -428,6 +426,9 @@ async fn transfer_psbt(
         )
         .into());
     }
+
+    let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
+    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
 
     let wallet_outpoints = wallet
         .wallet
