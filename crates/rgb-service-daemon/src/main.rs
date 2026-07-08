@@ -1040,6 +1040,27 @@ struct LnPaymentRecord {
 }
 
 impl LocalDaemonService {
+    fn electrum_with_retry<T, F>(&self, context: &str, mut op: F) -> rgb_service_api::Result<T>
+    where
+        F: FnMut() -> Result<T, electrum_client::Error>,
+    {
+        let attempts = 3;
+        let mut last_err = None;
+        for attempt in 1..=attempts {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < attempts {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+        let err = last_err.expect("electrum retry loop records the last error");
+        Err(RgbServiceError::Backend(format!("{context} failed: {err}")))
+    }
+
     async fn new(config: DaemonConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let logger = DaemonLogger::open(&config.service.data_dir)?;
         logger.info(format!(
@@ -1351,25 +1372,23 @@ impl LocalDaemonService {
         url: &str,
         outpoint: OutPoint,
     ) -> rgb_service_api::Result<bool> {
-        let client = electrum_client::Client::new(&normalize_electrum_url(url))
-            .map_err(|err| RgbServiceError::Backend(format!("electrum client failed: {err}")))?;
-        let funding_tx = client
-            .transaction_get(&outpoint.txid)
-            .map_err(|err| RgbServiceError::Backend(format!("electrum tx fetch failed: {err}")))?;
+        let client = self.electrum_with_retry("electrum client", || {
+            electrum_client::Client::new(&normalize_electrum_url(url))
+        })?;
+        let funding_tx =
+            self.electrum_with_retry("electrum tx fetch", || client.transaction_get(&outpoint.txid))?;
         let Some(output) = funding_tx.output.get(outpoint.vout as usize) else {
             return Ok(false);
         };
-        let history = client
-            .script_get_history(output.script_pubkey.as_script())
-            .map_err(|err| {
-                RgbServiceError::Backend(format!("electrum script history failed: {err}"))
-            })?;
+        let history = self.electrum_with_retry("electrum script history", || {
+            client.script_get_history(output.script_pubkey.as_script())
+        })?;
         for entry in history {
             if entry.tx_hash == outpoint.txid {
                 continue;
             }
-            let tx = client.transaction_get(&entry.tx_hash).map_err(|err| {
-                RgbServiceError::Backend(format!("electrum history tx fetch failed: {err}"))
+            let tx = self.electrum_with_retry("electrum history tx fetch", || {
+                client.transaction_get(&entry.tx_hash)
             })?;
             if tx.input.iter().any(|input| input.previous_output == outpoint) {
                 return Ok(false);
