@@ -730,6 +730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bdk_electrum"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b59a3f7fbe678874fa34354097644a171276e02a49934c13b3d61c54610ddf39"
+dependencies = [
+ "bdk_core",
+ "electrum-client",
+]
+
+[[package]]
 name = "bdk_esplora"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6449,6 +6459,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bdk_electrum",
  "bdk_esplora",
  "bdk_wallet",
  "bitcoin",

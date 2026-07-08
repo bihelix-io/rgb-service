@@ -44,11 +44,11 @@ use rgb_service_api::{
     TrackedUtxo,
 };
 use rgb_service_local::{
-    build_rgb20_transfer_consignment, encode_fascia_bytes, import_rgb20_stock_from_fs,
-    issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
-    list_rgb20_assets_for_utxos, list_rgb20_contracts, prepare_rgb20_psbt,
-    scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
-    ChainSource, EsploraConfig, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
+    import_rgb20_stock_from_fs, issue_rgb20_fixed_with_chain_source,
+    list_legacy_rgb20_assets_for_utxos, list_rgb20_assets_for_utxos, list_rgb20_contracts,
+    prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer,
+    stage_sender_fascia, ChainSource, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1186,7 +1186,7 @@ impl LocalDaemonService {
     }
 
     fn chain_source(&self) -> ChainSource {
-        ChainSource::Esplora(EsploraConfig::new(self.config.esplora_url.clone()))
+        chain_source_from_url(self.config.esplora_url.clone())
     }
 
     fn scan_pending_rgb_stocks(&self) -> rgb_service_api::Result<RecoveryScanSummary> {

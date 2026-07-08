@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
+use bdk_electrum::{electrum_client, BdkElectrumClient};
 use bdk_esplora::EsploraExt;
 use bdk_wallet::{
     bitcoin::{
@@ -26,7 +27,10 @@ use bdk_wallet::{
     file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet,
 };
 use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
-use rgb_service_local::{prepare_rgb20_psbt, select_rgb20_inputs, Rgb20PsbtAssignment};
+use rgb_service_local::{
+    is_electrum_url, list_rgb20_assets_for_utxos, normalize_electrum_url, prepare_rgb20_psbt,
+    select_rgb20_inputs, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{LegacyConfig, LocalDaemonService, PreparedTransferRecipient};
@@ -421,10 +425,13 @@ async fn transfer_psbt(
 
     let rgb_assignments = parse_legacy_rgb_assignments(&req.assign)?;
     if rgb_assignments.is_empty() {
-        return Err(RgbServiceError::InvalidRequest(
-            "legacy transfer/psbt requires at least one RGB assignment".to_string(),
-        )
-        .into());
+        let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
+        sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
+        let psbt = build_legacy_btc_only_psbt(&state, &account_id, &mut wallet, &req)?;
+        wallet.persist()?;
+        return Ok(Json(TransferPsbtResp {
+            psbt: psbt.to_string(),
+        }));
     }
 
     let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
@@ -552,6 +559,81 @@ async fn transfer_psbt(
     Ok(Json(TransferPsbtResp {
         psbt: prepared.psbt.to_string(),
     }))
+}
+
+fn build_legacy_btc_only_psbt(
+    state: &LegacyState,
+    account_id: &str,
+    wallet: &mut LegacyWallet,
+    req: &TransferReq,
+) -> Result<Psbt, LegacyHttpError> {
+    let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
+        .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
+    let rgb_outpoints = legacy_rgb_allocated_outpoints(state, account_id, wallet)?;
+    let change_address = wallet.wallet.reveal_next_address(KeychainKind::External);
+    let mut builder = wallet.wallet.build_tx();
+    builder
+        .ordering(TxOrdering::Untouched)
+        .fee_rate(fee_rate)
+        .drain_to(change_address.script_pubkey());
+
+    let network = state.service.network()?;
+    let mut has_recipient = false;
+    for assign in &req.assign {
+        if !assign.rgb_assign.is_empty() {
+            continue;
+        }
+        let sats = assign.sats.ok_or_else(|| {
+            RgbServiceError::InvalidRequest("BTC-only transfer requires sats".to_string())
+        })?;
+        if sats == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "BTC-only transfer requires non-zero sats".to_string(),
+            )
+            .into());
+        }
+        let address = Address::from_str(&assign.address)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?
+            .require_network(network)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        builder.add_recipient(address.script_pubkey(), Amount::from_sat(sats));
+        has_recipient = true;
+    }
+    if !has_recipient {
+        return Err(RgbServiceError::InvalidRequest("assign is empty".to_string()).into());
+    }
+
+    if !rgb_outpoints.is_empty() {
+        builder.unspendable(rgb_outpoints);
+    }
+    builder
+        .finish()
+        .map_err(|err| RgbServiceError::Backend(format!("failed to build BTC PSBT: {err}")).into())
+}
+
+fn legacy_rgb_allocated_outpoints(
+    state: &LegacyState,
+    account_id: &str,
+    wallet: &LegacyWallet,
+) -> Result<Vec<OutPoint>, LegacyHttpError> {
+    let wallet_utxos = wallet
+        .wallet
+        .list_unspent()
+        .map(|utxo| Rgb20TrackedUtxo {
+            outpoint: utxo.outpoint,
+            address: None,
+            confirmed: utxo.chain_position.is_confirmed(),
+        })
+        .collect::<Vec<_>>();
+    let allocations =
+        list_rgb20_assets_for_utxos(&state.service.account_stock_dir(account_id), wallet_utxos)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+    Ok(allocations
+        .into_iter()
+        .map(|allocation| allocation.outpoint)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 fn maybe_add_legacy_rgb_fee_assignment(
@@ -766,21 +848,26 @@ async fn transfer_callback(
         }
     };
     let transfer_id = req.transfer_id.unwrap_or_else(|| txid.clone());
-    let account_id = match req.desc.as_deref() {
-        Some(desc) => legacy_account_id(desc),
-        None => state
-            .service
-            .legacy_find_prepared_transfer_account_id(&transfer_id)?
-            .ok_or_else(|| {
-                RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
-            })?,
-    };
-    state.service.legacy_commit_prepared_transfer(
-        &account_id,
-        &transfer_id,
-        &txid,
-        req.utxos.unwrap_or_default(),
-    )?;
+    let desc_account_id = req.desc.as_deref().map(legacy_account_id);
+    let account_id = state
+        .service
+        .legacy_find_prepared_transfer_account_id(&transfer_id)?
+        .or(desc_account_id)
+        .ok_or_else(|| {
+            RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
+        })?;
+    state
+        .service
+        .legacy_commit_prepared_transfer(
+            &account_id,
+            &transfer_id,
+            &txid,
+            req.utxos.unwrap_or_default(),
+        )
+        .or_else(|err| match err {
+            RgbServiceError::NotFound(_) if req.desc.is_some() => Ok(()),
+            err => Err(err),
+        })?;
     Ok(StatusCode::OK)
 }
 
@@ -853,6 +940,22 @@ fn sync_legacy_wallet(
     config: &LegacyConfig,
     wallet: &mut LegacyWallet,
 ) -> Result<(), LegacyHttpError> {
+    if is_electrum_url(&service.config.esplora_url) {
+        let url = normalize_electrum_url(&service.config.esplora_url);
+        let client = electrum_client::Client::new(&url)
+            .map_err(|err| RgbServiceError::Backend(format!("electrum client failed: {err}")))?;
+        let client = BdkElectrumClient::new(client);
+        let request = wallet.wallet.start_sync_with_revealed_spks().build();
+        let update = client
+            .sync(request, 10, true)
+            .map_err(|err| RgbServiceError::Backend(format!("electrum sync failed: {err}")))?;
+        wallet
+            .wallet
+            .apply_update(update)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        return Ok(());
+    }
+
     let client = bdk_esplora::esplora_client::Builder::new(&service.config.esplora_url)
         .timeout(config.sync_timeout_secs.max(1))
         .build_blocking();

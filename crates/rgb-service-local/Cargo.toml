@@ -21,6 +21,7 @@ nonasync = { workspace = true }
 psrgbt = { workspace = true }
 rgb-schemata = { workspace = true }
 rgbstd = { workspace = true, features = [
+    "electrum_blocking",
     "esplora_blocking",
     "fs",
     "fjall",

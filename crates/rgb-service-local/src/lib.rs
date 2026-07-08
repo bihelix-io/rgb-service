@@ -45,6 +45,7 @@ static TX_CONFIRMATION_CACHE: OnceLock<Mutex<HashMap<(Network, Txid), TxConfirma
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChainSource {
     Esplora(EsploraConfig),
+    Electrum(ElectrumConfig),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +62,19 @@ impl EsploraConfig {
     pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
         self.api_key = api_key.filter(|value| !value.trim().is_empty());
         self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElectrumConfig {
+    pub url: String,
+}
+
+impl ElectrumConfig {
+    pub fn new(url: String) -> Self {
+        Self {
+            url: normalize_electrum_url(&url),
+        }
     }
 }
 
@@ -1036,9 +1050,7 @@ fn rgb_resolver(
     chain_source: &ChainSource,
     local_txs: impl IntoIterator<Item = Transaction>,
 ) -> Result<LocalWitnessResolver> {
-    let ChainSource::Esplora(config) = chain_source;
-    let resolver = AnyResolver::esplora_blocking(esplora_builder(config))
-        .map_err(|err| anyhow!("failed to create RGB Esplora resolver: {err}"))?;
+    let resolver = chain_source_resolver(chain_source)?;
     let resolver = LocalWitnessResolver::new(resolver, local_txs);
     resolver
         .check_chain_net(network_to_rgb(network))
@@ -1052,9 +1064,7 @@ fn rgb_resolver_with_consignment<const TYPE: bool>(
     consignment: &Consignment<TYPE>,
     local_txs: impl IntoIterator<Item = Transaction>,
 ) -> Result<LocalWitnessResolver> {
-    let ChainSource::Esplora(config) = chain_source;
-    let mut resolver = AnyResolver::esplora_blocking(esplora_builder(config))
-        .map_err(|err| anyhow!("failed to create RGB Esplora resolver: {err}"))?;
+    let mut resolver = chain_source_resolver(chain_source)?;
     resolver.add_consignment_txes(consignment);
     let resolver = LocalWitnessResolver::new(resolver, local_txs);
     resolver
@@ -1170,8 +1180,28 @@ fn chain_source_from_esplora_urls(
     let url = normalized_esplora_urls(esplora_urls)
         .into_iter()
         .next()
-        .with_context(|| format!("no Esplora URL configured for {network:?}"))?;
-    Ok(ChainSource::Esplora(EsploraConfig::new(url)))
+        .with_context(|| format!("no chain source URL configured for {network:?}"))?;
+    Ok(chain_source_from_url(url))
+}
+
+pub fn chain_source_from_url(url: String) -> ChainSource {
+    if is_electrum_url(&url) {
+        ChainSource::Electrum(ElectrumConfig::new(url))
+    } else {
+        ChainSource::Esplora(EsploraConfig::new(url))
+    }
+}
+
+pub fn is_electrum_url(url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("electrum://") || url.starts_with("tcp://") || url.starts_with("ssl://")
+}
+
+pub fn normalize_electrum_url(url: &str) -> String {
+    url.trim()
+        .strip_prefix("electrum://")
+        .map(|rest| format!("tcp://{rest}"))
+        .unwrap_or_else(|| url.trim().to_string())
 }
 
 fn normalized_esplora_urls(esplora_urls: &[String]) -> Vec<String> {
@@ -1269,13 +1299,21 @@ fn fetch_tx_confirmation_consensus_uncached(
     let mut saw_confirmed = false;
     let mut last_error = None;
     for url in rotated_urls {
-        let client = esplora_client::Builder::new(&url)
-            .timeout(10)
-            .build_blocking();
-        match client.get_tx_status(&txid) {
-            Ok(status) if status.confirmed => saw_confirmed = true,
-            Ok(_) => return Ok(Some(false)),
-            Err(err) => last_error = Some(anyhow!("{err:?}")),
+        if is_electrum_url(&url) {
+            match fetch_tx_confirmation_electrum(&url, txid) {
+                Ok(Some(true)) => saw_confirmed = true,
+                Ok(other) => return Ok(other),
+                Err(err) => last_error = Some(err),
+            }
+        } else {
+            let client = esplora_client::Builder::new(&url)
+                .timeout(10)
+                .build_blocking();
+            match client.get_tx_status(&txid) {
+                Ok(status) if status.confirmed => saw_confirmed = true,
+                Ok(_) => return Ok(Some(false)),
+                Err(err) => last_error = Some(anyhow!("{err:?}")),
+            }
         }
     }
     if saw_confirmed {
@@ -1285,6 +1323,29 @@ fn fetch_tx_confirmation_consensus_uncached(
         return Err(err).with_context(|| format!("failed to fetch RGB carrier tx status: {txid}"));
     }
     Ok(None)
+}
+
+fn chain_source_resolver(chain_source: &ChainSource) -> Result<AnyResolver> {
+    match chain_source {
+        ChainSource::Esplora(config) => AnyResolver::esplora_blocking(esplora_builder(config))
+            .map_err(|err| anyhow!("failed to create RGB Esplora resolver: {err}")),
+        ChainSource::Electrum(config) => AnyResolver::electrum_blocking(&config.url, None)
+            .map_err(|err| anyhow!("failed to create RGB Electrum resolver: {err}")),
+    }
+}
+
+fn fetch_tx_confirmation_electrum(url: &str, txid: Txid) -> Result<Option<bool>> {
+    let source = ChainSource::Electrum(ElectrumConfig::new(url.to_string()));
+    let resolver = chain_source_resolver(&source)?;
+    match resolver
+        .resolve_witness(txid)
+        .map_err(|err| anyhow!("failed to resolve Electrum witness {txid}: {err:?}"))?
+    {
+        WitnessStatus::Unresolved => Ok(None),
+        WitnessStatus::Resolved(_, WitnessOrd::Mined(_)) => Ok(Some(true)),
+        WitnessStatus::Resolved(_, WitnessOrd::Tentative) => Ok(Some(false)),
+        WitnessStatus::Resolved(_, WitnessOrd::Ignored | WitnessOrd::Archived) => Ok(None),
+    }
 }
 
 fn encode_fascia(fascia: &Fascia) -> Result<Vec<u8>> {
