@@ -1892,21 +1892,12 @@ impl LocalDaemonService {
         let Some(output) = funding_tx.output.get(outpoint.vout as usize) else {
             return Ok(false);
         };
-        let history = self.electrum_with_retry("electrum script history", || {
-            client.script_get_history(output.script_pubkey.as_script())
+        let unspent = self.electrum_with_retry("electrum script listunspent", || {
+            client.script_list_unspent(output.script_pubkey.as_script())
         })?;
-        for entry in history {
-            if entry.tx_hash == outpoint.txid {
-                continue;
-            }
-            let tx = self.electrum_with_retry("electrum history tx fetch", || {
-                client.transaction_get(&entry.tx_hash)
-            })?;
-            if tx.input.iter().any(|input| input.previous_output == outpoint) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(unspent
+            .iter()
+            .any(|entry| entry.tx_hash == outpoint.txid && entry.tx_pos == outpoint.vout as usize))
     }
 
     fn remove_account_utxos(
