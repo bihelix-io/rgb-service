@@ -19,6 +19,8 @@ use axum::{
     response::Response,
     serve,
 };
+use bdk_electrum::electrum_client::{self, ElectrumApi};
+use bdk_esplora::esplora_client;
 use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::{sha256, Hash, HashEngine},
@@ -47,8 +49,9 @@ use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
     import_rgb20_stock_from_fs, issue_rgb20_fixed_with_chain_source,
     list_legacy_rgb20_assets_for_utxos, list_rgb20_assets_for_utxos, list_rgb20_contracts,
-    prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer,
-    stage_sender_fascia, ChainSource, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    normalize_electrum_url, prepare_rgb20_psbt, scan_and_promote_confirmed_staged_rgb_stocks,
+    stage_receiver_transfer, stage_sender_fascia, ChainSource, Rgb20IssueRequest,
+    Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1278,7 +1281,8 @@ impl LocalDaemonService {
         &self,
         account_id: &str,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
-        self.list_account_utxos(account_id)?
+        let utxos = self
+            .list_account_utxos(account_id)?
             .into_iter()
             .map(|utxo| {
                 Ok(Rgb20TrackedUtxo {
@@ -1288,7 +1292,90 @@ impl LocalDaemonService {
                     confirmed: utxo.confirmed,
                 })
             })
-            .collect()
+            .collect::<rgb_service_api::Result<Vec<_>>>()?;
+        self.filter_unspent_account_utxos(account_id, utxos)
+    }
+
+    fn filter_unspent_account_utxos(
+        &self,
+        account_id: &str,
+        utxos: Vec<Rgb20TrackedUtxo>,
+    ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
+        let mut kept = Vec::with_capacity(utxos.len());
+        let mut spent = BTreeSet::new();
+        for utxo in utxos {
+            if !utxo.confirmed {
+                kept.push(utxo);
+                continue;
+            }
+            if self.chain_outpoint_unspent(utxo.outpoint)? {
+                kept.push(utxo);
+            } else {
+                spent.insert(utxo.outpoint.to_string());
+            }
+        }
+        if !spent.is_empty() {
+            self.logger.info(format!(
+                "removed spent rgb account utxos account_id={account_id} count={} outpoints={}",
+                spent.len(),
+                spent.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+            self.remove_account_utxos(account_id, spent)?;
+        }
+        Ok(kept)
+    }
+
+    fn chain_outpoint_unspent(&self, outpoint: OutPoint) -> rgb_service_api::Result<bool> {
+        match self.chain_source() {
+            ChainSource::Esplora(config) => self.esplora_outpoint_unspent(&config.url, outpoint),
+            ChainSource::Electrum(config) => self.electrum_outpoint_unspent(&config.url, outpoint),
+        }
+    }
+
+    fn esplora_outpoint_unspent(
+        &self,
+        url: &str,
+        outpoint: OutPoint,
+    ) -> rgb_service_api::Result<bool> {
+        let client = esplora_client::Builder::new(url)
+            .timeout(30)
+            .build_blocking();
+        let status = client
+            .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+            .map_err(|err| RgbServiceError::Backend(format!("esplora outspend failed: {err}")))?;
+        Ok(status.is_some_and(|status| !status.spent))
+    }
+
+    fn electrum_outpoint_unspent(
+        &self,
+        url: &str,
+        outpoint: OutPoint,
+    ) -> rgb_service_api::Result<bool> {
+        let client = electrum_client::Client::new(&normalize_electrum_url(url))
+            .map_err(|err| RgbServiceError::Backend(format!("electrum client failed: {err}")))?;
+        let funding_tx = client
+            .transaction_get(&outpoint.txid)
+            .map_err(|err| RgbServiceError::Backend(format!("electrum tx fetch failed: {err}")))?;
+        let Some(output) = funding_tx.output.get(outpoint.vout as usize) else {
+            return Ok(false);
+        };
+        let history = client
+            .script_get_history(output.script_pubkey.as_script())
+            .map_err(|err| {
+                RgbServiceError::Backend(format!("electrum script history failed: {err}"))
+            })?;
+        for entry in history {
+            if entry.tx_hash == outpoint.txid {
+                continue;
+            }
+            let tx = client.transaction_get(&entry.tx_hash).map_err(|err| {
+                RgbServiceError::Backend(format!("electrum history tx fetch failed: {err}"))
+            })?;
+            if tx.input.iter().any(|input| input.previous_output == outpoint) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn remove_account_utxos(
@@ -1556,7 +1643,16 @@ impl LocalDaemonService {
             summary.accounts += 1;
             summary.addresses += account.addresses.len();
             if let Some(utxos) = sql_utxos_by_account.remove(&account_id) {
+                let mut seen_outpoints = BTreeSet::<String>::new();
                 for utxo in utxos {
+                    if !seen_outpoints.insert(utxo.outpoint.clone()) {
+                        continue;
+                    }
+                    let outpoint = OutPoint::from_str(&utxo.outpoint)
+                        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+                    if utxo.confirmed && !self.chain_outpoint_unspent(outpoint)? {
+                        continue;
+                    }
                     self.put_account_utxo(&account_id, utxo)?;
                     summary.utxos += 1;
                 }
