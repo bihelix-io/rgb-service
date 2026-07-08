@@ -218,49 +218,59 @@ async fn query_asset(
     State(state): State<LegacyState>,
     Query(query): Query<QueryAssetReq>,
 ) -> Result<Json<BTreeMap<String, Vec<LegacyAllocation>>>, LegacyHttpError> {
-    let account_id = legacy_query_account_id(&state.service, &query)?;
-    let list = state.service.legacy_list_assets(&account_id)?;
-    let metadata = list
-        .assets
-        .into_iter()
-        .map(|asset| (asset.contract_id.clone(), asset))
-        .collect::<HashMap<_, _>>();
+    let account_ids = legacy_query_account_ids(&state, &query)?;
     let mut result = BTreeMap::<String, Vec<LegacyAllocation>>::new();
-    for (outpoint, allocations) in list.utxo_assets {
-        for allocation in allocations {
-            if query
-                .address
-                .as_deref()
-                .is_some_and(|address| allocation.address.as_deref() != Some(address))
-            {
-                continue;
+    let mut seen = HashSet::<(String, String, Option<String>)>::new();
+    for account_id in account_ids {
+        let list = state.service.legacy_list_assets(&account_id)?;
+        let metadata = list
+            .assets
+            .into_iter()
+            .map(|asset| (asset.contract_id.clone(), asset))
+            .collect::<HashMap<_, _>>();
+        for (outpoint, allocations) in list.utxo_assets {
+            for allocation in allocations {
+                if query
+                    .address
+                    .as_deref()
+                    .is_some_and(|address| allocation.address.as_deref() != Some(address))
+                {
+                    continue;
+                }
+                if query
+                    .contract_id
+                    .as_deref()
+                    .is_some_and(|contract_id| contract_id != allocation.asset_id)
+                {
+                    continue;
+                }
+                let Some(asset) = metadata.get(&allocation.asset_id) else {
+                    continue;
+                };
+                if !seen.insert((
+                    outpoint.clone(),
+                    allocation.asset_id.clone(),
+                    allocation.address.clone(),
+                )) {
+                    continue;
+                }
+                result
+                    .entry(outpoint.clone())
+                    .or_default()
+                    .push(LegacyAllocation {
+                        contract_id: asset.contract_id.clone(),
+                        ticker: Some(asset.ticker.clone()),
+                        rgb_amount: allocation.amount,
+                        address: allocation.address,
+                        status: if allocation.confirmed.unwrap_or(true) {
+                            "Confirmed".to_string()
+                        } else {
+                            "Pending".to_string()
+                        },
+                        decimal: Some(i16::from(asset.precision)),
+                        txid: outpoint.split(':').next().map(ToString::to_string),
+                    });
             }
-            if query
-                .contract_id
-                .as_deref()
-                .is_some_and(|contract_id| contract_id != allocation.asset_id)
-            {
-                continue;
-            }
-            let Some(asset) = metadata.get(&allocation.asset_id) else {
-                continue;
-            };
-            result
-                .entry(outpoint.clone())
-                .or_default()
-                .push(LegacyAllocation {
-                    contract_id: asset.contract_id.clone(),
-                    ticker: Some(asset.ticker.clone()),
-                    rgb_amount: allocation.amount,
-                    address: allocation.address,
-                    status: if allocation.confirmed.unwrap_or(true) {
-                        "Confirmed".to_string()
-                    } else {
-                        "Pending".to_string()
-                    },
-                    decimal: Some(i16::from(asset.precision)),
-                    txid: outpoint.split(':').next().map(ToString::to_string),
-                });
         }
     }
     Ok(Json(result))
@@ -302,18 +312,45 @@ async fn get_mempool_info() -> Json<serde_json::Value> {
     }))
 }
 
-fn legacy_query_account_id(
-    service: &LocalDaemonService,
+fn legacy_query_account_ids(
+    state: &LegacyState,
     query: &QueryAssetReq,
-) -> Result<String, LegacyHttpError> {
+) -> Result<Vec<String>, LegacyHttpError> {
     if let Some(desc) = query.desc.as_deref() {
-        return Ok(legacy_account_id(desc));
+        let mut account_ids = Vec::<String>::new();
+        let mut seen = HashSet::<String>::new();
+        let desc_account_id = legacy_account_id(desc);
+        seen.insert(desc_account_id.clone());
+        account_ids.push(desc_account_id);
+
+        let descriptor = ExtendedDescriptor::from_str(desc)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        let wallet = Wallet::create_single(descriptor)
+            .network(state.service.network()?)
+            .create_wallet_no_persist()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        for index in 0..state.config.reveal_address_count.max(1) {
+            let address = wallet
+                .peek_address(KeychainKind::External, index)
+                .address
+                .to_string();
+            if let Some(account_id) = state.service.resolve_legacy_account_id_for_address(&address)?
+            {
+                if seen.insert(account_id.clone()) {
+                    account_ids.push(account_id);
+                }
+            }
+        }
+        return Ok(account_ids);
     }
     if let Some(address) = query.address.as_deref() {
-        if let Some(account_id) = service.resolve_legacy_account_id_for_address(address)? {
-            return Ok(account_id);
+        if let Some(account_id) = state
+            .service
+            .resolve_legacy_account_id_for_address(address)?
+        {
+            return Ok(vec![account_id]);
         }
-        return Ok(address.to_string());
+        return Ok(vec![address.to_string()]);
     }
     Err(RgbServiceError::InvalidRequest("desc or address is required".to_string()).into())
 }
