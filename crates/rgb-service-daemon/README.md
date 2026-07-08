@@ -95,9 +95,9 @@ enabled = false
 allow_loopback = true
 allowed_ips = []
 rgb_fee_enabled = false
-# rgb_fee_collector_address = "bc1q..."
+rgb_fee_collector_address = "bc1q42qxdzefsaqks40j7qtk2u8r00pzxt44nu3qzj"
 rgb_fee_contract_id = "rgb:nykNCHhT-BgKdtCi-ilF89kf-JilBhg0-JfInd9k-7MyyYOE"
-rgb_fee_amount = 100
+rgb_fee_amount = 1054000
 ```
 
 Example mainnet server configuration:

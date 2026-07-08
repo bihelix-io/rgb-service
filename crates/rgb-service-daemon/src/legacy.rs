@@ -274,6 +274,7 @@ struct LegacyFeeInfo {
 async fn estimate_gas(
     State(state): State<LegacyState>,
 ) -> Result<Json<Option<LegacyFeeInfo>>, LegacyHttpError> {
+    let amount = legacy_rgb_fee_amount(&state);
     let fee = state
         .service
         .list_token_catalog_entries()?
@@ -282,7 +283,7 @@ async fn estimate_gas(
         .map(|entry| LegacyFeeInfo {
             ticker: "RNA",
             contract_id: entry.contract_id,
-            amount: state.service.rna.transfer_fee,
+            amount,
             precision: entry.precision,
         });
     Ok(Json(fee))
@@ -577,10 +578,7 @@ fn maybe_add_legacy_rgb_fee_assignment(
             )
         })?;
     let contract_id = legacy_rna_fee_contract_id(state)?;
-    let amount = state
-        .config
-        .rgb_fee_amount
-        .unwrap_or(state.service.rna.transfer_fee);
+    let amount = legacy_rgb_fee_amount(state);
     assignments.push(TransferAssign {
         address: collector.to_string(),
         sats: Some(DEFAULT_RGB_DUST_SATS),
@@ -609,6 +607,13 @@ fn legacy_rna_fee_contract_id(state: &LegacyState) -> Result<String, LegacyHttpE
         .ok_or_else(|| {
             RgbServiceError::NotFound("RNA asset not found in catalog".to_string()).into()
         })
+}
+
+fn legacy_rgb_fee_amount(state: &LegacyState) -> u64 {
+    state
+        .config
+        .rgb_fee_amount
+        .unwrap_or(state.service.rna.transfer_fee)
 }
 
 fn parse_legacy_rgb_assignments(
