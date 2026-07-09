@@ -15,7 +15,8 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use bdk_electrum::{electrum_client, BdkElectrumClient};
+use bdk_electrum::electrum_client::{self, ElectrumApi};
+use bdk_electrum::BdkElectrumClient;
 use bdk_esplora::EsploraExt;
 use bdk_wallet::{
     bitcoin::{
@@ -872,22 +873,28 @@ async fn transfer_callback(
     State(state): State<LegacyState>,
     Json(req): Json<TransferCallbackReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
-    let txid = match (req.txid, req.tx) {
-        (Some(txid), _) => txid,
-        (None, Some(tx_hex)) => {
-            let tx: bdk_wallet::bitcoin::Transaction = deserialize(
-                &crate::hex_decode(&tx_hex)
-                    .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
-            )
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-            tx.compute_txid().to_string()
+    // Parse the signed transaction (the caller submits the fully-signed tx;
+    // the daemon is responsible for broadcasting it, mirroring wallet-v2).
+    let tx: bdk_wallet::bitcoin::Transaction = match (req.txid.clone(), req.tx.clone()) {
+        (_, Some(tx_hex)) => deserialize(
+            &crate::hex_decode(&tx_hex)
+                .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
+        )
+        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
+        (Some(txid_str), None) => {
+            return Err(RgbServiceError::InvalidRequest(format!(
+                "transfer callback requires signed tx to broadcast (txid={txid_str})"
+            ))
+            .into());
         }
         (None, None) => {
             return Err(
-                RgbServiceError::InvalidRequest("tx or txid is required".to_string()).into(),
+                RgbServiceError::InvalidRequest("tx is required".to_string()).into(),
             );
         }
     };
+    let txid = tx.compute_txid().to_string();
+
     let has_transfer_id_field = req.transfer_id.is_some();
     let has_desc = req.desc.is_some();
     let transfer_id = req.transfer_id.unwrap_or_else(|| txid.clone());
@@ -898,22 +905,31 @@ async fn transfer_callback(
     let account_id = state
         .service
         .legacy_find_prepared_transfer_account_id(&transfer_id)?
-        .or(desc_account_id)
-        .ok_or_else(|| {
-            RgbServiceError::NotFound(format!("prepared transfer not found: {transfer_id}"))
-        })?;
-    state
-        .service
-        .legacy_commit_prepared_transfer(
-            &account_id,
-            &transfer_id,
-            &txid,
-            req.utxos.unwrap_or_default(),
-        )
-        .or_else(|err| match err {
-            RgbServiceError::NotFound(_) if req.desc.is_some() => Ok(()),
-            err => Err(err),
-        })?;
+        .or(desc_account_id);
+    // RGB commit first: stage the fascia/consignment into stock so that RGB
+    // state is persisted before we attempt broadcast. If broadcast fails the
+    // RGB transition is already recorded and the tx can be re-broadcast later.
+    if let Some(account_id) = &account_id {
+        state
+            .service
+            .legacy_commit_prepared_transfer(
+                account_id,
+                &transfer_id,
+                &txid,
+                req.utxos.unwrap_or_default(),
+            )
+            .or_else(|err| match err {
+                RgbServiceError::NotFound(_) if req.desc.is_some() => Ok(()),
+                err => Err(err),
+            })?;
+    } else {
+        // No prepared transfer and no desc: BTC-only transfer, nothing to commit.
+        state.service.logger().info(format!(
+            "legacy transfer callback btc-only (no rgb commit) txid={txid}"
+        ));
+    }
+    // Broadcast the signed transaction via the configured chain backend.
+    broadcast_legacy_tx(&state.service, &tx, &txid)?;
     Ok(StatusCode::OK)
 }
 
@@ -1034,6 +1050,47 @@ fn sync_legacy_wallet(
             ));
         }
     }
+    Ok(())
+}
+
+// Broadcast a fully-signed transaction through the configured chain backend
+// (electrum protocol or esplora HTTP). Logs and propagates errors so the
+// caller (transfer/callback) returns a non-200 to the client for retry.
+fn broadcast_legacy_tx(
+    service: &LocalDaemonService,
+    tx: &bdk_wallet::bitcoin::Transaction,
+    txid: &str,
+) -> Result<(), LegacyHttpError> {
+    if is_electrum_url(&service.config.esplora_url) {
+        let url = normalize_electrum_url(&service.config.esplora_url);
+        let result = service.electrum_with_retry("electrum broadcast", || {
+            let config = electrum_client::ConfigBuilder::new()
+                .timeout(Some(crate::ELECTRUM_TIMEOUT_SECS))
+                .build();
+            let client = electrum_client::Client::from_config(&url, config)?;
+            client.transaction_broadcast(tx)?;
+            Ok(())
+        });
+        if let Err(err) = result {
+            service.logger().warn(format!(
+                "legacy broadcast failed txid={txid} (electrum): {err}"
+            ));
+            return Err(RgbServiceError::Backend(format!("broadcast failed: {err}")).into());
+        }
+    } else {
+        let client = bdk_esplora::esplora_client::Builder::new(&service.config.esplora_url)
+            .timeout(30)
+            .build_blocking();
+        if let Err(err) = client.broadcast(tx) {
+            service.logger().warn(format!(
+                "legacy broadcast failed txid={txid} (esplora): {err}"
+            ));
+            return Err(RgbServiceError::Backend(format!("broadcast failed: {err}")).into());
+        }
+    }
+    service
+        .logger()
+        .info(format!("legacy broadcast ok txid={txid}"));
     Ok(())
 }
 
