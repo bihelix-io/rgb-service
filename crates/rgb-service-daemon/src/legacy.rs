@@ -983,13 +983,27 @@ fn sync_legacy_wallet(
             .map_err(|err| RgbServiceError::Backend(format!("electrum client failed: {err}")))?;
         let client = BdkElectrumClient::new(client);
         let request = wallet.wallet.start_sync_with_revealed_spks().build();
-        let update = client
-            .sync(request, 10, true)
-            .map_err(|err| RgbServiceError::Backend(format!("electrum sync failed: {err}")))?;
-        wallet
-            .wallet
-            .apply_update(update)
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        // `fetch_prev_txouts=false`: legacy transfers don't need fee calculation
+        // from the chain sync. Some electrs deployments reject the
+        // `blockchain.block.txids` calls that anchors fetching triggers, so we
+        // skip it. If sync still fails (e.g. the server lacks a method), we log
+        // and continue with the persisted BDK state rather than failing the
+        // whole request — the stock allocation is the source of truth for RGB
+        // balances, and the BDK wallet already carries the last-known UTXO set.
+        match client.sync(request, 10, false) {
+            Ok(update) => {
+                if let Err(err) = wallet.wallet.apply_update(update) {
+                    service
+                        .logger()
+                        .warn(format!("legacy electrum apply_update failed: {err}"));
+                }
+            }
+            Err(err) => {
+                service.logger().warn(format!(
+                    "legacy electrum sync failed (continuing with persisted state): {err}"
+                ));
+            }
+        }
         return Ok(());
     }
 
@@ -997,13 +1011,20 @@ fn sync_legacy_wallet(
         .timeout(config.sync_timeout_secs.max(1))
         .build_blocking();
     let request = wallet.wallet.start_sync_with_revealed_spks().build();
-    let update = client
-        .sync(request, 2)
-        .map_err(|err| RgbServiceError::Backend(format!("esplora sync failed: {err}")))?;
-    wallet
-        .wallet
-        .apply_update(update)
-        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    match client.sync(request, 2) {
+        Ok(update) => {
+            if let Err(err) = wallet.wallet.apply_update(update) {
+                service
+                    .logger()
+                    .warn(format!("legacy esplora apply_update failed: {err}"));
+            }
+        }
+        Err(err) => {
+            service.logger().warn(format!(
+                "legacy esplora sync failed (continuing with persisted state): {err}"
+            ));
+        }
+    }
     Ok(())
 }
 

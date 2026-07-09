@@ -1446,7 +1446,7 @@ struct RecoveryScanSummary {
 }
 
 #[derive(Clone)]
-struct DaemonLogger {
+pub(crate) struct DaemonLogger {
     file: Arc<Mutex<fs::File>>,
 }
 
@@ -1462,6 +1462,10 @@ impl DaemonLogger {
 
     fn info(&self, message: impl AsRef<str>) {
         self.write("INFO", message.as_ref());
+    }
+
+    pub(crate) fn warn(&self, message: impl AsRef<str>) {
+        self.write("WARN", message.as_ref());
     }
 
     fn write(&self, level: &str, message: &str) {
@@ -1699,6 +1703,11 @@ impl LocalDaemonService {
             logger,
             pending_stock_dirs: Arc::new(Mutex::new(pending_stock_dirs)),
         })
+    }
+
+    /// Logger accessor for modules that need to write warnings (e.g. legacy).
+    pub(crate) fn logger(&self) -> &DaemonLogger {
+        &self.logger
     }
 
     fn account_stock_dir(&self, account_id: &str) -> PathBuf {
