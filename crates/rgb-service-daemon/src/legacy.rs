@@ -313,36 +313,54 @@ async fn get_mempool_info() -> Json<serde_json::Value> {
     }))
 }
 
+// Resolve all legacy account_ids that the given descriptor can reach:
+//   1. The desc's own account (`legacy-desc:<sha256(desc)>`).
+//   2. Every other legacy account that owns a revealed address of the
+//      descriptor's wallet (the same xpub may have been imported under a
+//      different desc in the wallet-v2 migration, leaving the stock under
+//      a different account_id; the address mapping bridges them).
+//
+// This mirrors the resolution used by `legacy_query_account_ids` for the
+// desc case so that `/asset?desc=...` and `/transfer/psbt` agree on
+// which account holds the RGB balance. The first entry is always the
+// desc's own account_id and is used as the canonical primary key for
+// non-RGB state (e.g. `legacy_put_prepared_transfer`).
+fn legacy_desc_account_ids(
+    state: &LegacyState,
+    desc: &str,
+) -> Result<Vec<String>, LegacyHttpError> {
+    let mut account_ids = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let desc_account_id = legacy_account_id(desc);
+    seen.insert(desc_account_id.clone());
+    account_ids.push(desc_account_id);
+
+    let descriptor = ExtendedDescriptor::from_str(desc)
+        .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+    let wallet = Wallet::create_single(descriptor)
+        .network(state.service.network()?)
+        .create_wallet_no_persist()
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    for index in 0..state.config.reveal_address_count.max(1) {
+        let address = wallet
+            .peek_address(KeychainKind::External, index)
+            .address
+            .to_string();
+        if let Some(account_id) = state.service.resolve_legacy_account_id_for_address(&address)? {
+            if seen.insert(account_id.clone()) {
+                account_ids.push(account_id);
+            }
+        }
+    }
+    Ok(account_ids)
+}
+
 fn legacy_query_account_ids(
     state: &LegacyState,
     query: &QueryAssetReq,
 ) -> Result<Vec<String>, LegacyHttpError> {
     if let Some(desc) = query.desc.as_deref() {
-        let mut account_ids = Vec::<String>::new();
-        let mut seen = HashSet::<String>::new();
-        let desc_account_id = legacy_account_id(desc);
-        seen.insert(desc_account_id.clone());
-        account_ids.push(desc_account_id);
-
-        let descriptor = ExtendedDescriptor::from_str(desc)
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let wallet = Wallet::create_single(descriptor)
-            .network(state.service.network()?)
-            .create_wallet_no_persist()
-            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-        for index in 0..state.config.reveal_address_count.max(1) {
-            let address = wallet
-                .peek_address(KeychainKind::External, index)
-                .address
-                .to_string();
-            if let Some(account_id) = state.service.resolve_legacy_account_id_for_address(&address)?
-            {
-                if seen.insert(account_id.clone()) {
-                    account_ids.push(account_id);
-                }
-            }
-        }
-        return Ok(account_ids);
+        return legacy_desc_account_ids(state, desc);
     }
     if let Some(address) = query.address.as_deref() {
         if let Some(account_id) = state
@@ -457,7 +475,18 @@ async fn transfer_psbt(
         .desc
         .as_deref()
         .ok_or_else(|| RgbServiceError::InvalidRequest("desc is required".to_string()))?;
-    let account_id = legacy_account_id(desc);
+    // Resolve every legacy account_id reachable from this descriptor so RGB
+    // balance checks and input selection stay consistent with `/asset?desc=`
+    // (which already aggregates across the same set of accounts). The first
+    // entry is the desc's own account_id and remains the canonical primary
+    // key for prepared-transfer storage.
+    let account_ids = legacy_desc_account_ids(&state, desc)?;
+    let account_id = account_ids[0].clone();
+    // `transfer_account_id` tracks which resolved account actually owns the
+    // RGB stock that will be moved; we use it for `prepare_rgb20_psbt` and
+    // `legacy_put_prepared_transfer` so the fascia is staged into the same
+    // stock that backs the consumed allocations.
+    let mut transfer_account_id = account_id.clone();
 
     maybe_add_legacy_rgb_fee_assignment(&state, &mut req.assign)?;
 
@@ -483,19 +512,45 @@ async fn transfer_psbt(
     let rgb_totals = aggregate_legacy_rgb_amounts(&rgb_assignments)?;
     let mut rgb_inputs = BTreeSet::new();
     for (contract_id, amount) in &rgb_totals {
-        let have = legacy_rgb_balance(&state.service, &account_id, contract_id)?;
+        // Sum balance across every reachable account_id. The query path
+        // already does this, so the transfer's availability check matches
+        // what the frontend sees from `/asset?desc=`.
+        let have: u64 = account_ids
+            .iter()
+            .map(|aid| {
+                legacy_rgb_balance(&state.service, aid, contract_id).unwrap_or_default()
+            })
+            .sum();
         if have < *amount {
             return Err(legacy_rgb_insufficient_error(contract_id, *amount, have));
         }
-        for outpoint in select_rgb20_inputs(
-            &state.service.account_stock_dir(&account_id),
-            wallet_outpoints.clone(),
-            *contract_id,
-            *amount,
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?
-        {
-            rgb_inputs.insert(outpoint);
+        // Try each reachable account's stock in order; the first that holds
+        // the required amount wins. (Split allocations across accounts are
+        // not yet supported — the common case is a single stock per wallet.)
+        let mut selected = false;
+        for aid in &account_ids {
+            match select_rgb20_inputs(
+                &state.service.account_stock_dir(aid),
+                wallet_outpoints.clone(),
+                *contract_id,
+                *amount,
+            ) {
+                Ok(inputs) => {
+                    if !selected {
+                        transfer_account_id = aid.clone();
+                        selected = true;
+                    }
+                    rgb_inputs.extend(inputs);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        if !selected {
+            return Err(RgbServiceError::Backend(format!(
+                "no reachable account holds contract {contract_id}"
+            ))
+            .into());
         }
     }
 
@@ -562,7 +617,7 @@ async fn transfer_psbt(
                 vout: *vout,
             });
     let prepared = prepare_rgb20_psbt(
-        &state.service.account_stock_dir(&account_id),
+        &state.service.account_stock_dir(&transfer_account_id),
         psbt,
         change_vout,
         psbt_assignments,
@@ -585,7 +640,7 @@ async fn transfer_psbt(
         RgbServiceError::InvalidRequest("legacy transfer/psbt requires recipient".to_string())
     })?;
     state.service.legacy_put_prepared_transfer(
-        &account_id,
+        &transfer_account_id,
         &transfer_id,
         first_recipient.asset_id.clone(),
         first_recipient.recipient_account_id.clone(),
@@ -596,7 +651,7 @@ async fn transfer_psbt(
     state
         .service
         .logger()
-        .info(format!("legacy prepared transfer stored account_id={account_id} transfer_id={transfer_id}"));
+        .info(format!("legacy prepared transfer stored account_id={transfer_account_id} (desc_account_id={account_id}) transfer_id={transfer_id}"));
     wallet.persist()?;
     Ok(Json(TransferPsbtResp {
         psbt: prepared.psbt.to_string(),
