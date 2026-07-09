@@ -421,6 +421,60 @@ pub fn import_rgb20_stock_from_fs(source_stock_dir: &Path, target_stock_dir: &Pa
     })
 }
 
+// wallet-service-v2 migration: same as `import_rgb20_stock_from_fs` but also
+// returns every outpoint carrying a fungible RGB allocation recorded in the
+// stock (FilterIncludeAll). Loading the stock only once avoids re-reading the
+// legacy stock for allocation extraction, which matters for large accounts.
+pub fn import_rgb20_stock_and_allocations(
+    source_stock_dir: &Path,
+    target_stock_dir: &Path,
+) -> Result<Vec<OutPoint>> {
+    use rgbstd::contract::FilterIncludeAll;
+    let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
+        .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
+    let mut stock: Stock = Stock::load(source_provider, true).map_err(|err| {
+        anyhow!(
+            "load legacy RGB stock {}: {err:?}",
+            source_stock_dir.display()
+        )
+    })?;
+
+    // extract allocation outpoints while the stock is loaded in memory
+    let mut allocation_outpoints = Vec::new();
+    let contracts = stock
+        .contracts()
+        .map_err(|err| anyhow!("list contracts: {err:?}"))?;
+    for info in contracts {
+        let Ok(contract_data) = stock.contract_data(info.id) else {
+            continue;
+        };
+        let Ok(allocations) = contract_data.fungible("assetOwner", FilterIncludeAll) else {
+            continue;
+        };
+        for allocation in allocations {
+            allocation_outpoints.push(allocation.seal.to_outpoint());
+        }
+    }
+
+    let target_store = LocalRgbStore::open(target_stock_dir)?;
+    let target_provider = target_store.rgb_stock_store()?;
+    stock
+        .make_persistent(target_provider, true)
+        .map_err(|err| {
+            anyhow!(
+                "persist migrated RGB stock {}: {err:?}",
+                target_stock_dir.display()
+            )
+        })?;
+    stock.store().map_err(|err| {
+        anyhow!(
+            "store migrated RGB stock {}: {err:?}",
+            target_stock_dir.display()
+        )
+    })?;
+    Ok(allocation_outpoints)
+}
+
 pub fn import_selected_rgb20_contracts_from_fs(
     source_stock_dir: &Path,
     target_stock_dir: &Path,

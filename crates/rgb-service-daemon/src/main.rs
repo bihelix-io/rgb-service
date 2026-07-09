@@ -47,7 +47,7 @@ use rgb_service_api::{
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
-    import_rgb20_stock_from_fs,
+    import_rgb20_stock_and_allocations,
     issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
     list_rgb20_assets_for_utxos, list_rgb20_contracts, normalize_electrum_url, prepare_rgb20_psbt,
     rgbstd::{
@@ -513,6 +513,79 @@ fn list_wallet_v2_contracts(wallet_v2_data_dir: &Path) -> rgb_service_api::Resul
     Ok(())
 }
 
+// wallet-service-v2 migration: audit every allocation recorded in each account
+// stock (FilterIncludeAll, independent of BDK unspent). Used to compare against
+// the BDK-derived UTXO set and detect allocations missed during import.
+fn audit_wallet_v2_allocations(wallet_v2_data_dir: &Path) -> rgb_service_api::Result<()> {
+    let entries = fs::read_dir(wallet_v2_data_dir)
+        .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 data dir: {err}")))?;
+    let mut total_allocations = 0usize;
+    let mut accounts_with_allocations = 0usize;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 entry: {err}")))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let source = entry.file_name().to_string_lossy().to_string();
+        if source == "priv" {
+            continue;
+        }
+        let stock_dir = entry.path().join(WALLET_V2_RGB_PATH);
+        if !stock_dir.is_dir() {
+            continue;
+        }
+        let provider = FsBinStore::new(stock_dir.clone())
+            .map_err(|err| RgbServiceError::Backend(format!("open legacy RGB stock: {err:?}")))?;
+        let stock: Stock = match Stock::load(provider, true) {
+            Ok(stock) => stock,
+            Err(_) => continue,
+        };
+        let contracts = stock
+            .contracts()
+            .map_err(|err| RgbServiceError::Backend(format!("list contracts: {err:?}")))?;
+        let mut account_count = 0usize;
+        for info in contracts {
+            let contract_id = info.id;
+            let Ok(contract_data) = stock.contract_data(contract_id) else {
+                continue;
+            };
+            let (ticker, precision) = contract_data
+                .global("spec")
+                .next()
+                .map(|val| {
+                    let spec = AssetSpec::from_strict_val_unchecked(&val);
+                    (spec.ticker.to_string(), spec.precision.decimals())
+                })
+                .unwrap_or_else(|| (String::new(), 0u8));
+            let Ok(allocations) = contract_data.fungible("assetOwner", FilterIncludeAll) else {
+                continue;
+            };
+            for allocation in allocations {
+                account_count += 1;
+                total_allocations += 1;
+                println!(
+                    "account={source} contract_id={contract_id} ticker={ticker} outpoint={} amount_raw={} witness={}",
+                    allocation.seal.to_outpoint(),
+                    allocation.state.value(),
+                    allocation
+                        .witness
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| "genesis".to_string())
+                );
+            }
+            let _ = precision;
+        }
+        if account_count > 0 {
+            accounts_with_allocations += 1;
+        }
+    }
+    eprintln!(
+        "audit total: accounts_with_allocations={accounts_with_allocations} total_allocations={total_allocations}"
+    );
+    Ok(())
+}
+
 // wallet-service-v2 migration: inspect a single account's RGB allocations
 // directly from the on-disk data directory (no SQL dump needed). Resolves the
 // account by desc_id, opens its BDK wallet via the bundled reader to recover
@@ -903,6 +976,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args
         .get(1)
+        .is_some_and(|arg| arg == "audit-wallet-v2-allocations")
+    {
+        let data_dir = args.get(2).ok_or("usage: rgb-service audit-wallet-v2-allocations <wallet-v2-local-data-dir>")?;
+        audit_wallet_v2_allocations(Path::new(data_dir))?;
+        return Ok(());
+    }
+    if args
+        .get(1)
         .is_some_and(|arg| arg == "decode-script-address")
     {
         let script_hex = args.get(2).ok_or(decode_script_address_usage())?;
@@ -1034,16 +1115,41 @@ async fn access_log_middleware(
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let status = response.status().as_u16();
     let latency_ms = started.elapsed().as_millis();
-    service.logger.info(format!(
-        "access remote={} forwarded_for={} method={} path={} status={} latency_ms={} user_agent={}",
-        remote.ip(),
-        forwarded_for,
-        method,
-        path,
-        status,
-        latency_ms,
-        user_agent
-    ));
+    // For error responses, capture the body so we can log why the request
+    // failed (the access log alone only shows the status code).
+    let body_note = if status >= 400 {
+        let body = std::mem::replace(response.body_mut(), Body::empty());
+        let bytes = axum::body::to_bytes(body, 8 * 1024).await.unwrap_or_default();
+        let note = String::from_utf8_lossy(&bytes).to_string();
+        *response.body_mut() = Body::from(bytes);
+        note
+    } else {
+        String::new()
+    };
+    if body_note.is_empty() {
+        service.logger.info(format!(
+            "access remote={} forwarded_for={} method={} path={} status={} latency_ms={} user_agent={}",
+            remote.ip(),
+            forwarded_for,
+            method,
+            path,
+            status,
+            latency_ms,
+            user_agent
+        ));
+    } else {
+        service.logger.info(format!(
+            "access remote={} forwarded_for={} method={} path={} status={} latency_ms={} user_agent={} body={}",
+            remote.ip(),
+            forwarded_for,
+            method,
+            path,
+            status,
+            latency_ms,
+            user_agent,
+            body_note
+        ));
+    }
     response
 }
 
@@ -2151,22 +2257,46 @@ impl LocalDaemonService {
             self.put_legacy_address_account(address, &account_id)?;
             summary.addresses += 1;
         }
+        // Seed tracked UTXOs from the BDK unspent set so the daemon knows the
+        // bitcoin UTXOs the account owns (used for coin selection / change).
+        let mut seeded = std::collections::BTreeSet::new();
         for utxo in recovered.utxos {
             let tracked = TrackedUtxo {
-                outpoint: utxo.outpoint,
+                outpoint: utxo.outpoint.clone(),
                 address: utxo.address,
                 confirmed: utxo.is_confirmed,
             };
             self.put_account_utxo(&account_id, tracked)?;
+            seeded.insert(utxo.outpoint);
             summary.utxos += 1;
         }
-        import_rgb20_stock_from_fs(source_stock_dir, &self.account_stock_dir(&account_id))
-            .map_err(|err| {
-                RgbServiceError::Backend(format!(
-                    "import wallet-v2 RGB stock {}: {err:#}",
-                    source_stock_dir.display()
-                ))
-            })?;
+        // Migrate the RGB stock into the daemon's fjall store and, from the same
+        // single load, collect every outpoint carrying a fungible allocation.
+        // Allocation outpoints are the authoritative source of which UTXOs hold
+        // RGB assets and may include change outputs that BDK no longer tracks as
+        // unspent; seed them as tracked UTXOs so the daemon resolves the full
+        // balance. Chain-sync filtering later removes genuinely spent ones.
+        let allocation_outpoints =
+            import_rgb20_stock_and_allocations(source_stock_dir, &self.account_stock_dir(&account_id))
+                .map_err(|err| {
+                    RgbServiceError::Backend(format!(
+                        "import wallet-v2 RGB stock {}: {err:#}",
+                        source_stock_dir.display()
+                    ))
+                })?;
+        for allocation_outpoint in allocation_outpoints {
+            let outpoint_str = allocation_outpoint.to_string();
+            if !seeded.insert(outpoint_str.clone()) {
+                continue;
+            }
+            let tracked = TrackedUtxo {
+                outpoint: outpoint_str,
+                address: None,
+                confirmed: true,
+            };
+            self.put_account_utxo(&account_id, tracked)?;
+            summary.utxos += 1;
+        }
         summary.stocks_imported += 1;
         summary.accounts += 1;
         Ok(())
