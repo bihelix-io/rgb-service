@@ -592,6 +592,10 @@ async fn transfer_psbt(
         &prepared.fascia,
         recipients,
     )?;
+    state
+        .service
+        .logger()
+        .info(format!("legacy prepared transfer stored account_id={account_id} transfer_id={transfer_id}"));
     wallet.persist()?;
     Ok(Json(TransferPsbtResp {
         psbt: prepared.psbt.to_string(),
@@ -884,8 +888,13 @@ async fn transfer_callback(
             );
         }
     };
+    let has_transfer_id_field = req.transfer_id.is_some();
+    let has_desc = req.desc.is_some();
     let transfer_id = req.transfer_id.unwrap_or_else(|| txid.clone());
     let desc_account_id = req.desc.as_deref().map(legacy_account_id);
+    state.service.logger().info(format!(
+        "legacy transfer callback txid={txid} transfer_id={transfer_id} has_desc={has_desc} has_transfer_id_field={has_transfer_id_field}"
+    ));
     let account_id = state
         .service
         .legacy_find_prepared_transfer_account_id(&transfer_id)?
