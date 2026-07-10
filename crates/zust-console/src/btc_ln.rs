@@ -118,6 +118,7 @@ pub struct BtcLnRuntimeConfig {
     pub entropy_mnemonic: Option<String>,
     pub trusted_peers_0conf: Vec<String>,
     pub accept_inbound_channels: bool,
+    pub announce_for_forwarding: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

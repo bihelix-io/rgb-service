@@ -10,6 +10,11 @@ pub trait RgbServiceApi: Send + Sync + 'static {
 
     async fn list_assets(&self, req: Authorized<ListAssetsRequest>) -> Result<ListAssetsResponse>;
 
+    async fn assets_by_utxo(
+        &self,
+        req: Authorized<UtxoAssetsRequest>,
+    ) -> Result<UtxoAssetsResponse>;
+
     async fn token_list(&self) -> Result<TokenListResponse>;
 
     async fn balance(&self, req: Authorized<BalanceRequest>) -> Result<RgbBalance>;

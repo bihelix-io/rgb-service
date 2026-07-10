@@ -25,7 +25,7 @@ bdk_esplora = { version = "0.22.2", features = ["blocking"] }
 bdk_wallet = { version = "=2.2.0", features = ["file_store", "keys-bip39"] }
 bip39 = "2"
 bitcoin = { version = "0.32.7", features = ["base64", "serde", "secp-recovery"] }
-dynamic = { package = "zust-dynamic", version = "0.9.16" }
+dynamic = { workspace = true }
 fjall = { workspace = true }
 getrandom = "0.3"
 iroh = "1.0.0-rc.0"
@@ -42,10 +42,11 @@ rgb-consensus = { path = "../rgb-consensus" }
 rgb-invoice = { package = "rgb-invoicing", path = "../rgb-ops/invoice", default-features = false }
 rgb-schemata = { package = "rgb-schemas", path = "../rgb-schemas", default-features = false }
 rgbstd = { package = "rgb-ops", path = "../rgb-ops", default-features = false, features = ["serde", "esplora_blocking", "fjall"] }
-root = { package = "zust-root", version = "0.9.6" }
+root = { workspace = true }
+reqwest = { version = "0.12", features = ["blocking"] }
 serde = { package = "serde", version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 strict_types = { package = "rgb-strict-types", version = "~1.0.1", features = ["serde"] }
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "time"] }
-vm = { package = "zust-vm", version = "0.9.75" }
+vm = { workspace = true }

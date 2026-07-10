@@ -210,6 +210,7 @@ callback 参数返回。需要签名的调用会在后台线程里按 `local/sig
 | `rgb::request(route, payload, callback)` | POST 任意 RGB daemon route，结果进 callback。 |
 | `rgb::issue(ticker, name, precision, supply, allocation_outpoint, callback)` | POST `/v1/assets/issue`，结果进 callback。 |
 | `rgb::assets(callback)` | 对默认账户 POST `/v1/assets/list`，结果进 callback。 |
+| `rgb::assets_by_utxo(outpoint, address, confirmed, callback)` | 对默认托管账户 POST `/v1/assets/by-utxo`，返回该 L1 outpoint 已验证的 RGB allocations。 |
 | `rgb::scan_utxos(addr)` | SSH 运维函数：通过 Esplora 扫描地址 UTXO，并直接写入 daemon 本地 `account_utxos`。不经过 HTTP 管理入口。 |
 | `rgb::token_list()` | GET `/v1/tokens/list`；公开 token/contract 列表。 |
 | `rgb::balance(asset_id, scope, callback)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`，结果进 callback。 |

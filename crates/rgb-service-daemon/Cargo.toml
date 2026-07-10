@@ -24,7 +24,7 @@ bdk_electrum = "0.23.2"
 bdk_esplora = { version = "0.22.2", features = ["blocking"] }
 bdk_wallet = { version = "=2.2.0", features = ["file_store"] }
 bitcoin = { workspace = true }
-dynamic = { package = "zust-dynamic", version = "0.9.12" }
+dynamic = { workspace = true }
 fjall = { workspace = true }
 rgb-service-local = { version = "0.11.1-rc.10", path = "../rgb-service-local" }
 rgb-service-api = { workspace = true, features = ["axum"] }

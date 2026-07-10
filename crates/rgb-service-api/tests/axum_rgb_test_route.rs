@@ -8,17 +8,19 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use rgb_service_api::{
-    axum_service::router, AccountId, AssetSpendAuthorization, AuthSubject, AuthVerifier,
-    Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse, BalanceRequest,
-    CancelTransferRequest, CancelTransferResponse, CommitTransferRequest, CommitTransferResponse,
-    IssueAssetRequest, IssueAssetResponse, ListAssetsRequest, ListAssetsResponse,
-    ListPendingRequest, ListPendingResponse, LnChannelOpenPrepareRequest,
-    LnChannelOpenPrepareResponse, LnClosingComposeRequest, LnCommitmentComposeRequest,
-    LnComposeResponse, LnOnchainClaimComposeRequest, LnRecoverRequest, LnRecoveryReport,
-    Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest, RecoveryReport,
-    RequestSignature, RgbBalance, RgbServiceApi, RgbServiceError, RgbTestScenario, RgbTestStep,
-    RnaBalanceRequest, RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SignatureScheme,
-    SignedRequest, TokenListResponse,
+    axum_service::router, AccountId, AllocationStatus, AssetLayer, AssetSpendAuthorization,
+    AuthSubject, AuthVerifier, Authorized, BalanceBreakdownRequest, BalanceBreakdownResponse,
+    BalanceRequest, CancelTransferRequest, CancelTransferResponse, CommitTransferRequest,
+    CommitTransferResponse, IssueAssetRequest, IssueAssetResponse, ListAssetsRequest,
+    ListAssetsResponse, ListPendingRequest, ListPendingResponse, LnChannelFundingRefRequest,
+    LnChannelFundingRefResponse, LnChannelOpenPrepareRequest, LnChannelOpenPrepareResponse,
+    LnClosingComposeRequest, LnCommitmentComposeRequest, LnComposeResponse,
+    LnOnchainClaimComposeRequest, LnPaymentClaimRequest, LnPaymentClaimResponse, LnRecoverRequest,
+    LnRecoveryReport, Permission, PrepareTransferRequest, PrepareTransferResponse, RecoverRequest,
+    RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance, RgbServiceApi,
+    RgbServiceError, RgbTestScenario, RgbTestStep, RnaBalanceRequest, RnaBalanceResponse,
+    RunRgbTestRequest, RunRgbTestResponse, SignatureScheme, SignedRequest, TokenListResponse,
+    UtxoAssetsRequest, UtxoAssetsResponse,
 };
 use tower::ServiceExt;
 
@@ -72,6 +74,39 @@ impl RgbServiceApi for TestRgbService {
         _req: Authorized<ListAssetsRequest>,
     ) -> rgb_service_api::Result<ListAssetsResponse> {
         Err(unimplemented_call("list_assets"))
+    }
+
+    async fn assets_by_utxo(
+        &self,
+        req: Authorized<UtxoAssetsRequest>,
+    ) -> rgb_service_api::Result<UtxoAssetsResponse> {
+        let outpoint = req.payload.outpoint;
+        Ok(UtxoAssetsResponse {
+            account_id: req.payload.account_id,
+            outpoint: outpoint.clone(),
+            assets: vec![RgbAssetInfo {
+                asset_id: "rgb:asset-1".to_string(),
+                contract_id: "rgb:asset-1".to_string(),
+                ticker: "TEST".to_string(),
+                name: "Test Asset".to_string(),
+                precision: 8,
+                supply: None,
+                issue_utxo: String::new(),
+                contract_type: "Rgb20".to_string(),
+                issuer_desc: String::new(),
+                created_at: String::new(),
+                ext: None,
+            }],
+            allocations: vec![RgbAllocation {
+                asset_id: "rgb:asset-1".to_string(),
+                outpoint,
+                amount: 100_000_000,
+                layer: AssetLayer::L1,
+                status: AllocationStatus::Available,
+                address: Some("bc1qtest".to_string()),
+                confirmed: Some(true),
+            }],
+        })
     }
 
     async fn token_list(&self) -> rgb_service_api::Result<TokenListResponse> {
@@ -137,6 +172,20 @@ impl RgbServiceApi for TestRgbService {
         Err(unimplemented_call("prepare_ln_channel_open"))
     }
 
+    async fn ln_channel_funding_ref(
+        &self,
+        _req: Authorized<LnChannelFundingRefRequest>,
+    ) -> rgb_service_api::Result<LnChannelFundingRefResponse> {
+        Err(unimplemented_call("ln_channel_funding_ref"))
+    }
+
+    async fn claim_ln_payment(
+        &self,
+        _req: Authorized<LnPaymentClaimRequest>,
+    ) -> rgb_service_api::Result<LnPaymentClaimResponse> {
+        Err(unimplemented_call("claim_ln_payment"))
+    }
+
     async fn compose_ln_commitment(
         &self,
         _req: Authorized<LnCommitmentComposeRequest>,
@@ -198,6 +247,38 @@ async fn token_list_route_is_public() {
     let response: TokenListResponse = serde_json::from_slice(&body).unwrap();
     assert!(response.contracts.is_empty());
     assert!(response.assets.is_empty());
+}
+
+#[tokio::test]
+async fn assets_by_utxo_route_returns_allocations_for_outpoint() {
+    let app = router(Arc::new(TestRgbService), Arc::new(AllowAllAuth));
+    let signed = SignedRequest {
+        payload: UtxoAssetsRequest {
+            account_id: account("alice"),
+            outpoint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1"
+                .to_string(),
+            address: Some("bc1qexample".to_string()),
+            confirmed: true,
+        },
+        signature: test_signature(),
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/assets/by-utxo")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&signed).unwrap()))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let response: UtxoAssetsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.account_id, account("alice"));
+    assert_eq!(response.assets.len(), 1);
+    assert_eq!(response.assets[0].contract_id, "rgb:asset-1");
+    assert_eq!(response.allocations.len(), 1);
+    assert_eq!(response.allocations[0].amount, 100_000_000);
+    assert_eq!(response.allocations[0].status, AllocationStatus::Available);
 }
 
 #[tokio::test]

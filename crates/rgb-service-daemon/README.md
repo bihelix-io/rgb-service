@@ -200,6 +200,7 @@ Current public daemon routes:
 POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
 POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
 POST /v1/assets/list            # Query account asset list, charges query_fee
+POST /v1/assets/by-utxo         # Query verified RGB allocations and asset metadata for one L1 outpoint, charges query_fee
 GET  /v1/tokens/list            # Public RGB20 contract/asset catalog, no signature required
 POST /v1/balance                # Query asset balance summary, charges query_fee
 POST /v1/balance/breakdown      # Query allocations and pending detail, charges query_fee
@@ -273,6 +274,21 @@ not expose `/v1/pending/list` or `/v1/recover` to clients.
 LN compose routes are service-owned state-transition APIs for `ln-rgb-lightning`. They require both the outer request signature and `asset_authorization`. Until the daemon RGB-LN state machine is wired to `rgb-service-local`, these routes fail loudly with HTTP 501 instead of falling back to local LN RGB state.
 
 All non-public requests use `SignedRequest<T>`.
+
+`/v1/assets/by-utxo` payload:
+
+```json
+{
+  "account_id": "<custody account>",
+  "outpoint": "<txid>:<vout>",
+  "address": "bc1q...",
+  "confirmed": true
+}
+```
+
+The response returns `assets` and `allocations`. Allocations come exclusively from the
+account RGB stock after consignment acceptance; an ordinary BTC UTXO with no RGB assignment
+returns empty arrays.
 
 `prepare` and `commit` also require `AssetSpendAuthorization`.
 

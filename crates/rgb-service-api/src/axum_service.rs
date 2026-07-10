@@ -30,6 +30,7 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
         .route("/v1/rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
+        .route("/v1/assets/by-utxo", post(assets_by_utxo))
         .route("/v1/tokens/list", get(token_list))
         .route("/v1/balance", post(balance))
         .route("/v1/balance/breakdown", post(balance_breakdown))
@@ -126,6 +127,14 @@ async fn list_assets(
 ) -> Result<Json<ListAssetsResponse>, HttpError> {
     let req = authorize(&state, Permission::ReadAssets, req).await?;
     Ok(Json(state.service.list_assets(req).await?))
+}
+
+async fn assets_by_utxo(
+    State(state): State<ApiState>,
+    Json(req): Json<SignedRequest<UtxoAssetsRequest>>,
+) -> Result<Json<UtxoAssetsResponse>, HttpError> {
+    let req = authorize(&state, Permission::ReadAssets, req).await?;
+    Ok(Json(state.service.assets_by_utxo(req).await?))
 }
 
 async fn token_list(State(state): State<ApiState>) -> Result<Json<TokenListResponse>, HttpError> {

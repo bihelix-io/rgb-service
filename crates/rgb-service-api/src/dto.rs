@@ -62,6 +62,22 @@ pub struct ListAssetsResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UtxoAssetsRequest {
+    pub account_id: AccountId,
+    pub outpoint: Outpoint,
+    pub address: Option<BtcAddress>,
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UtxoAssetsResponse {
+    pub account_id: AccountId,
+    pub outpoint: Outpoint,
+    pub assets: Vec<RgbAssetInfo>,
+    pub allocations: Vec<RgbAllocation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokenListResponse {
     pub contracts: Vec<RgbContractInfo>,
     pub assets: Vec<RgbAssetInfo>,
@@ -504,6 +520,7 @@ account_scoped!(
     RnaBalanceRequest,
     IssueAssetRequest,
     ListAssetsRequest,
+    UtxoAssetsRequest,
     BalanceRequest,
     BalanceBreakdownRequest,
     PrepareTransferRequest,

@@ -43,7 +43,7 @@ use rgb_service_api::{
     RecoveryReport, RequestSignature, RgbAllocation, RgbAssetInfo, RgbBalance, RgbContractInfo,
     RgbFundingRef, RgbServiceApi, RgbServiceError, RgbTestStep, RnaBalanceRequest,
     RnaBalanceResponse, RunRgbTestRequest, RunRgbTestResponse, SignatureScheme, TokenListResponse,
-    TrackedUtxo,
+    TrackedUtxo, UtxoAssetsRequest, UtxoAssetsResponse,
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
@@ -1291,9 +1291,13 @@ impl ConfiguredAuthVerifier {
     fn permission_purposes(permission: &Permission) -> &'static [&'static str] {
         match permission {
             Permission::ReadRnaBalance => &["read_rna_balance", "rna_balance"],
-            Permission::ReadAssets => {
-                &["read_assets", "list_assets", "balance", "balance_breakdown"]
-            }
+            Permission::ReadAssets => &[
+                "read_assets",
+                "list_assets",
+                "assets_by_utxo",
+                "balance",
+                "balance_breakdown",
+            ],
             Permission::IssueAsset => &["issue_asset"],
             Permission::PrepareTransfer => &["prepare_transfer"],
             Permission::CommitTransfer => &["commit_transfer"],
@@ -3169,6 +3173,73 @@ impl RgbServiceApi for LocalDaemonService {
         Ok(ListAssetsResponse {
             assets,
             utxo_assets,
+        })
+    }
+
+    async fn assets_by_utxo(
+        &self,
+        req: Authorized<UtxoAssetsRequest>,
+    ) -> rgb_service_api::Result<UtxoAssetsResponse> {
+        let route = "/v1/assets/by-utxo";
+        let purpose = "assets_by_utxo";
+        let payload = req.payload;
+        self.charge_rna(&payload.account_id, route, purpose, self.rna.query_fee)?;
+        let stock_dir = self.account_stock_dir(&payload.account_id);
+        let outpoint = OutPoint::from_str(&payload.outpoint)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        let discovered = list_rgb20_assets_for_utxos(
+            &stock_dir,
+            [Rgb20TrackedUtxo {
+                outpoint,
+                address: payload.address.clone(),
+                confirmed: payload.confirmed,
+            }],
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let mut seen_assets = BTreeSet::new();
+        let mut assets = Vec::new();
+        let mut amounts = BTreeMap::<String, u64>::new();
+        for allocation in discovered {
+            let asset_id = allocation.contract_id.to_string();
+            if seen_assets.insert(asset_id.clone()) {
+                assets.push(
+                    self.catalog_entry_for_contract(
+                        asset_id.clone(),
+                        allocation.ticker.clone(),
+                        allocation.name.clone(),
+                        allocation.precision,
+                    )?
+                    .into_asset_info(),
+                );
+            }
+            let amount = amounts.entry(asset_id).or_default();
+            *amount = amount.checked_add(allocation.amount_raw).ok_or_else(|| {
+                RgbServiceError::Backend("RGB allocation amount overflow".to_string())
+            })?;
+        }
+        let allocation_outpoint = payload.outpoint.clone();
+        let allocation_status = if payload.confirmed {
+            AllocationStatus::Available
+        } else {
+            AllocationStatus::PendingIn
+        };
+        let allocations = amounts
+            .into_iter()
+            .map(|(asset_id, amount)| RgbAllocation {
+                asset_id,
+                outpoint: allocation_outpoint.clone(),
+                amount,
+                layer: AssetLayer::L1,
+                status: allocation_status.clone(),
+                address: payload.address.clone(),
+                confirmed: Some(payload.confirmed),
+            })
+            .collect::<Vec<_>>();
+        Ok(UtxoAssetsResponse {
+            account_id: payload.account_id,
+            outpoint: payload.outpoint,
+            assets,
+            allocations,
         })
     }
 

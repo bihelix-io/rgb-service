@@ -495,6 +495,16 @@ where
     /// Regenerates and broadcasts the spending transaction for any outputs that are pending. This method will be a
     /// no-op if a sweep is already pending.
     pub async fn regenerate_and_broadcast_spend_if_necessary(&self) -> Result<(), ()> {
+        self.regenerate_and_broadcast_spend(false).await
+    }
+
+    /// Regenerates and broadcasts the spending transaction even if a pending output was already
+    /// broadcast at the current block height.
+    pub async fn force_regenerate_and_broadcast_spend(&self) -> Result<(), ()> {
+        self.regenerate_and_broadcast_spend(true).await
+    }
+
+    async fn regenerate_and_broadcast_spend(&self, force_rebroadcast: bool) -> Result<(), ()> {
         // Prevent concurrent sweeps.
         if self
             .pending_sweep
@@ -505,7 +515,7 @@ where
         }
 
         let result = self
-            .regenerate_and_broadcast_spend_if_necessary_internal()
+            .regenerate_and_broadcast_spend_if_necessary_internal(force_rebroadcast)
             .await;
 
         // Release the pending sweep flag again, regardless of result.
@@ -515,7 +525,10 @@ where
     }
 
     /// Regenerates and broadcasts the spending transaction for any outputs that are pending
-    async fn regenerate_and_broadcast_spend_if_necessary_internal(&self) -> Result<(), ()> {
+    async fn regenerate_and_broadcast_spend_if_necessary_internal(
+        &self,
+        force_rebroadcast: bool,
+    ) -> Result<(), ()> {
         let filter_fn = |o: &TrackedSpendableOutput, cur_height: u32| {
             if o.status.is_confirmed() {
                 // Don't rebroadcast confirmed txs.
@@ -527,7 +540,7 @@ where
                 return false;
             }
 
-            if o.status.latest_broadcast_height() >= Some(cur_height) {
+            if !force_rebroadcast && o.status.latest_broadcast_height() >= Some(cur_height) {
                 // Only broadcast once per block height.
                 return false;
             }
@@ -1083,6 +1096,19 @@ where
             task::Poll::Pending => {
                 // In a sync context, we can't wait for the future to complete.
                 unreachable!("OutputSweeper::regenerate_and_broadcast_spend_if_necessary should not be pending in a sync context");
+            }
+        }
+    }
+
+    /// Wraps [`OutputSweeper::force_regenerate_and_broadcast_spend`].
+    pub fn force_regenerate_and_broadcast_spend(&self) -> Result<(), ()> {
+        let mut fut = Box::pin(self.sweeper.force_regenerate_and_broadcast_spend());
+        let mut waker = dummy_waker();
+        let mut ctx = task::Context::from_waker(&mut waker);
+        match fut.as_mut().poll(&mut ctx) {
+            task::Poll::Ready(result) => result,
+            task::Poll::Pending => {
+                unreachable!("OutputSweeper::force_regenerate_and_broadcast_spend should not be pending in a sync context");
             }
         }
     }

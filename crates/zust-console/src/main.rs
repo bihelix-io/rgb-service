@@ -170,7 +170,6 @@ fn eval_code(vm: &Vm, code: &str, arg: Dynamic) -> Result<Dynamic> {
     let (fn_ptr, ty) = vm
         .jit
         .write()
-        .map_err(|_| anyhow::anyhow!("Zust VM JIT lock poisoned"))?
         .load(code.as_bytes().to_vec(), "arg".into())
         .context("compile Zust code")?;
     let result = dynamic::call_fn(fn_ptr, ty, Box::new(arg)).context("execute Zust script")?;

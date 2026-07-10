@@ -28,6 +28,7 @@ pub struct LightningNodeConfig {
     pub peers: Vec<LightningPeerConfig>,
     pub trusted_peers_0conf: Vec<String>,
     pub accept_inbound_channels: bool,
+    pub announce_for_forwarding: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,7 @@ fn btc_ln_runtime_config(config: &LightningNodeConfig) -> BtcLnRuntimeConfig {
         entropy_mnemonic: Some(config.mnemonic.clone()),
         trusted_peers_0conf: config.trusted_peers_0conf.clone(),
         accept_inbound_channels: config.accept_inbound_channels,
+        announce_for_forwarding: config.announce_for_forwarding,
     }
 }
 

@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -26,8 +27,15 @@ use bdk_wallet::keys::bip39::{Language as BdkLanguage, Mnemonic as BdkMnemonic};
 use bdk_wallet::KeychainKind;
 use bip39::{Language as Bip39Language, Mnemonic as Bip39Mnemonic};
 use bitcoin::{
-    absolute::LockTime, consensus::encode, psbt::Psbt, secp256k1::PublicKey, transaction::Version,
-    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    absolute::LockTime,
+    bip32::{ChildNumber, DerivationPath, Fingerprint, Xpub},
+    consensus::encode,
+    hashes::{sha256, Hash},
+    psbt::Psbt,
+    secp256k1::PublicKey,
+    transaction::Version,
+    Address, Amount, CompressedPublicKey, Network, NetworkKind, OutPoint, ScriptBuf, Sequence,
+    Transaction, TxIn, TxOut, Witness,
 };
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
 use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
@@ -41,7 +49,6 @@ use vm::{Vm, ZustCallback};
 const SIGNER_ALPN: &[u8] = b"bihelix/signer/1";
 const SIGNER_REQUEST_SIGNATURE_PATH: &str = "/v1/signer/request-signature";
 const SIGNER_ASSET_AUTHORIZATION_PATH: &str = "/v1/signer/asset-authorization";
-const SIGNER_ADDRESS_BATCH_PATH: &str = "/v1/signer/address/batch";
 const SIGNER_PSBT_SIGN_PATH: &str = "/v1/signer/psbt/sign";
 const SIGNER_TIMEOUT_MS_DEFAULT: u64 = 60000;
 const SIGNER_ATTEMPTS_DEFAULT: usize = 60;
@@ -52,12 +59,20 @@ const LN_DATA_DIR_DEFAULT: &str = ".zust-console/lightning";
 const LN_LDK_DATA_DIR_DEFAULT: &str = ".zust-console/lightning/ldk";
 const LN_LISTEN_DEFAULT: &str = "0.0.0.0:9736";
 const LN_ESPLORA_DEFAULT: &str = "https://blockstream.info/api";
+const BTC_ESPLORA_CONNECT_TIMEOUT_SECS: u64 = 5;
+const BTC_ESPLORA_REQUEST_TIMEOUT_SECS: u64 = 15;
+const BTC_ESPLORA_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const BTC_ESPLORA_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const LN_LOW_WATER_SATS: u64 = 100_000;
 const BTC_ADDRESS_POOL_LOW_WATER: usize = 5;
 const BTC_ADDRESS_POOL_TARGET: usize = 20;
+const BTC_ADDRESS_XPUB_DEFAULT_PATH: &str = "0/*";
+const BTC_ADDRESS_XPUB_LOOKUP_LIMIT: u32 = 20_000;
+const BTC_ADDRESS_XPUB_LOOKUP_MARGIN: u32 = 1_000;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static ESPLORA_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 static LN_RGB_NODE: OnceLock<Mutex<Option<Arc<LnRgbBtcLnBackend>>>> = OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -85,6 +100,554 @@ fn local_dynamic(name: &str) -> Option<Dynamic> {
         .filter(|value| !matches!(value, Dynamic::Null))
 }
 
+#[derive(Clone, Debug)]
+struct BtcAddressXpubConfig {
+    xpub: Xpub,
+    xpub_fingerprint: String,
+    signing_fingerprint: Fingerprint,
+    account_path: Vec<ChildNumber>,
+    account_path_text: String,
+    source_format: String,
+    address_type: String,
+    path_template: String,
+    start_index: u32,
+}
+
+fn btc_address_xpub_config() -> Result<Option<BtcAddressXpubConfig>> {
+    let object_config =
+        local_dynamic("btc-address-xpub-config").map(|value| dynamic_to_json(&value));
+    let xpub_text = object_config
+        .as_ref()
+        .and_then(|config| {
+            find_string_field(config, &["xpub", "public_key", "extended_public_key"])
+        })
+        .or_else(|| local_string("btc-address-xpub"))
+        .or_else(|| local_string("btc-addr-xpub"))
+        .or_else(|| local_string("btc-xpub"))
+        .or_else(|| local_string("btc/address_xpub"));
+    let Some(xpub_text) = xpub_text else {
+        return Ok(None);
+    };
+
+    let xpub_text = xpub_text.trim();
+    ensure!(!xpub_text.is_empty(), "BTC address xpub must not be empty");
+    let (xpub, inferred_type, source_format) = parse_btc_address_xpub(xpub_text)?;
+    let address_type = object_config
+        .as_ref()
+        .and_then(|config| find_string_field(config, &["address_type", "script_type", "type"]))
+        .or_else(|| local_string("btc-address-xpub-type"))
+        .or_else(|| local_string("btc-addr-xpub-type"))
+        .unwrap_or(inferred_type)
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    ensure!(
+        matches!(
+            address_type.as_str(),
+            "p2wpkh"
+                | "native_segwit"
+                | "segwit"
+                | "p2shwpkh"
+                | "nested_segwit"
+                | "legacy"
+                | "p2pkh"
+                | "taproot"
+                | "p2tr"
+        ),
+        "unsupported BTC address xpub address_type `{address_type}`"
+    );
+    let path_template = object_config
+        .as_ref()
+        .and_then(|config| find_string_field(config, &["path", "derive_path", "derivation_path"]))
+        .or_else(|| local_string("btc-address-xpub-path"))
+        .or_else(|| local_string("btc-addr-xpub-path"))
+        .unwrap_or_else(|| BTC_ADDRESS_XPUB_DEFAULT_PATH.to_string());
+    let start_index = object_config
+        .as_ref()
+        .and_then(|config| find_u64_field(config, &["start_index", "index_start"]))
+        .or_else(|| {
+            local_string("btc-address-xpub-start-index").and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(0);
+    ensure!(
+        start_index <= u32::MAX as u64,
+        "BTC address xpub start_index exceeds u32"
+    );
+    let account_path_text = object_config
+        .as_ref()
+        .and_then(|config| find_string_field(config, &["account_path", "base_path", "origin_path"]))
+        .or_else(|| local_string("btc-address-xpub-account-path"))
+        .or_else(|| local_string("btc-addr-xpub-account-path"))
+        .unwrap_or_default();
+    let account_path = parse_bip32_path_prefix(&account_path_text)?;
+    let signing_fingerprint_text = object_config
+        .as_ref()
+        .and_then(|config| {
+            find_string_field(
+                config,
+                &["master_fingerprint", "root_fingerprint", "fingerprint"],
+            )
+        })
+        .or_else(|| local_string("btc-address-xpub-master-fingerprint"))
+        .or_else(|| local_string("btc-addr-xpub-master-fingerprint"));
+    let signing_fingerprint = match signing_fingerprint_text {
+        Some(text) => Fingerprint::from_str(text.trim()).with_context(|| {
+            format!(
+                "parse BTC address xpub master fingerprint `{}`",
+                text.trim()
+            )
+        })?,
+        None => Fingerprint::from_str(&xpub.fingerprint().to_string())
+            .context("parse BTC address xpub fingerprint")?,
+    };
+
+    Ok(Some(BtcAddressXpubConfig {
+        xpub,
+        xpub_fingerprint: xpub.fingerprint().to_string(),
+        signing_fingerprint,
+        account_path_text: xpub_derivation_path_text(&account_path),
+        account_path,
+        source_format,
+        address_type,
+        path_template,
+        start_index: start_index as u32,
+    }))
+}
+
+fn parse_btc_address_xpub(value: &str) -> Result<(Xpub, String, String)> {
+    let trimmed = value.trim();
+    let decoded = bitcoin::base58::decode_check(trimmed)
+        .with_context(|| "decode BTC address xpub base58check")?;
+    ensure!(
+        decoded.len() == 78,
+        "BTC address xpub payload length must be 78 bytes"
+    );
+    let version = [decoded[0], decoded[1], decoded[2], decoded[3]];
+    let (canonical_version, inferred_type, source_format) = match version {
+        [0x04, 0x88, 0xb2, 0x1e] => ([0x04, 0x88, 0xb2, 0x1e], "p2wpkh", "xpub"),
+        [0x04, 0x35, 0x87, 0xcf] => ([0x04, 0x35, 0x87, 0xcf], "p2wpkh", "tpub"),
+        [0x04, 0x9d, 0x7c, 0xb2] => ([0x04, 0x88, 0xb2, 0x1e], "p2shwpkh", "ypub"),
+        [0x04, 0x4a, 0x52, 0x62] => ([0x04, 0x35, 0x87, 0xcf], "p2shwpkh", "upub"),
+        [0x04, 0xb2, 0x47, 0x46] => ([0x04, 0x88, 0xb2, 0x1e], "p2wpkh", "zpub"),
+        [0x04, 0x5f, 0x1c, 0xf6] => ([0x04, 0x35, 0x87, 0xcf], "p2wpkh", "vpub"),
+        [0x02, 0x95, 0xb4, 0x3f] | [0x02, 0x42, 0x89, 0xef] => {
+            bail!("multisig ypub/upub BTC address xpub formats are not supported")
+        }
+        [0x02, 0xaa, 0x7e, 0xd3] | [0x02, 0x57, 0x54, 0x83] => {
+            bail!("multisig zpub/vpub BTC address xpub formats are not supported")
+        }
+        _ => {
+            let parsed = Xpub::from_str(trimmed).context("parse BTC address xpub")?;
+            return Ok((parsed, "p2wpkh".to_string(), "xpub".to_string()));
+        }
+    };
+    let mut canonical = decoded;
+    canonical[0..4].copy_from_slice(&canonical_version);
+    let xpub = Xpub::decode(&canonical).context("parse BTC address xpub payload")?;
+    Ok((xpub, inferred_type.to_string(), source_format.to_string()))
+}
+
+fn derive_btc_address_from_xpub(
+    config: &BtcAddressXpubConfig,
+    index: u32,
+) -> Result<(String, String)> {
+    let path = xpub_derivation_path(&config.path_template, index)?;
+    let concrete_path = xpub_derivation_path_text(&path);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived = config
+        .xpub
+        .derive_pub(&secp, &path)
+        .with_context(|| format!("derive BTC address xpub path {concrete_path}"))?;
+    let network = parse_ln_network(&ln_rgb_network_name())?;
+    let network_kind = NetworkKind::from(network);
+    ensure!(
+        derived.xpub_network_matches(network),
+        "BTC address xpub network does not match configured network {network:?}"
+    );
+    let compressed = CompressedPublicKey(derived.public_key);
+    let address = match config.address_type.as_str() {
+        "p2wpkh" | "native_segwit" | "segwit" => Address::p2wpkh(&compressed, network),
+        "p2shwpkh" | "nested_segwit" => Address::p2shwpkh(&compressed, network_kind),
+        "legacy" | "p2pkh" => Address::p2pkh(compressed, network_kind),
+        "taproot" | "p2tr" => Address::p2tr(&secp, compressed.into(), None, network),
+        _ => bail!(
+            "unsupported BTC address xpub address_type `{}`",
+            config.address_type
+        ),
+    };
+    Ok((address.to_string(), concrete_path))
+}
+
+trait XpubNetworkExt {
+    fn xpub_network_matches(&self, network: Network) -> bool;
+}
+
+impl XpubNetworkExt for Xpub {
+    fn xpub_network_matches(&self, network: Network) -> bool {
+        self.network == NetworkKind::from(network)
+    }
+}
+
+fn xpub_derivation_path(template: &str, index: u32) -> Result<Vec<ChildNumber>> {
+    let mut path = Vec::new();
+    let trimmed = template.trim().trim_start_matches("m/").trim_matches('/');
+    let template = if trimmed.is_empty() { "*" } else { trimmed };
+    let mut saw_wildcard = false;
+    for segment in template.split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        ensure!(
+            !segment.ends_with('\'') && !segment.ends_with('h') && !segment.ends_with('H'),
+            "BTC address xpub derivation path cannot contain hardened segment `{segment}`"
+        );
+        let child_index = if segment == "*" {
+            saw_wildcard = true;
+            index
+        } else {
+            segment
+                .parse::<u32>()
+                .with_context(|| format!("invalid BTC address xpub path segment `{segment}`"))?
+        };
+        path.push(ChildNumber::Normal { index: child_index });
+    }
+    ensure!(
+        saw_wildcard,
+        "BTC address xpub derivation path must contain `*` placeholder"
+    );
+    Ok(path)
+}
+
+fn xpub_derivation_path_text(path: &[ChildNumber]) -> String {
+    path.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn parse_bip32_path_prefix(path: &str) -> Result<Vec<ChildNumber>> {
+    let mut parsed = Vec::new();
+    let trimmed = path.trim().trim_start_matches("m/").trim_matches('/');
+    if trimmed.is_empty() || trimmed == "m" {
+        return Ok(parsed);
+    }
+    for segment in trimmed.split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        parsed.push(ChildNumber::from_str(segment).with_context(|| {
+            format!("invalid BTC address xpub account path segment `{segment}`")
+        })?);
+    }
+    Ok(parsed)
+}
+
+fn xpub_signing_derivation_path(
+    config: &BtcAddressXpubConfig,
+    child_path: &[ChildNumber],
+) -> DerivationPath {
+    let mut full_path = config.account_path.clone();
+    full_path.extend_from_slice(child_path);
+    DerivationPath::from(full_path)
+}
+
+fn existing_btc_address_set(store: &LocalNodeStore) -> Result<std::collections::BTreeSet<String>> {
+    Ok(store
+        .list_btc_address_pool_records()?
+        .into_iter()
+        .map(|(address, _)| address)
+        .chain(
+            store
+                .list_used_btc_address_pool_records()?
+                .into_iter()
+                .map(|(address, _)| address),
+        )
+        .chain(
+            store
+                .list_ident_btc_addresses()?
+                .into_iter()
+                .map(|(_, address)| address),
+        )
+        .collect())
+}
+
+fn next_btc_xpub_index(store: &LocalNodeStore, config: &BtcAddressXpubConfig) -> Result<u32> {
+    let max_seen = store
+        .list_btc_address_pool_records()?
+        .into_iter()
+        .chain(store.list_used_btc_address_pool_records()?)
+        .filter_map(|(_, record)| {
+            (record.get("source").and_then(Value::as_str) == Some("xpub")).then_some(record)
+        })
+        .filter(|record| {
+            record.get("xpub_fingerprint").and_then(Value::as_str)
+                == Some(config.xpub_fingerprint.as_str())
+                && record.get("derivation_path").and_then(Value::as_str)
+                    == Some(config.path_template.as_str())
+        })
+        .filter_map(|record| record.get("derivation_index").and_then(Value::as_u64))
+        .max();
+    Ok(max_seen
+        .and_then(|value| u32::try_from(value.saturating_add(1)).ok())
+        .unwrap_or(config.start_index))
+}
+
+fn refill_btc_address_pool_from_xpub(
+    store: &LocalNodeStore,
+    count: usize,
+    purpose: &str,
+) -> Result<usize> {
+    if count == 0 {
+        return Ok(0);
+    }
+    let config = btc_address_xpub_config()?
+        .context("BTC address xpub is not configured; cannot refill address pool")?;
+    let mut existing = existing_btc_address_set(store)?;
+    let mut index = next_btc_xpub_index(store, &config)?;
+    let mut added = 0usize;
+    let mut attempts = 0usize;
+    let max_attempts = count
+        .saturating_add(existing.len())
+        .saturating_add(BTC_ADDRESS_POOL_TARGET)
+        .saturating_mul(2)
+        .max(count);
+    while added < count && attempts < max_attempts {
+        attempts += 1;
+        let (address, concrete_path) = derive_btc_address_from_xpub(&config, index)
+            .with_context(|| format!("derive BTC address pool index {index}"))?;
+        let derivation_index = index;
+        index = index
+            .checked_add(1)
+            .context("BTC address xpub derivation index overflow")?;
+        if existing.contains(&address) {
+            continue;
+        }
+        store.put_btc_address_pool_record(
+            &address,
+            &json!({
+                "address": address,
+                "created_at_ms": now_ms(),
+                "purpose": purpose,
+                "source": "xpub",
+                "xpub_fingerprint": config.xpub_fingerprint,
+                "xpub_source_format": config.source_format,
+                "address_type": config.address_type,
+                "derivation_path": config.path_template,
+                "concrete_derivation_path": concrete_path,
+                "derivation_index": derivation_index
+            }),
+        )?;
+        existing.insert(address);
+        added += 1;
+    }
+    ensure!(
+        added == count,
+        "BTC address xpub refill added {added} addresses, requested {count}"
+    );
+    Ok(added)
+}
+
+fn refill_btc_address_pool_to_target(store: &LocalNodeStore, purpose: &str) -> Result<usize> {
+    let available = store.list_btc_address_pool_records()?.len();
+    if available >= BTC_ADDRESS_POOL_LOW_WATER {
+        return Ok(0);
+    }
+    let to_add = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
+    refill_btc_address_pool_from_xpub(store, to_add, purpose)
+}
+
+fn btc_address_pool_record_for(store: &LocalNodeStore, address: &str) -> Result<Option<Value>> {
+    for (record_address, record) in store
+        .list_used_btc_address_pool_records()?
+        .into_iter()
+        .chain(store.list_btc_address_pool_records()?)
+    {
+        if record_address == address {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+fn btc_xpub_lookup_limit() -> u32 {
+    local_string("btc-address-xpub-lookup-limit")
+        .or_else(|| local_string("btc-addr-xpub-lookup-limit"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BTC_ADDRESS_XPUB_LOOKUP_LIMIT)
+}
+
+fn btc_xpub_key_source_for_index(
+    config: &BtcAddressXpubConfig,
+    address: &str,
+    index: u32,
+) -> Result<(PublicKey, Fingerprint, DerivationPath)> {
+    let path = xpub_derivation_path(&config.path_template, index)?;
+    let (derived_address, _) = derive_btc_address_from_xpub(config, index)?;
+    ensure!(
+        derived_address == address,
+        "BTC address xpub derivation mismatch for {address}: derived {derived_address}"
+    );
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived = config
+        .xpub
+        .derive_pub(&secp, &path)
+        .with_context(|| format!("derive BTC xpub signing key for {address}"))?;
+    Ok((
+        derived.public_key,
+        config.signing_fingerprint,
+        xpub_signing_derivation_path(config, &path),
+    ))
+}
+
+fn btc_xpub_find_index_for_address(
+    store: &LocalNodeStore,
+    config: &BtcAddressXpubConfig,
+    address: &str,
+) -> Result<Option<u32>> {
+    let next_index = next_btc_xpub_index(store, config).unwrap_or(config.start_index);
+    let configured_limit = btc_xpub_lookup_limit();
+    let upper_by_limit = config.start_index.saturating_add(configured_limit);
+    let upper_by_seen = next_index.saturating_add(BTC_ADDRESS_XPUB_LOOKUP_MARGIN);
+    let upper = upper_by_limit.max(upper_by_seen);
+    for index in config.start_index..=upper {
+        let (derived_address, _) = derive_btc_address_from_xpub(config, index)
+            .with_context(|| format!("derive BTC xpub lookup index {index}"))?;
+        if derived_address == address {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn btc_xpub_index_map_for_addresses(
+    store: &LocalNodeStore,
+    config: &BtcAddressXpubConfig,
+    addresses: &BTreeSet<String>,
+) -> Result<BTreeMap<String, u32>> {
+    if addresses.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let next_index = next_btc_xpub_index(store, config).unwrap_or(config.start_index);
+    let configured_limit = btc_xpub_lookup_limit();
+    let upper_by_limit = config.start_index.saturating_add(configured_limit);
+    let upper_by_seen = next_index.saturating_add(BTC_ADDRESS_XPUB_LOOKUP_MARGIN);
+    let upper = upper_by_limit.max(upper_by_seen);
+    let mut matched = BTreeMap::new();
+    for index in config.start_index..=upper {
+        let (derived_address, _) = derive_btc_address_from_xpub(config, index)
+            .with_context(|| format!("derive BTC xpub repair index {index}"))?;
+        if addresses.contains(&derived_address) {
+            matched.insert(derived_address, index);
+            if matched.len() == addresses.len() {
+                break;
+            }
+        }
+    }
+    Ok(matched)
+}
+
+fn enriched_btc_xpub_pool_record(
+    record: Value,
+    config: &BtcAddressXpubConfig,
+    address: &str,
+    index: u32,
+    purpose: &str,
+    ident: Option<&str>,
+) -> Result<Value> {
+    let (derived_address, concrete_path) = derive_btc_address_from_xpub(config, index)?;
+    ensure!(
+        derived_address == address,
+        "BTC xpub repair mismatch for {address}: derived {derived_address}"
+    );
+    let mut object = match record {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    let now = now_ms();
+    object
+        .entry("created_at_ms".to_string())
+        .or_insert_with(|| json!(now));
+    object
+        .entry("purpose".to_string())
+        .or_insert_with(|| json!(purpose));
+    object.insert("address".to_string(), json!(address));
+    object.insert("source".to_string(), json!("xpub"));
+    object.insert(
+        "xpub_fingerprint".to_string(),
+        json!(config.xpub_fingerprint),
+    );
+    object.insert(
+        "xpub_source_format".to_string(),
+        json!(config.source_format),
+    );
+    object.insert("address_type".to_string(), json!(config.address_type));
+    object.insert("derivation_path".to_string(), json!(config.path_template));
+    object.insert("concrete_derivation_path".to_string(), json!(concrete_path));
+    object.insert("derivation_index".to_string(), json!(index));
+    object.insert("metadata_repaired_at_ms".to_string(), json!(now));
+    if let Some(ident) = ident.filter(|value| !value.trim().is_empty()) {
+        object.insert("ident".to_string(), json!(ident));
+    }
+    Ok(Value::Object(object))
+}
+
+fn btc_xpub_input_key_source(
+    store: &LocalNodeStore,
+    config: &BtcAddressXpubConfig,
+    address: &str,
+) -> Result<Option<(PublicKey, Fingerprint, DerivationPath)>> {
+    let Some(record) = btc_address_pool_record_for(store, address)? else {
+        let Some(index) = btc_xpub_find_index_for_address(store, config, address)? else {
+            return Ok(None);
+        };
+        return btc_xpub_key_source_for_index(config, address, index).map(Some);
+    };
+    if record.get("source").and_then(Value::as_str) != Some("xpub") {
+        let Some(index) = btc_xpub_find_index_for_address(store, config, address)? else {
+            return Ok(None);
+        };
+        return btc_xpub_key_source_for_index(config, address, index).map(Some);
+    }
+    if record.get("xpub_fingerprint").and_then(Value::as_str)
+        != Some(config.xpub_fingerprint.as_str())
+    {
+        let Some(index) = btc_xpub_find_index_for_address(store, config, address)? else {
+            return Ok(None);
+        };
+        return btc_xpub_key_source_for_index(config, address, index).map(Some);
+    }
+    if record.get("derivation_path").and_then(Value::as_str) != Some(config.path_template.as_str())
+    {
+        let Some(index) = btc_xpub_find_index_for_address(store, config, address)? else {
+            return Ok(None);
+        };
+        return btc_xpub_key_source_for_index(config, address, index).map(Some);
+    }
+    let Some(index) = record.get("derivation_index").and_then(Value::as_u64) else {
+        let Some(index) = btc_xpub_find_index_for_address(store, config, address)? else {
+            return Ok(None);
+        };
+        return btc_xpub_key_source_for_index(config, address, index).map(Some);
+    };
+    let index = u32::try_from(index).context("BTC address pool derivation_index exceeds u32")?;
+    btc_xpub_key_source_for_index(config, address, index).map(Some)
+}
+
+fn find_u64_field(value: &Value, names: &[&str]) -> Option<u64> {
+    names.iter().find_map(|name| {
+        value.get(*name).and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+            })
+        })
+    })
+}
+
 pub fn register_console_modules(vm: &Vm) -> Result<()> {
     register_btc_module(vm)?;
     register_rgb_module(vm)?;
@@ -93,7 +656,7 @@ pub fn register_console_modules(vm: &Vm) -> Result<()> {
 }
 
 fn register_btc_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
+    let mut jit = vm.jit.write();
     jit.add_native_module_ptr(
         "btc",
         "get_wallet_address",
@@ -145,6 +708,13 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "btc",
+        "verify_message",
+        &[Type::Str, Type::Str, Type::Str],
+        Type::Any,
+        btc_verify_message as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
         "scan_deposits",
         &[Type::Str],
         Type::Any,
@@ -173,6 +743,13 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "btc",
+        "repair_address_pool_metadata",
+        &[],
+        Type::Any,
+        btc_repair_address_pool_metadata as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
         "sign_psbt",
         &[Type::Str, Type::Str],
         Type::Any,
@@ -187,10 +764,66 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "btc",
+        "broadcast_psbt",
+        &[Type::Str],
+        Type::Any,
+        btc_broadcast_psbt as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "broadcast_psbt_checked",
+        &[Type::Str, Type::Str, Type::U64],
+        Type::Any,
+        btc_broadcast_psbt_checked as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "broadcast_psbt_outputs_checked",
+        &[Type::Str, Type::Str],
+        Type::Any,
+        btc_broadcast_psbt_outputs_checked as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "prepare_transfer_with_inputs",
+        &[Type::Str, Type::Str, Type::U64, Type::U64, Type::Str],
+        Type::Any,
+        btc_prepare_transfer_with_inputs as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "prepare_sweep_with_inputs",
+        &[Type::Str, Type::Str, Type::U64, Type::Str],
+        Type::Any,
+        btc_prepare_sweep_with_inputs as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "prepare_consolidation_psbt",
+        &[Type::Str, Type::U64, Type::Any],
+        Type::Any,
+        btc_prepare_consolidation_psbt as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "prepare_batch_transfer_with_inputs",
+        &[Type::Str, Type::U64, Type::Str],
+        Type::Any,
+        btc_prepare_batch_transfer_with_inputs as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
         "transfer",
         &[Type::Str, Type::Str, Type::U64, Type::U64],
         Type::Any,
         btc_transfer as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "transfer_with_inputs",
+        &[Type::Str, Type::Str, Type::U64, Type::U64, Type::Str],
+        Type::Any,
+        btc_transfer_with_inputs as *const u8,
     )?;
     jit.add_native_module_ptr(
         "btc",
@@ -203,7 +836,7 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
 }
 
 fn register_rgb_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
+    let mut jit = vm.jit.write();
     jit.add_native_module_ptr(
         "rgb",
         "signed",
@@ -267,6 +900,13 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Any],
         Type::Any,
         rgb_assets as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
+        "assets_by_utxo",
+        &[Type::Str, Type::Str, Type::Bool, Type::Any],
+        Type::Any,
+        rgb_assets_by_utxo as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
@@ -353,7 +993,7 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
 }
 
 fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
-    let mut jit = vm.jit.write().unwrap();
+    let mut jit = vm.jit.write();
     jit.add_native_module_ptr(
         "ln_rgb",
         "node_address",
@@ -379,6 +1019,13 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
+        "retry_sweeps",
+        &[],
+        Type::Any,
+        ln_rgb_retry_sweeps as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
         "status",
         &[],
         Type::Any,
@@ -397,6 +1044,28 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
         &[],
         Type::Any,
         ln_rgb_get_addr as *const u8,
+    )?;
+    jit.add_native_module_ptr("ln_rgb", "utxos", &[], Type::Any, ln_rgb_utxos as *const u8)?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "sync_utxos",
+        &[],
+        Type::Any,
+        ln_rgb_sync_utxos as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "transfer_with_inputs",
+        &[Type::Str, Type::U64, Type::U64, Type::Str],
+        Type::Any,
+        ln_rgb_transfer_with_inputs as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "transfer_batch_with_inputs",
+        &[Type::Str, Type::U64, Type::Str],
+        Type::Any,
+        ln_rgb_transfer_batch_with_inputs as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
@@ -467,6 +1136,13 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::U64, Type::Str, Type::U64],
         Type::Any,
         ln_rgb_invoice as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "invoice_for_ident",
+        &[Type::U64, Type::Str, Type::U64, Type::Str],
+        Type::Any,
+        ln_rgb_invoice_for_ident as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
@@ -567,71 +1243,6 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
                 "persisted": true
             })));
         }
-        let available = store.list_btc_address_pool_records()?.len();
-        if available < BTC_ADDRESS_POOL_LOW_WATER {
-            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
-            if count > 0 {
-                let body = json!({
-                    "account_id": default_account_id()?,
-                    "network": "bitcoin",
-                    "purpose": "low_water_refill",
-                    "count": count,
-                    "timestamp_ms": now_ms()
-                });
-                let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
-                let addresses = response
-                    .get("addresses")
-                    .and_then(Value::as_array)
-                    .with_context(|| {
-                        format!("signer batch address response missing `addresses`: {response}")
-                    })?;
-                ensure!(
-                    addresses.len() == count,
-                    "signer batch address response count mismatch: requested={count}, returned={}",
-                    addresses.len()
-                );
-                let existing = store
-                    .list_btc_address_pool_records()?
-                    .into_iter()
-                    .map(|(address, _)| address)
-                    .chain(
-                        store
-                            .list_used_btc_address_pool_records()?
-                            .into_iter()
-                            .map(|(address, _)| address),
-                    )
-                    .chain(
-                        store
-                            .list_ident_btc_addresses()?
-                            .into_iter()
-                            .map(|(_, address)| address),
-                    )
-                    .collect::<std::collections::BTreeSet<_>>();
-                for response in addresses {
-                    let address = response
-                        .get("address")
-                        .and_then(Value::as_str)
-                        .filter(|address| !address.trim().is_empty())
-                        .with_context(|| {
-                            format!(
-                                "signer batch address item missing non-empty `address`: {response}"
-                            )
-                        })?;
-                    if existing.contains(address) {
-                        continue;
-                    }
-                    store.put_btc_address_pool_record(
-                        address,
-                        &json!({
-                            "address": address,
-                            "created_at_ms": now_ms(),
-                            "purpose": "low_water_refill",
-                            "signer_response": response
-                        }),
-                    )?;
-                }
-            }
-        }
         let mut available = store.list_btc_address_pool_records()?;
         available.sort_by_key(|(_, record)| {
             record
@@ -642,7 +1253,7 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
         let (address, mut pool_record) = available
             .into_iter()
             .next()
-            .context("BTC address pool is empty after refill")?;
+            .context("BTC address pool is empty; refill required")?;
         if let Value::Object(object) = &mut pool_record {
             object.insert("used_at_ms".to_string(), json!(now_ms()));
             object.insert("ident".to_string(), json!(ident));
@@ -650,70 +1261,14 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
         store.remove_btc_address_pool_record(&address)?;
         store.put_used_btc_address_pool_record(&address, &pool_record)?;
         store.put_ident_btc_address(&ident, &address)?;
-        let available = store.list_btc_address_pool_records()?.len();
-        if available < BTC_ADDRESS_POOL_LOW_WATER {
-            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
-            if count > 0 {
-                let body = json!({
-                    "account_id": default_account_id()?,
-                    "network": "bitcoin",
-                    "purpose": "low_water_refill",
-                    "count": count,
-                    "timestamp_ms": now_ms()
-                });
-                let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
-                let addresses = response
-                    .get("addresses")
-                    .and_then(Value::as_array)
-                    .with_context(|| {
-                        format!("signer batch address response missing `addresses`: {response}")
-                    })?;
-                ensure!(
-                    addresses.len() == count,
-                    "signer batch address response count mismatch: requested={count}, returned={}",
-                    addresses.len()
-                );
-                let existing = store
-                    .list_btc_address_pool_records()?
-                    .into_iter()
-                    .map(|(address, _)| address)
-                    .chain(
-                        store
-                            .list_used_btc_address_pool_records()?
-                            .into_iter()
-                            .map(|(address, _)| address),
-                    )
-                    .chain(
-                        store
-                            .list_ident_btc_addresses()?
-                            .into_iter()
-                            .map(|(_, address)| address),
-                    )
-                    .collect::<std::collections::BTreeSet<_>>();
-                for response in addresses {
-                    let address = response
-                        .get("address")
-                        .and_then(Value::as_str)
-                        .filter(|address| !address.trim().is_empty())
-                        .with_context(|| {
-                            format!(
-                                "signer batch address item missing non-empty `address`: {response}"
-                            )
-                        })?;
-                    if existing.contains(address) {
-                        continue;
-                    }
-                    store.put_btc_address_pool_record(
-                        address,
-                        &json!({
-                            "address": address,
-                            "created_at_ms": now_ms(),
-                            "purpose": "low_water_refill",
-                            "signer_response": response
-                        }),
-                    )?;
-                }
-            }
+        match refill_btc_address_pool_to_target(&store, "low_water_refill") {
+            Ok(added) if added > 0 => eprintln!(
+                "[zust-console] BTC address pool auto-refilled after assignment: added={added}, low_water={BTC_ADDRESS_POOL_LOW_WATER}, target={BTC_ADDRESS_POOL_TARGET}"
+            ),
+            Ok(_) => {}
+            Err(err) => eprintln!(
+                "[zust-console] BTC address pool auto-refill after assignment failed: {err:#}"
+            ),
         }
         Ok(ok(json!({
             "module": "btc",
@@ -740,18 +1295,53 @@ extern "C" fn btc_lookup_address_ident(input: *const Dynamic) -> *const Dynamic 
     })
 }
 
+extern "C" fn btc_verify_message(
+    address: *const Dynamic,
+    message: *const Dynamic,
+    signature: *const Dynamic,
+) -> *const Dynamic {
+    native_three_string_dynamic_result(
+        address,
+        message,
+        signature,
+        |address, message, signature| {
+            let address_text = address.trim();
+            ensure!(!address_text.is_empty(), "address must not be empty");
+            ensure!(!message.is_empty(), "message must not be empty");
+            ensure!(!signature.trim().is_empty(), "signature must not be empty");
+
+            let network = parse_ln_network(&ln_rgb_network_name())?;
+            let address = Address::from_str(address_text)
+                .with_context(|| format!("invalid BTC address: {address_text}"))?
+                .require_network(network)
+                .with_context(|| format!("address is not for {network:?}: {address_text}"))?;
+            let signature = bitcoin::sign_message::MessageSignature::from_base64(signature.trim())
+                .context("invalid Bitcoin message signature")?;
+            let hash = bitcoin::sign_message::signed_msg_hash(message);
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let pubkey = signature
+                .recover_pubkey(&secp, hash)
+                .context("recover Bitcoin message public key")?;
+            ensure!(
+                address.is_related_to_pubkey(&pubkey),
+                "signature does not match address"
+            );
+
+            Ok(ok(json!({
+                "module": "btc",
+                "address": address_text,
+                "verified": true
+            })))
+        },
+    )
+}
+
 extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |ident_filter| {
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         store.put_wallet_btc_address(&default_account_id()?)?;
-        let esplora = btc_esplora_url();
-        let tip_url = format!("{}/blocks/tip/height", esplora.trim_end_matches('/'));
-        let tip_height = attohttpc::get(&tip_url)
-            .send()
-            .ok()
-            .and_then(|response| response.text().ok())
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .unwrap_or_default();
+        let (esplora, tip_height) = btc_tip_height_with_fallback();
+        let mut scan_esplora = esplora.clone();
         let mut deposits = Vec::new();
         let mut persisted = 0usize;
         let mut address_mappings = Vec::new();
@@ -777,22 +1367,24 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
         }
         for (owner_type, owner_label, ident, address) in address_mappings {
             let mut seen = std::collections::BTreeSet::new();
-            let txs = esplora_get_json(&format!(
-                "{}/address/{address}/txs",
-                esplora.trim_end_matches('/')
-            ))
-            .with_context(|| format!("fetch BTC deposit transactions for {address}"))?;
+            let (tx_esplora, txs) = btc_address_txs_json_with_fallback(
+                &address,
+                &format!("fetch BTC deposit transactions for {address}"),
+            )?;
+            scan_esplora = tx_esplora;
             for tx in txs.as_array().cloned().unwrap_or_default() {
                 let txid = tx
                     .get("txid")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                for output in tx
+                for (fallback_vout, output) in tx
                     .get("vout")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
                 {
                     let output_address = output
                         .get("scriptpubkey_address")
@@ -801,7 +1393,10 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
                     if output_address != address {
                         continue;
                     }
-                    let vout = output.get("n").and_then(Value::as_u64).unwrap_or_default();
+                    let vout = output
+                        .get("n")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(fallback_vout as u64);
                     let outpoint = format!("{txid}:{vout}");
                     seen.insert(outpoint.clone());
                     let amount_sat = output
@@ -845,7 +1440,7 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
                     deposits.push(record);
                 }
             }
-            let utxos = btc_address_utxos_json(&address, &esplora)?;
+            let utxos = btc_address_utxos_json(&address, &scan_esplora)?;
             for utxo in utxos.as_array().cloned().unwrap_or_default() {
                 let txid = utxo
                     .get("txid")
@@ -902,7 +1497,7 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
             "module": "btc",
             "ok": true,
             "network": "bitcoin",
-            "esplora": esplora,
+            "esplora": scan_esplora,
             "tip_height": tip_height,
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "persisted": persisted,
@@ -922,14 +1517,8 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
         ensure!(!ident_filter.trim().is_empty(), "ident must not be empty");
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         store.put_wallet_btc_address(&default_account_id()?)?;
-        let esplora = btc_esplora_url();
-        let tip_url = format!("{}/blocks/tip/height", esplora.trim_end_matches('/'));
-        let tip_height = attohttpc::get(&tip_url)
-            .send()
-            .ok()
-            .and_then(|response| response.text().ok())
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .unwrap_or_default();
+        let (esplora, tip_height) = btc_tip_height_with_fallback();
+        let mut scan_esplora = esplora.clone();
         let mut deposits = Vec::new();
         let mut persisted = 0usize;
         for (ident, address) in store.list_ident_btc_addresses()? {
@@ -937,22 +1526,24 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
                 continue;
             }
             let mut seen = std::collections::BTreeSet::new();
-            let txs = esplora_get_json(&format!(
-                "{}/address/{address}/txs",
-                esplora.trim_end_matches('/')
-            ))
-            .with_context(|| format!("fetch BTC deposit transactions for {address}"))?;
+            let (tx_esplora, txs) = btc_address_txs_json_with_fallback(
+                &address,
+                &format!("fetch BTC deposit transactions for {address}"),
+            )?;
+            scan_esplora = tx_esplora;
             for tx in txs.as_array().cloned().unwrap_or_default() {
                 let txid = tx
                     .get("txid")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                for output in tx
+                for (fallback_vout, output) in tx
                     .get("vout")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
                 {
                     let output_address = output
                         .get("scriptpubkey_address")
@@ -961,7 +1552,10 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
                     if output_address != address {
                         continue;
                     }
-                    let vout = output.get("n").and_then(Value::as_u64).unwrap_or_default();
+                    let vout = output
+                        .get("n")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(fallback_vout as u64);
                     let outpoint = format!("{txid}:{vout}");
                     seen.insert(outpoint.clone());
                     let amount_sat = output
@@ -1005,7 +1599,7 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
                     deposits.push(record);
                 }
             }
-            let utxos = btc_address_utxos_json(&address, &esplora)?;
+            let utxos = btc_address_utxos_json(&address, &scan_esplora)?;
             for utxo in utxos.as_array().cloned().unwrap_or_default() {
                 let txid = utxo
                     .get("txid")
@@ -1062,7 +1656,7 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
             "module": "btc",
             "ok": true,
             "network": "bitcoin",
-            "esplora": esplora,
+            "esplora": scan_esplora,
             "tip_height": tip_height,
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "persisted": persisted,
@@ -1081,9 +1675,23 @@ extern "C" fn btc_address_pool_status() -> *const Dynamic {
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
+        let xpub_config = btc_address_xpub_config()?;
         Ok(json_to_dynamic(&json!({
             "module": "btc",
             "ok": true,
+            "xpub": xpub_config.as_ref().map(|config| json!({
+                "configured": true,
+                "fingerprint": config.xpub_fingerprint,
+                "signing_fingerprint": config.signing_fingerprint.to_string(),
+                "source_format": config.source_format,
+                "address_type": config.address_type,
+                "account_path": config.account_path_text,
+                "path": config.path_template,
+                "start_index": config.start_index,
+                "next_index": next_btc_xpub_index(&store, config).unwrap_or(config.start_index)
+            })).unwrap_or_else(|| json!({
+                "configured": false
+            })),
             "address_pool": {
                 "available": available.len(),
                 "used": used.len(),
@@ -1103,72 +1711,33 @@ extern "C" fn btc_refill_address_pool(count: u64) -> *const Dynamic {
     native_result(|| {
         let count = count as usize;
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
-        let mut added = 0usize;
-        if count > 0 {
-            let body = json!({
-                "account_id": default_account_id()?,
-                "network": "bitcoin",
-                "purpose": "manual_refill",
-                "count": count,
-                "timestamp_ms": now_ms()
-            });
-            let response = signer_request(SIGNER_ADDRESS_BATCH_PATH, &body)?;
-            let addresses = response
-                .get("addresses")
-                .and_then(Value::as_array)
-                .with_context(|| {
-                    format!("signer batch address response missing `addresses`: {response}")
-                })?;
-            ensure!(
-                addresses.len() == count,
-                "signer batch address response count mismatch: requested={count}, returned={}",
-                addresses.len()
-            );
-            let existing = store
-                .list_btc_address_pool_records()?
-                .into_iter()
-                .map(|(address, _)| address)
-                .chain(
-                    store
-                        .list_used_btc_address_pool_records()?
-                        .into_iter()
-                        .map(|(address, _)| address),
-                )
-                .chain(
-                    store
-                        .list_ident_btc_addresses()?
-                        .into_iter()
-                        .map(|(_, address)| address),
-                )
-                .collect::<std::collections::BTreeSet<_>>();
-            for response in addresses {
-                let address = response
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .filter(|address| !address.trim().is_empty())
-                    .with_context(|| {
-                        format!("signer batch address item missing non-empty `address`: {response}")
-                    })?;
-                if existing.contains(address) {
-                    continue;
-                }
-                store.put_btc_address_pool_record(
-                    address,
-                    &json!({
-                        "address": address,
-                        "created_at_ms": now_ms(),
-                        "purpose": "manual_refill",
-                        "signer_response": response
-                    }),
-                )?;
-                added += 1;
-            }
-        }
+        let mut source = "none".to_string();
+        let added = if count > 0 {
+            source = "xpub".to_string();
+            refill_btc_address_pool_from_xpub(&store, count, "manual_refill")?
+        } else {
+            0
+        };
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
+        let xpub_config = btc_address_xpub_config()?;
         Ok(json_to_dynamic(&json!({
             "module": "btc",
             "ok": true,
+            "source": source,
+            "xpub": xpub_config.as_ref().map(|config| json!({
+                "configured": true,
+                "fingerprint": config.xpub_fingerprint,
+                "signing_fingerprint": config.signing_fingerprint.to_string(),
+                "source_format": config.source_format,
+                "address_type": config.address_type,
+                "account_path": config.account_path_text,
+                "path": config.path_template,
+                "start_index": config.start_index,
+                "next_index": next_btc_xpub_index(&store, config).unwrap_or(config.start_index)
+            })).unwrap_or_else(|| json!({
+                "configured": false
+            })),
             "address_pool": {
                 "available": available.len(),
                 "used": used.len(),
@@ -1179,6 +1748,122 @@ extern "C" fn btc_refill_address_pool(count: u64) -> *const Dynamic {
                     .into_iter()
                     .map(|(_, record)| record)
                     .collect::<Vec<_>>()
+            }
+        })))
+    })
+}
+
+extern "C" fn btc_repair_address_pool_metadata() -> *const Dynamic {
+    native_result(|| {
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let config = btc_address_xpub_config()?
+            .context("BTC address xpub is not configured; cannot repair address pool metadata")?;
+        let available = store.list_btc_address_pool_records()?;
+        let used = store.list_used_btc_address_pool_records()?;
+        let ident_addresses = store.list_ident_btc_addresses()?;
+
+        let mut addresses = BTreeSet::new();
+        for (address, _) in available.iter().chain(used.iter()) {
+            addresses.insert(address.clone());
+        }
+        for (_, address) in &ident_addresses {
+            addresses.insert(address.clone());
+        }
+        let address_indexes = btc_xpub_index_map_for_addresses(&store, &config, &addresses)?;
+
+        let ident_by_address = ident_addresses
+            .iter()
+            .map(|(ident, address)| (address.clone(), ident.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let available_by_address = available
+            .iter()
+            .map(|(address, record)| (address.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let used_by_address = used
+            .iter()
+            .map(|(address, record)| (address.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut available_updated = 0usize;
+        for (address, record) in available {
+            let Some(index) = address_indexes.get(&address).copied() else {
+                continue;
+            };
+            let repaired = enriched_btc_xpub_pool_record(
+                record,
+                &config,
+                &address,
+                index,
+                "metadata_repair_available",
+                ident_by_address.get(&address).map(String::as_str),
+            )?;
+            store.put_btc_address_pool_record(&address, &repaired)?;
+            available_updated += 1;
+        }
+
+        let mut used_updated = 0usize;
+        for (address, record) in used {
+            let Some(index) = address_indexes.get(&address).copied() else {
+                continue;
+            };
+            let repaired = enriched_btc_xpub_pool_record(
+                record,
+                &config,
+                &address,
+                index,
+                "metadata_repair_used",
+                ident_by_address.get(&address).map(String::as_str),
+            )?;
+            store.put_used_btc_address_pool_record(&address, &repaired)?;
+            used_updated += 1;
+        }
+
+        let mut used_created = 0usize;
+        let mut removed_from_available = 0usize;
+        for (ident, address) in ident_addresses {
+            if used_by_address.contains_key(&address) {
+                continue;
+            }
+            let Some(index) = address_indexes.get(&address).copied() else {
+                continue;
+            };
+            if available_by_address.contains_key(&address) {
+                store.remove_btc_address_pool_record(&address)?;
+                removed_from_available += 1;
+            }
+            let repaired = enriched_btc_xpub_pool_record(
+                Value::Null,
+                &config,
+                &address,
+                index,
+                "metadata_repair_ident",
+                Some(&ident),
+            )?;
+            store.put_used_btc_address_pool_record(&address, &repaired)?;
+            used_created += 1;
+        }
+
+        let unresolved = addresses.len().saturating_sub(address_indexes.len());
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "operation": "repair_address_pool_metadata",
+            "address_count": addresses.len(),
+            "matched_xpub": address_indexes.len(),
+            "unresolved": unresolved,
+            "available_updated": available_updated,
+            "used_updated": used_updated,
+            "used_created": used_created,
+            "removed_from_available": removed_from_available,
+            "xpub": {
+                "fingerprint": config.xpub_fingerprint,
+                "signing_fingerprint": config.signing_fingerprint.to_string(),
+                "source_format": config.source_format,
+                "address_type": config.address_type,
+                "account_path": config.account_path_text,
+                "path": config.path_template,
+                "start_index": config.start_index,
+                "next_index": next_btc_xpub_index(&store, &config).unwrap_or(config.start_index)
             }
         })))
     })
@@ -1248,6 +1933,361 @@ extern "C" fn btc_sign_psbt(psbt: *const Dynamic, ident: *const Dynamic) -> *con
 extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |tx_hex| {
         Ok(json_to_dynamic(&broadcast_raw_transaction_json(tx_hex)?))
+    })
+}
+
+extern "C" fn btc_broadcast_psbt(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |signed_psbt| {
+        ensure!(
+            !signed_psbt.trim().is_empty(),
+            "signed_psbt must not be empty"
+        );
+        let psbt = Psbt::from_str(signed_psbt).context("decode signed PSBT base64")?;
+        let (psbt, finalize_report) = finalize_psbt_for_broadcast(psbt)?;
+        let tx = psbt
+            .extract_tx()
+            .context("extract signed transaction from PSBT")?;
+        let raw_tx = bytes_to_hex(&encode::serialize(&tx));
+        let extracted_txid = tx.compute_txid().to_string();
+        let broadcast = broadcast_raw_transaction_json(&raw_tx)?;
+        let broadcast_txid = broadcast
+            .get("txid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(extracted_txid.as_str())
+            .to_string();
+        ensure!(
+            broadcast_txid == extracted_txid,
+            "broadcast txid mismatch: extracted={extracted_txid}, broadcast={broadcast_txid}"
+        );
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "broadcast_psbt",
+            "txid": broadcast_txid,
+            "raw_tx": raw_tx,
+            "signed_psbt": signed_psbt,
+            "finalize": finalize_report,
+            "outputs": tx.output
+                .iter()
+                .enumerate()
+                .map(|(vout, output)| {
+                    let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+                        .map(|address| address.to_string())
+                        .unwrap_or_default();
+                    json!({
+                        "vout": vout,
+                        "value": output.value.to_sat(),
+                        "address": address,
+                        "script_pubkey": bytes_to_hex(output.script_pubkey.as_bytes())
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "broadcast": broadcast
+        })))
+    })
+}
+
+extern "C" fn btc_broadcast_psbt_checked(
+    input: *const Dynamic,
+    recipient: *const Dynamic,
+    amount_sats: u64,
+) -> *const Dynamic {
+    let input = unsafe { &*input };
+    let recipient = unsafe { &*recipient };
+    native_result(|| {
+        ensure!(input.is_str(), "signed_psbt must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(amount_sats > 0, "amount_sats must be greater than zero");
+        let signed_psbt = input.as_str().trim();
+        ensure!(!signed_psbt.is_empty(), "signed_psbt must not be empty");
+        let recipient_address = recipient.as_str().trim().to_string();
+        ensure!(
+            !recipient_address.is_empty(),
+            "recipient address must not be empty"
+        );
+        let network = Network::Bitcoin;
+        let recipient_address = Address::from_str(&recipient_address)
+            .with_context(|| format!("invalid recipient BTC address: {recipient_address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?;
+        let recipient_script = recipient_address.script_pubkey();
+        let psbt = Psbt::from_str(signed_psbt).context("decode signed PSBT base64")?;
+        let (psbt, finalize_report) = finalize_psbt_for_broadcast(psbt)?;
+        let tx = psbt
+            .extract_tx()
+            .context("extract signed transaction from PSBT")?;
+        ensure!(
+            tx.output.iter().any(|output| {
+                output.script_pubkey == recipient_script && output.value.to_sat() == amount_sats
+            }),
+            "signed PSBT does not pay expected withdrawal output"
+        );
+        let raw_tx = bytes_to_hex(&encode::serialize(&tx));
+        let extracted_txid = tx.compute_txid().to_string();
+        let broadcast = broadcast_raw_transaction_json(&raw_tx)?;
+        let broadcast_txid = broadcast
+            .get("txid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(extracted_txid.as_str())
+            .to_string();
+        ensure!(
+            broadcast_txid == extracted_txid,
+            "broadcast txid mismatch: extracted={extracted_txid}, broadcast={broadcast_txid}"
+        );
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "broadcast_psbt_checked",
+            "txid": broadcast_txid,
+            "raw_tx": raw_tx,
+            "signed_psbt": signed_psbt,
+            "expected_output": {
+                "address": recipient_address.to_string(),
+                "amount_sats": amount_sats
+            },
+            "finalize": finalize_report,
+            "outputs": tx.output
+                .iter()
+                .enumerate()
+                .map(|(vout, output)| {
+                    let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+                        .map(|address| address.to_string())
+                        .unwrap_or_default();
+                    json!({
+                        "vout": vout,
+                        "value": output.value.to_sat(),
+                        "address": address,
+                        "script_pubkey": bytes_to_hex(output.script_pubkey.as_bytes())
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "broadcast": broadcast
+        })))
+    })
+}
+
+fn parse_btc_outputs(outputs: &str, network: Network) -> Result<Vec<(String, ScriptBuf, u64)>> {
+    let mut parsed = Vec::new();
+    for entry in outputs
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (address, amount) = entry
+            .split_once('=')
+            .with_context(|| format!("invalid BTC output entry: {entry}"))?;
+        let address = address.trim().to_string();
+        ensure!(!address.is_empty(), "BTC output address must not be empty");
+        let amount_sats = amount
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid BTC output amount for {address}"))?;
+        ensure!(
+            amount_sats > 0,
+            "BTC output amount must be greater than zero"
+        );
+        let script = Address::from_str(&address)
+            .with_context(|| format!("invalid recipient BTC address: {address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?
+            .script_pubkey();
+        parsed.push((address, script, amount_sats));
+    }
+    ensure!(
+        !parsed.is_empty(),
+        "outputs must include at least one BTC output"
+    );
+    Ok(parsed)
+}
+
+fn btc_output_counts(
+    outputs: &[(String, ScriptBuf, u64)],
+) -> std::collections::BTreeMap<String, u64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for (_, script, amount) in outputs {
+        let key = format!("{}:{amount}", bytes_to_hex(script.as_bytes()));
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
+    let mut inputs = Vec::new();
+    let mut auto_finalized = 0usize;
+    for (vin, input) in psbt.inputs.iter_mut().enumerate() {
+        let has_final = input.final_script_witness.is_some() || input.final_script_sig.is_some();
+        let script_kind = input
+            .witness_utxo
+            .as_ref()
+            .map(|utxo| {
+                if utxo.script_pubkey.is_p2wpkh() {
+                    "p2wpkh"
+                } else if utxo.script_pubkey.is_p2tr() {
+                    "p2tr"
+                } else if utxo.script_pubkey.is_p2wsh() {
+                    "p2wsh"
+                } else if utxo.script_pubkey.is_p2pkh() {
+                    "p2pkh"
+                } else {
+                    "unknown"
+                }
+            })
+            .unwrap_or("missing_witness_utxo");
+        let partial_sig_count = input.partial_sigs.len();
+        if has_final {
+            inputs.push(json!({
+                "vin": vin,
+                "status": "already_finalized",
+                "script_kind": script_kind,
+                "partial_sig_count": partial_sig_count,
+                "has_final_script_sig": input.final_script_sig.is_some(),
+                "has_final_script_witness": input.final_script_witness.is_some()
+            }));
+            continue;
+        }
+        if script_kind == "p2wpkh" && partial_sig_count == 1 {
+            let (pubkey, sig) = input
+                .partial_sigs
+                .iter()
+                .next()
+                .map(|(pubkey, sig)| (*pubkey, *sig))
+                .context("P2WPKH partial signature disappeared before finalization")?;
+            let mut witness = Witness::new();
+            witness.push(sig.to_vec());
+            witness.push(pubkey.to_bytes());
+            input.final_script_witness = Some(witness);
+            input.final_script_sig = Some(ScriptBuf::new());
+            input.partial_sigs = BTreeMap::new();
+            input.sighash_type = None;
+            input.redeem_script = None;
+            input.witness_script = None;
+            input.bip32_derivation = BTreeMap::new();
+            auto_finalized += 1;
+            inputs.push(json!({
+                "vin": vin,
+                "status": "auto_finalized_p2wpkh",
+                "script_kind": script_kind,
+                "partial_sig_count": partial_sig_count
+            }));
+        } else {
+            let status = if partial_sig_count <= 0 {
+                "missing_partial_sigs"
+            } else {
+                "unsupported_partial_finalization"
+            };
+            inputs.push(json!({
+                "vin": vin,
+                "status": status,
+                "script_kind": script_kind,
+                "partial_sig_count": partial_sig_count,
+                "has_witness_utxo": input.witness_utxo.is_some(),
+                "has_non_witness_utxo": input.non_witness_utxo.is_some()
+            }));
+        }
+    }
+    let report = json!({
+        "auto_finalized_inputs": auto_finalized,
+        "inputs": inputs
+    });
+    if auto_finalized > 0
+        || report
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("status").and_then(Value::as_str) == Some("missing_partial_sigs")
+                        || item.get("status").and_then(Value::as_str)
+                            == Some("unsupported_partial_finalization")
+                })
+            })
+            .unwrap_or(false)
+    {
+        log_btc_broadcast_event("psbt_finalize", report.clone());
+    }
+    Ok((psbt, report))
+}
+
+extern "C" fn btc_broadcast_psbt_outputs_checked(
+    input: *const Dynamic,
+    outputs: *const Dynamic,
+) -> *const Dynamic {
+    let input = unsafe { &*input };
+    let outputs = unsafe { &*outputs };
+    native_result(|| {
+        ensure!(input.is_str(), "signed_psbt must be string");
+        ensure!(outputs.is_str(), "outputs must be string");
+        let signed_psbt = input.as_str().trim();
+        ensure!(!signed_psbt.is_empty(), "signed_psbt must not be empty");
+        let expected_outputs = parse_btc_outputs(outputs.as_str(), Network::Bitcoin)?;
+        let expected_counts = btc_output_counts(&expected_outputs);
+        let psbt = Psbt::from_str(signed_psbt).context("decode signed PSBT base64")?;
+        let (psbt, finalize_report) = finalize_psbt_for_broadcast(psbt)?;
+        let tx = psbt
+            .extract_tx()
+            .context("extract signed transaction from PSBT")?;
+        let actual_tuples = tx
+            .output
+            .iter()
+            .map(|output| {
+                (
+                    String::new(),
+                    output.script_pubkey.clone(),
+                    output.value.to_sat(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual_counts = btc_output_counts(&actual_tuples);
+        for (key, expected_count) in expected_counts {
+            let actual_count = actual_counts.get(&key).copied().unwrap_or_default();
+            ensure!(
+                actual_count >= expected_count,
+                "signed PSBT does not pay all expected withdrawal outputs"
+            );
+        }
+        let raw_tx = bytes_to_hex(&encode::serialize(&tx));
+        let extracted_txid = tx.compute_txid().to_string();
+        let broadcast = broadcast_raw_transaction_json(&raw_tx)?;
+        let broadcast_txid = broadcast
+            .get("txid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(extracted_txid.as_str())
+            .to_string();
+        ensure!(
+            broadcast_txid == extracted_txid,
+            "broadcast txid mismatch: extracted={extracted_txid}, broadcast={broadcast_txid}"
+        );
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "broadcast_psbt_outputs_checked",
+            "txid": broadcast_txid,
+            "raw_tx": raw_tx,
+            "signed_psbt": signed_psbt,
+            "expected_outputs": expected_outputs
+                .iter()
+                .map(|(address, _, amount)| json!({
+                    "address": address,
+                    "amount_sats": amount
+                }))
+                .collect::<Vec<_>>(),
+            "finalize": finalize_report,
+            "outputs": tx.output
+                .iter()
+                .enumerate()
+                .map(|(vout, output)| {
+                    let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+                        .map(|address| address.to_string())
+                        .unwrap_or_default();
+                    json!({
+                        "vout": vout,
+                        "value": output.value.to_sat(),
+                        "address": address,
+                        "script_pubkey": bytes_to_hex(output.script_pubkey.as_bytes())
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "broadcast": broadcast
+        })))
     })
 }
 
@@ -1446,6 +2486,981 @@ extern "C" fn btc_transfer(
     })
 }
 
+extern "C" fn btc_transfer_with_inputs(
+    ident: *const Dynamic,
+    recipient: *const Dynamic,
+    amount_sats: u64,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let ident = unsafe { &*ident };
+    let recipient = unsafe { &*recipient };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(ident.is_str(), "ident must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        ensure!(amount_sats > 0, "amount_sats must be greater than zero");
+        let ident = ident.as_str().trim().to_string();
+        let account = btc_account_for_ident(&ident)?;
+        let sender_address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|address| !address.trim().is_empty())
+            .context("BTC sender account missing address")?
+            .to_string();
+        let recipient_address = recipient.as_str().trim().to_string();
+        ensure!(
+            !recipient_address.is_empty(),
+            "recipient address must not be empty"
+        );
+        let requested = input_outpoints.as_str().trim().to_string();
+        ensure!(
+            !requested.is_empty(),
+            "input_outpoints must include at least one outpoint"
+        );
+        let network = Network::Bitcoin;
+        let recipient_address = Address::from_str(&recipient_address)
+            .with_context(|| format!("invalid recipient BTC address: {recipient_address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?;
+        let sender_address_checked = Address::from_str(&sender_address)
+            .with_context(|| format!("invalid sender BTC address: {sender_address}"))?
+            .require_network(network)
+            .with_context(|| format!("sender address is not for {network:?}"))?;
+        let recipient_script = recipient_address.script_pubkey();
+        let change_script = sender_address_checked.script_pubkey();
+        let esplora = btc_esplora_url();
+        let utxos = btc_address_utxos_json(&sender_address, &esplora)?;
+        let candidates = utxos
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|utxo| {
+                utxo.get("status")
+                    .and_then(|status| status.get("confirmed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|utxo| {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .context("utxo missing txid")?;
+                let vout = utxo
+                    .get("vout")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing vout")?;
+                let value = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing value")?;
+                Ok((
+                    OutPoint {
+                        txid: txid
+                            .parse()
+                            .with_context(|| format!("invalid utxo txid {txid}"))?,
+                        vout: u32::try_from(vout).context("utxo vout exceeds u32")?,
+                    },
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let available = candidates
+            .iter()
+            .map(|(outpoint, value)| (*outpoint, *value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        for token in requested
+            .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let outpoint = OutPoint::from_str(token)
+                .with_context(|| format!("invalid selected BTC outpoint: {token}"))?;
+            ensure!(
+                seen.insert(outpoint),
+                "duplicate selected BTC outpoint: {outpoint}"
+            );
+            let value = *available.get(&outpoint).with_context(|| {
+                format!("selected BTC outpoint is not confirmed/available: {outpoint}")
+            })?;
+            selected_sats = selected_sats.saturating_add(value);
+            selected.push((outpoint, value));
+        }
+        ensure!(!selected.is_empty(), "no selected BTC UTXO provided");
+        let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
+            fee_rate_sat_vb
+        } else {
+            2
+        };
+        let mut output_count = 2u64;
+        let mut estimated_vbytes =
+            10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+        let mut fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+        ensure!(
+            selected_sats >= amount_sats.saturating_add(fee_sats),
+            "insufficient selected BTC funds: need {} sats, selected {} sats",
+            amount_sats.saturating_add(fee_sats),
+            selected_sats
+        );
+        let mut change_sats = selected_sats
+            .saturating_sub(amount_sats)
+            .saturating_sub(fee_sats);
+        if change_sats > 0 && change_sats < 546 {
+            output_count = 1;
+            estimated_vbytes =
+                10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+            fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+            ensure!(
+                selected_sats >= amount_sats.saturating_add(fee_sats),
+                "insufficient selected BTC funds after dust change removal"
+            );
+            change_sats = 0;
+        }
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(amount_sats),
+                script_pubkey: recipient_script,
+            }],
+        };
+        if change_sats >= 546 {
+            tx.output.push(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let mut psbt = Psbt::from_unsigned_tx(tx).context("build BTC transfer PSBT")?;
+        for (index, (_, value)) in selected.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let unsigned_psbt = psbt.to_string();
+        let sign = sign_psbt_json(&unsigned_psbt, &ident)?;
+        let signed_psbt = ["psbt", "signed_psbt", "signed_anchor_psbt"]
+            .iter()
+            .find_map(|key| sign.get(*key).and_then(Value::as_str))
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("signer PSBT response missing signed psbt: {sign}"))?
+            .to_string();
+        let (raw_tx, extracted_txid) = extract_transaction_hex_from_signed_psbt(&signed_psbt)?;
+        let broadcast = broadcast_raw_transaction_json(&raw_tx)?;
+        let broadcast_txid = broadcast
+            .get("txid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(extracted_txid.as_str())
+            .to_string();
+        ensure!(
+            broadcast_txid == extracted_txid,
+            "broadcast txid mismatch: extracted={extracted_txid}, broadcast={broadcast_txid}"
+        );
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "transfer_with_inputs",
+            "ident": ident,
+            "from": sender_address,
+            "to": recipient_address.to_string(),
+            "amount_sats": amount_sats,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "fee_sats": selected_sats.saturating_sub(amount_sats).saturating_sub(change_sats),
+            "change_sats": change_sats,
+            "selected_sats": selected_sats,
+            "inputs": selected
+                .iter()
+                .map(|(outpoint, value)| json!({
+                    "outpoint": outpoint.to_string(),
+                    "value": value
+                }))
+                .collect::<Vec<_>>(),
+            "txid": broadcast_txid,
+            "raw_tx": raw_tx,
+            "unsigned_psbt": unsigned_psbt,
+            "signed_psbt": signed_psbt,
+            "sign": sign,
+            "broadcast": broadcast
+        })))
+    })
+}
+
+extern "C" fn btc_prepare_transfer_with_inputs(
+    ident: *const Dynamic,
+    recipient: *const Dynamic,
+    amount_sats: u64,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let ident = unsafe { &*ident };
+    let recipient = unsafe { &*recipient };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(ident.is_str(), "ident must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        ensure!(amount_sats > 0, "amount_sats must be greater than zero");
+        let ident = ident.as_str().trim().to_string();
+        let account = btc_account_for_ident(&ident)?;
+        let sender_address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|address| !address.trim().is_empty())
+            .context("BTC sender account missing address")?
+            .to_string();
+        let recipient_address = recipient.as_str().trim().to_string();
+        ensure!(
+            !recipient_address.is_empty(),
+            "recipient address must not be empty"
+        );
+        let requested = input_outpoints.as_str().trim().to_string();
+        ensure!(
+            !requested.is_empty(),
+            "input_outpoints must include at least one outpoint"
+        );
+        let network = Network::Bitcoin;
+        let recipient_address = Address::from_str(&recipient_address)
+            .with_context(|| format!("invalid recipient BTC address: {recipient_address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?;
+        let sender_address_checked = Address::from_str(&sender_address)
+            .with_context(|| format!("invalid sender BTC address: {sender_address}"))?
+            .require_network(network)
+            .with_context(|| format!("sender address is not for {network:?}"))?;
+        let recipient_script = recipient_address.script_pubkey();
+        let change_script = sender_address_checked.script_pubkey();
+        let esplora = btc_esplora_url();
+        let utxos = btc_address_utxos_json(&sender_address, &esplora)?;
+        let candidates = utxos
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|utxo| {
+                utxo.get("status")
+                    .and_then(|status| status.get("confirmed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|utxo| {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .context("utxo missing txid")?;
+                let vout = utxo
+                    .get("vout")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing vout")?;
+                let value = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing value")?;
+                Ok((
+                    OutPoint {
+                        txid: txid
+                            .parse()
+                            .with_context(|| format!("invalid utxo txid {txid}"))?,
+                        vout: u32::try_from(vout).context("utxo vout exceeds u32")?,
+                    },
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let available = candidates
+            .iter()
+            .map(|(outpoint, value)| (*outpoint, *value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        for token in requested
+            .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let outpoint = OutPoint::from_str(token)
+                .with_context(|| format!("invalid selected BTC outpoint: {token}"))?;
+            ensure!(
+                seen.insert(outpoint),
+                "duplicate selected BTC outpoint: {outpoint}"
+            );
+            let value = *available.get(&outpoint).with_context(|| {
+                format!("selected BTC outpoint is not confirmed/available: {outpoint}")
+            })?;
+            selected_sats = selected_sats.saturating_add(value);
+            selected.push((outpoint, value));
+        }
+        ensure!(!selected.is_empty(), "no selected BTC UTXO provided");
+        let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
+            fee_rate_sat_vb
+        } else {
+            2
+        };
+        let mut output_count = 2u64;
+        let mut estimated_vbytes =
+            10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+        let mut fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+        ensure!(
+            selected_sats >= amount_sats.saturating_add(fee_sats),
+            "insufficient selected BTC funds: need {} sats, selected {} sats",
+            amount_sats.saturating_add(fee_sats),
+            selected_sats
+        );
+        let mut change_sats = selected_sats
+            .saturating_sub(amount_sats)
+            .saturating_sub(fee_sats);
+        if change_sats > 0 && change_sats < 546 {
+            output_count = 1;
+            estimated_vbytes =
+                10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+            fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+            ensure!(
+                selected_sats >= amount_sats.saturating_add(fee_sats),
+                "insufficient selected BTC funds after dust change removal"
+            );
+            change_sats = 0;
+        }
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(amount_sats),
+                script_pubkey: recipient_script,
+            }],
+        };
+        if change_sats >= 546 {
+            tx.output.push(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let mut psbt = Psbt::from_unsigned_tx(tx).context("build BTC transfer PSBT")?;
+        for (index, (_, value)) in selected.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let unsigned_psbt = psbt.to_string();
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "prepare_transfer_with_inputs",
+            "ident": ident,
+            "from": sender_address,
+            "to": recipient_address.to_string(),
+            "amount_sats": amount_sats,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "fee_sats": selected_sats.saturating_sub(amount_sats).saturating_sub(change_sats),
+            "change_sats": change_sats,
+            "selected_sats": selected_sats,
+            "inputs": selected
+                .iter()
+                .map(|(outpoint, value)| json!({
+                    "outpoint": outpoint.to_string(),
+                    "value": value
+                }))
+                .collect::<Vec<_>>(),
+            "unsigned_psbt": unsigned_psbt,
+            "psbt": unsigned_psbt,
+            "signer": "admin_btc_wallet"
+        })))
+    })
+}
+
+extern "C" fn btc_prepare_sweep_with_inputs(
+    ident: *const Dynamic,
+    recipient: *const Dynamic,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let ident = unsafe { &*ident };
+    let recipient = unsafe { &*recipient };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(ident.is_str(), "ident must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        let ident = ident.as_str().trim().to_string();
+        ensure!(
+            !ident.is_empty(),
+            "ident must not be empty for deposit sweep"
+        );
+        let account = btc_account_for_ident(&ident)?;
+        let sender_address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|address| !address.trim().is_empty())
+            .context("BTC sender account missing address")?
+            .to_string();
+        let recipient_address = recipient.as_str().trim().to_string();
+        ensure!(
+            !recipient_address.is_empty(),
+            "recipient address must not be empty"
+        );
+        let requested = input_outpoints.as_str().trim().to_string();
+        ensure!(
+            !requested.is_empty(),
+            "input_outpoints must include at least one outpoint"
+        );
+        let network = Network::Bitcoin;
+        let recipient_address = Address::from_str(&recipient_address)
+            .with_context(|| format!("invalid recipient BTC address: {recipient_address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?;
+        let sender_address_checked = Address::from_str(&sender_address)
+            .with_context(|| format!("invalid sender BTC address: {sender_address}"))?
+            .require_network(network)
+            .with_context(|| format!("sender address is not for {network:?}"))?;
+        let recipient_script = recipient_address.script_pubkey();
+        let sender_script = sender_address_checked.script_pubkey();
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let xpub_config = btc_address_xpub_config()?;
+        let key_source = match xpub_config.as_ref() {
+            Some(config) => btc_xpub_input_key_source(&store, config, &sender_address)?,
+            None => None,
+        };
+        let esplora = btc_esplora_url();
+        let utxos = btc_address_utxos_json(&sender_address, &esplora)?;
+        let candidates = utxos
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|utxo| {
+                utxo.get("status")
+                    .and_then(|status| status.get("confirmed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|utxo| {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .context("utxo missing txid")?;
+                let vout = utxo
+                    .get("vout")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing vout")?;
+                let value = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing value")?;
+                Ok((
+                    OutPoint {
+                        txid: txid
+                            .parse()
+                            .with_context(|| format!("invalid utxo txid {txid}"))?,
+                        vout: u32::try_from(vout).context("utxo vout exceeds u32")?,
+                    },
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let available = candidates
+            .iter()
+            .map(|(outpoint, value)| (*outpoint, *value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        for token in requested
+            .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let outpoint = OutPoint::from_str(token)
+                .with_context(|| format!("invalid selected BTC outpoint: {token}"))?;
+            ensure!(
+                seen.insert(outpoint),
+                "duplicate selected BTC outpoint: {outpoint}"
+            );
+            let value = *available.get(&outpoint).with_context(|| {
+                format!("selected BTC outpoint is not confirmed/available: {outpoint}")
+            })?;
+            selected_sats = selected_sats.saturating_add(value);
+            selected.push((outpoint, value));
+        }
+        ensure!(!selected.is_empty(), "no selected BTC UTXO provided");
+        let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
+            fee_rate_sat_vb
+        } else {
+            2
+        };
+        let estimated_vbytes = 10u64 + (selected.len() as u64).saturating_mul(68) + 31;
+        let fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+        ensure!(
+            selected_sats > fee_sats,
+            "selected BTC funds do not cover sweep fee: selected {} sats, fee {} sats",
+            selected_sats,
+            fee_sats
+        );
+        let output_sats = selected_sats.saturating_sub(fee_sats);
+        ensure!(
+            output_sats >= 546,
+            "sweep output would be dust: {output_sats} sats"
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(output_sats),
+                script_pubkey: recipient_script,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).context("build BTC sweep PSBT")?;
+        let mut derivation_count = 0usize;
+        for (index, (_, value)) in selected.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: sender_script.clone(),
+            });
+            if let Some((public_key, fingerprint, derivation_path)) = key_source.as_ref() {
+                let mut derivations = BTreeMap::new();
+                derivations.insert(*public_key, (*fingerprint, derivation_path.clone()));
+                psbt.inputs[index].bip32_derivation = derivations;
+                derivation_count += 1;
+            }
+        }
+        let unsigned_psbt = psbt.to_string();
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "prepare_sweep_with_inputs",
+            "ident": ident,
+            "from": sender_address,
+            "to": recipient_address.to_string(),
+            "amount_sats": output_sats,
+            "input_sats": selected_sats,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "fee_sats": fee_sats,
+            "estimated_vbytes": estimated_vbytes,
+            "inputs": selected
+                .iter()
+                .map(|(outpoint, value)| json!({
+                    "outpoint": outpoint.to_string(),
+                    "value": value
+                }))
+                .collect::<Vec<_>>(),
+            "unsigned_psbt": unsigned_psbt,
+            "psbt": unsigned_psbt,
+            "signer": "xpub_owner_wallet",
+            "bip32_derivation_count": derivation_count
+        })))
+    })
+}
+
+extern "C" fn btc_prepare_consolidation_psbt(
+    recipient: *const Dynamic,
+    fee_rate_sat_vb: u64,
+    inputs: *const Dynamic,
+) -> *const Dynamic {
+    let recipient = unsafe { &*recipient };
+    let inputs = unsafe { &*inputs };
+    native_result(|| {
+        ensure!(recipient.is_str(), "recipient must be string");
+        let recipient_address = recipient.as_str().trim().to_string();
+        ensure!(
+            !recipient_address.is_empty(),
+            "recipient address must not be empty"
+        );
+        let network = Network::Bitcoin;
+        let recipient_address = Address::from_str(&recipient_address)
+            .with_context(|| format!("invalid recipient BTC address: {recipient_address}"))?
+            .require_network(network)
+            .with_context(|| format!("recipient address is not for {network:?}"))?;
+        let recipient_script = recipient_address.script_pubkey();
+        let input_doc = dynamic_to_json(inputs);
+        let input_items = input_doc
+            .as_array()
+            .cloned()
+            .or_else(|| input_doc.get("inputs").and_then(Value::as_array).cloned())
+            .or_else(|| input_doc.get("utxos").and_then(Value::as_array).cloned())
+            .context("inputs must be an array or object with inputs/utxos array")?;
+
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let xpub_config = btc_address_xpub_config()?;
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for item in input_items {
+            let address = item
+                .get("address")
+                .or_else(|| item.get("deposit_address"))
+                .and_then(Value::as_str)
+                .context("consolidation input missing address")?
+                .trim()
+                .to_string();
+            ensure!(!address.is_empty(), "consolidation input address is empty");
+            let source_address = Address::from_str(&address)
+                .with_context(|| format!("invalid input BTC address: {address}"))?
+                .require_network(network)
+                .with_context(|| format!("input address is not for {network:?}"))?;
+            let outpoint = if let Some(outpoint) = item.get("outpoint").and_then(Value::as_str) {
+                OutPoint::from_str(outpoint.trim())
+                    .with_context(|| format!("invalid consolidation outpoint: {outpoint}"))?
+            } else {
+                let txid = item
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .context("consolidation input missing txid/outpoint")?;
+                let vout = item
+                    .get("vout")
+                    .and_then(Value::as_u64)
+                    .context("consolidation input missing vout")?;
+                OutPoint {
+                    txid: txid
+                        .parse()
+                        .with_context(|| format!("invalid consolidation txid {txid}"))?,
+                    vout: u32::try_from(vout).context("consolidation vout exceeds u32")?,
+                }
+            };
+            ensure!(
+                seen.insert(outpoint),
+                "duplicate consolidation input outpoint: {outpoint}"
+            );
+            let value = item
+                .get("value")
+                .or_else(|| item.get("amount_sat"))
+                .or_else(|| item.get("value_sats"))
+                .and_then(Value::as_u64)
+                .context("consolidation input missing value")?;
+            ensure!(value > 0, "consolidation input value must be positive");
+            let confirmed = item
+                .get("status")
+                .and_then(|status| status.get("confirmed"))
+                .and_then(Value::as_bool)
+                .or_else(|| item.get("confirmed").and_then(Value::as_bool))
+                .unwrap_or(true);
+            ensure!(
+                confirmed,
+                "consolidation input must be confirmed: {outpoint}"
+            );
+            let key_source = match xpub_config.as_ref() {
+                Some(config) => btc_xpub_input_key_source(&store, config, &address)?,
+                None => None,
+            };
+            selected_sats = selected_sats.saturating_add(value);
+            selected.push((
+                address,
+                source_address.script_pubkey(),
+                outpoint,
+                value,
+                key_source,
+            ));
+        }
+        ensure!(!selected.is_empty(), "no consolidation inputs provided");
+
+        let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
+            fee_rate_sat_vb
+        } else {
+            2
+        };
+        let estimated_vbytes = 10u64 + (selected.len() as u64).saturating_mul(68) + 31;
+        let fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+        ensure!(
+            selected_sats > fee_sats,
+            "selected BTC funds do not cover consolidation fee: selected {} sats, fee {} sats",
+            selected_sats,
+            fee_sats
+        );
+        let output_sats = selected_sats.saturating_sub(fee_sats);
+        ensure!(
+            output_sats >= 546,
+            "consolidation output would be dust: {output_sats} sats"
+        );
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(_, _, outpoint, _, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(output_sats),
+                script_pubkey: recipient_script,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).context("build BTC consolidation PSBT")?;
+        let mut derivation_count = 0usize;
+        for (index, (_, script_pubkey, _, value, key_source)) in selected.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: script_pubkey.clone(),
+            });
+            if let Some((public_key, fingerprint, derivation_path)) = key_source {
+                let mut derivations = BTreeMap::new();
+                derivations.insert(*public_key, (*fingerprint, derivation_path.clone()));
+                psbt.inputs[index].bip32_derivation = derivations;
+                derivation_count += 1;
+            }
+        }
+        let unsigned_tx_hex = encode::serialize_hex(&psbt.unsigned_tx);
+        let unsigned_psbt = psbt.to_string();
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "prepare_consolidation_psbt",
+            "to": recipient_address.to_string(),
+            "amount_sats": output_sats,
+            "input_sats": selected_sats,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "fee_sats": fee_sats,
+            "estimated_vbytes": estimated_vbytes,
+            "input_count": selected.len(),
+            "inputs": selected
+                .iter()
+                .map(|(address, _, outpoint, value, key_source)| json!({
+                    "address": address,
+                    "outpoint": outpoint.to_string(),
+                    "value": value,
+                    "has_bip32_derivation": key_source.is_some()
+                }))
+                .collect::<Vec<_>>(),
+            "outputs": [{
+                "address": recipient_address.to_string(),
+                "value": output_sats
+            }],
+            "unsigned_tx_hex": unsigned_tx_hex,
+            "unsigned_psbt": unsigned_psbt,
+            "psbt": unsigned_psbt,
+            "signer": "xpub_owner_wallet",
+            "bip32_derivation_count": derivation_count
+        })))
+    })
+}
+
+extern "C" fn btc_prepare_batch_transfer_with_inputs(
+    outputs: *const Dynamic,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let outputs = unsafe { &*outputs };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(outputs.is_str(), "outputs must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        let ident = "";
+        let account = btc_account_for_ident(ident)?;
+        let sender_address = account
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|address| !address.trim().is_empty())
+            .context("BTC sender account missing address")?
+            .to_string();
+        let requested = input_outpoints.as_str().trim().to_string();
+        ensure!(
+            !requested.is_empty(),
+            "input_outpoints must include at least one outpoint"
+        );
+        let network = Network::Bitcoin;
+        let sender_address_checked = Address::from_str(&sender_address)
+            .with_context(|| format!("invalid sender address: {sender_address}"))?
+            .require_network(network)
+            .with_context(|| format!("sender address is not for {network:?}"))?;
+        let recipients = parse_btc_outputs(outputs.as_str(), network)?;
+        let amount_sats = recipients
+            .iter()
+            .fold(0u64, |sum, (_, _, amount)| sum.saturating_add(*amount));
+        ensure!(
+            amount_sats > 0,
+            "total output amount must be greater than zero"
+        );
+        let change_script = sender_address_checked.script_pubkey();
+        let esplora = btc_esplora_url();
+        let utxos = btc_address_utxos_json(&sender_address, &esplora)?;
+        let candidates = utxos
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|utxo| {
+                utxo.get("status")
+                    .and_then(|status| status.get("confirmed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|utxo| {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .context("utxo missing txid")?;
+                let vout = utxo
+                    .get("vout")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing vout")?;
+                let value = utxo
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .context("utxo missing value")?;
+                Ok((
+                    OutPoint {
+                        txid: txid
+                            .parse()
+                            .with_context(|| format!("invalid utxo txid {txid}"))?,
+                        vout: u32::try_from(vout).context("utxo vout exceeds u32")?,
+                    },
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let available = candidates
+            .iter()
+            .map(|(outpoint, value)| (*outpoint, *value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        for token in requested
+            .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let outpoint = OutPoint::from_str(token)
+                .with_context(|| format!("invalid selected BTC outpoint: {token}"))?;
+            ensure!(
+                seen.insert(outpoint),
+                "duplicate selected BTC outpoint: {outpoint}"
+            );
+            let value = *available.get(&outpoint).with_context(|| {
+                format!("selected BTC outpoint is not confirmed/available: {outpoint}")
+            })?;
+            selected_sats = selected_sats.saturating_add(value);
+            selected.push((outpoint, value));
+        }
+        ensure!(!selected.is_empty(), "no selected BTC UTXO provided");
+        let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
+            fee_rate_sat_vb
+        } else {
+            2
+        };
+        let recipient_output_count =
+            u64::try_from(recipients.len()).context("too many BTC outputs")?;
+        let mut output_count = recipient_output_count.saturating_add(1);
+        let mut estimated_vbytes =
+            10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+        let mut fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+        ensure!(
+            selected_sats >= amount_sats.saturating_add(fee_sats),
+            "insufficient selected BTC funds: need {} sats, selected {} sats",
+            amount_sats.saturating_add(fee_sats),
+            selected_sats
+        );
+        let mut change_sats = selected_sats
+            .saturating_sub(amount_sats)
+            .saturating_sub(fee_sats);
+        if change_sats > 0 && change_sats < 546 {
+            output_count = recipient_output_count;
+            estimated_vbytes =
+                10u64 + (selected.len() as u64).saturating_mul(68) + output_count * 31;
+            fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
+            ensure!(
+                selected_sats >= amount_sats.saturating_add(fee_sats),
+                "insufficient selected BTC funds after dust change removal"
+            );
+            change_sats = 0;
+        }
+        let mut tx_outputs = recipients
+            .iter()
+            .map(|(_, script, amount)| TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: script.clone(),
+            })
+            .collect::<Vec<_>>();
+        if change_sats >= 546 {
+            tx_outputs.push(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: tx_outputs,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).context("build BTC batch transfer PSBT")?;
+        for (index, (_, value)) in selected.iter().enumerate() {
+            psbt.inputs[index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        let unsigned_psbt = psbt.to_string();
+        Ok(ok(json!({
+            "module": "btc",
+            "operation": "prepare_batch_transfer_with_inputs",
+            "ident": ident,
+            "from": sender_address,
+            "amount_sats": amount_sats,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "fee_sats": selected_sats.saturating_sub(amount_sats).saturating_sub(change_sats),
+            "change_sats": change_sats,
+            "selected_sats": selected_sats,
+            "outputs": recipients
+                .iter()
+                .map(|(address, _, amount)| json!({
+                    "address": address,
+                    "amount_sats": amount
+                }))
+                .collect::<Vec<_>>(),
+            "inputs": selected
+                .iter()
+                .map(|(outpoint, value)| json!({
+                    "outpoint": outpoint.to_string(),
+                    "value": value
+                }))
+                .collect::<Vec<_>>(),
+            "unsigned_psbt": unsigned_psbt,
+            "psbt": unsigned_psbt,
+            "signer": "admin_btc_wallet"
+        })))
+    })
+}
+
 extern "C" fn btc_tx_status(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |txid| {
         let txid = txid.to_string();
@@ -1484,21 +3499,14 @@ fn sign_psbt_json(psbt: &str, ident: &str) -> Result<Value> {
 
 fn broadcast_raw_transaction_json(tx_hex: &str) -> Result<Value> {
     ensure!(!tx_hex.trim().is_empty(), "tx_hex must not be empty");
-    let esplora = btc_esplora_url();
-    let url = format!("{}/tx", esplora.trim_end_matches('/'));
-    let response = attohttpc::post(&url)
-        .header("content-type", "text/plain")
-        .text(tx_hex.to_string())
-        .send()
-        .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    let txid = response
-        .text()
-        .with_context(|| format!("read Esplora response body from {url}"))?;
-    ensure!(
-        (200..300).contains(&status.as_u16()),
-        "Esplora POST {url} failed with HTTP {status}: {txid}"
-    );
+    ensure_btc_transaction_finalized(tx_hex)?;
+    let (esplora, txid) = match esplora_post_tx_with_fallback(tx_hex) {
+        Ok(result) => result,
+        Err(err) => {
+            log_btc_broadcast_failure(tx_hex, &err);
+            return Err(err);
+        }
+    };
     Ok(dynamic_to_json(&ok(json!({
         "module": "btc",
         "broadcast": true,
@@ -1506,6 +3514,272 @@ fn broadcast_raw_transaction_json(tx_hex: &str) -> Result<Value> {
         "esplora": esplora,
         "txid": txid.trim()
     }))))
+}
+
+fn esplora_post_tx_with_fallback(tx_hex: &str) -> Result<(String, String)> {
+    let mut errors = Vec::new();
+    for esplora in btc_esplora_urls() {
+        let base = esplora.trim_end_matches('/');
+        if is_electrum_chain_source(base) {
+            match electrum_rpc(base, "blockchain.transaction.broadcast", json!([tx_hex])) {
+                Ok(result) => {
+                    let txid = result
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| result.to_string());
+                    return Ok((base.to_string(), txid));
+                }
+                Err(err) => {
+                    errors.push(format!("{base}: Electrum broadcast failed: {err:#}"));
+                    continue;
+                }
+            }
+        }
+        let url = format!("{base}/tx");
+        let response = match attohttpc::post(&url)
+            .header("content-type", "text/plain")
+            .text(tx_hex.to_string())
+            .send()
+        {
+            Ok(response) => response,
+            Err(err) => {
+                errors.push(format!("{base}: POST failed: {err:#}"));
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response
+            .text()
+            .with_context(|| format!("read Esplora response body from {url}"))?;
+        if (200..300).contains(&status.as_u16()) {
+            return Ok((base.to_string(), body));
+        }
+        errors.push(format!(
+            "{base}: Esplora POST {url} failed with HTTP {status}: {body}"
+        ));
+    }
+    bail!(
+        "broadcast BTC transaction: all Esplora endpoints failed: {}",
+        errors.join(" | ")
+    )
+}
+
+fn ensure_btc_transaction_finalized(tx_hex: &str) -> Result<()> {
+    let bytes = hex_to_bytes(tx_hex)?;
+    let tx: Transaction = encode::deserialize(&bytes).context("decode raw tx before broadcast")?;
+    let unsigned_inputs = tx
+        .input
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| input.witness.is_empty() && input.script_sig.is_empty())
+        .map(|(vin, input)| {
+            json!({
+                "vin": vin,
+                "outpoint": input.previous_output.to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    if unsigned_inputs.is_empty() {
+        return Ok(());
+    }
+    let diagnostics = btc_transaction_diagnostics_from_tx_hex(tx_hex, &tx);
+    log_btc_broadcast_event(
+        "not_signed_or_finalized",
+        json!({
+            "error": "BTC_PSBT_NOT_SIGNED_OR_FINALIZED",
+            "reason": "raw transaction has inputs with empty script_sig and empty witness",
+            "unsigned_inputs": unsigned_inputs,
+            "diagnostics": diagnostics
+        }),
+    );
+    bail!("BTC_PSBT_NOT_SIGNED_OR_FINALIZED: raw transaction has unsigned/non-finalized inputs")
+}
+
+fn log_btc_broadcast_failure(tx_hex: &str, err: &anyhow::Error) {
+    log_btc_broadcast_event(
+        "broadcast_failed",
+        json!({
+            "error": format!("{err:#}"),
+            "diagnostics": btc_transaction_diagnostics_from_hex(tx_hex)
+        }),
+    );
+}
+
+fn log_btc_broadcast_event(event: &str, payload: Value) {
+    let line = json!({
+        "ts_ms": now_ms(),
+        "event": event,
+        "payload": payload
+    })
+    .to_string();
+    let path = std::env::var("BTC_BROADCAST_LOG_FILE").unwrap_or_else(|_| {
+        let dir = std::env::var("BTC_BROADCAST_LOG_DIR")
+            .unwrap_or_else(|_| "/data/logs/super_bazaar".to_string());
+        format!("{}/btc-broadcast.log", dir.trim_end_matches('/'))
+    });
+    let path = PathBuf::from(path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn btc_transaction_diagnostics_from_hex(tx_hex: &str) -> Value {
+    let mut out = Map::new();
+    out.insert("raw_tx".to_string(), json!(tx_hex));
+    match hex_to_bytes(tx_hex)
+        .and_then(|bytes| encode::deserialize::<Transaction>(&bytes).context("decode raw tx"))
+    {
+        Ok(tx) => return btc_transaction_diagnostics_from_tx_hex(tx_hex, &tx),
+        Err(err) => {
+            out.insert("decode_error".to_string(), json!(format!("{err:#}")));
+        }
+    }
+    Value::Object(out)
+}
+
+fn btc_transaction_diagnostics_from_tx_hex(tx_hex: &str, tx: &Transaction) -> Value {
+    json!({
+        "raw_tx": tx_hex,
+        "txid": tx.compute_txid().to_string(),
+        "version": tx.version.0,
+        "lock_time": tx.lock_time.to_consensus_u32(),
+        "inputs": tx.input
+            .iter()
+            .enumerate()
+            .map(|(vin, input)| {
+                json!({
+                    "vin": vin,
+                    "outpoint": input.previous_output.to_string(),
+                    "txid": input.previous_output.txid.to_string(),
+                    "vout": input.previous_output.vout,
+                    "sequence": input.sequence.to_consensus_u32(),
+                    "script_sig": bytes_to_hex(input.script_sig.as_bytes()),
+                    "witness_items": input.witness.len()
+                })
+            })
+            .collect::<Vec<_>>(),
+        "input_statuses": tx.input
+            .iter()
+            .take(100)
+            .map(|input| match btc_outpoint_status_json(&input.previous_output) {
+                Ok(status) => status,
+                Err(err) => json!({
+                    "outpoint": input.previous_output.to_string(),
+                    "error": format!("{err:#}")
+                }),
+            })
+            .collect::<Vec<_>>(),
+        "input_status_truncated": tx.input.len() > 100,
+        "outputs": tx.output
+            .iter()
+            .enumerate()
+            .map(|(vout, output)| {
+                let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+                    .map(|address| address.to_string())
+                    .unwrap_or_default();
+                json!({
+                    "vout": vout,
+                    "value": output.value.to_sat(),
+                    "address": address,
+                    "script_pubkey": bytes_to_hex(output.script_pubkey.as_bytes())
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn btc_outpoint_status_json(outpoint: &OutPoint) -> Result<Value> {
+    let mut errors = Vec::new();
+    for source in btc_esplora_urls() {
+        let base = source.trim_end_matches('/').to_string();
+        if is_electrum_chain_source(&base) {
+            match btc_outpoint_status_electrum_json(&base, outpoint) {
+                Ok(status) => return Ok(status),
+                Err(err) => errors.push(format!("{base}: {err:#}")),
+            }
+        } else {
+            match btc_outpoint_status_esplora_json(&base, outpoint) {
+                Ok(status) => return Ok(status),
+                Err(err) => errors.push(format!("{base}: {err:#}")),
+            }
+        }
+    }
+    bail!(
+        "fetch BTC outpoint status {} failed: {}",
+        outpoint,
+        errors.join(" | ")
+    )
+}
+
+fn btc_outpoint_status_electrum_json(source: &str, outpoint: &OutPoint) -> Result<Value> {
+    let txid = outpoint.txid.to_string();
+    let vout = outpoint.vout as usize;
+    let raw = electrum_rpc(source, "blockchain.transaction.get", json!([txid]))?;
+    let raw_hex = raw
+        .as_str()
+        .with_context(|| format!("Electrum transaction.get returned non-string for {outpoint}"))?;
+    let raw_tx = hex_to_bytes(raw_hex)?;
+    let tx: Transaction = encode::deserialize(&raw_tx)
+        .with_context(|| format!("decode Electrum prev transaction {outpoint}"))?;
+    let output = tx
+        .output
+        .get(vout)
+        .with_context(|| format!("prev transaction missing vout for {outpoint}"))?;
+    let script_hash = electrum_script_hash_hex(&output.script_pubkey);
+    let unspent = electrum_rpc(
+        source,
+        "blockchain.scripthash.listunspent",
+        json!([script_hash]),
+    )?;
+    let still_unspent = unspent
+        .as_array()
+        .map(|items| {
+            items.iter().any(|item| {
+                item.get("tx_hash").and_then(Value::as_str)
+                    == Some(outpoint.txid.to_string().as_str())
+                    && item.get("tx_pos").and_then(Value::as_u64) == Some(outpoint.vout as u64)
+            })
+        })
+        .unwrap_or(false);
+    let address = Address::from_script(&output.script_pubkey, Network::Bitcoin)
+        .map(|address| address.to_string())
+        .unwrap_or_default();
+    Ok(json!({
+        "source": source,
+        "outpoint": outpoint.to_string(),
+        "value": output.value.to_sat(),
+        "address": address,
+        "script_pubkey": bytes_to_hex(output.script_pubkey.as_bytes()),
+        "still_unspent": still_unspent
+    }))
+}
+
+fn btc_outpoint_status_esplora_json(source: &str, outpoint: &OutPoint) -> Result<Value> {
+    let txid = outpoint.txid.to_string();
+    let vout = outpoint.vout as usize;
+    let tx = esplora_get_json(&format!("{source}/tx/{txid}"))?;
+    let output = tx
+        .get("vout")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(vout))
+        .with_context(|| format!("Esplora transaction missing vout for {outpoint}"))?;
+    let outspend = esplora_get_json(&format!("{source}/tx/{txid}/outspend/{vout}"))
+        .unwrap_or_else(|err| json!({"error": format!("{err:#}")}));
+    Ok(json!({
+        "source": source,
+        "outpoint": outpoint.to_string(),
+        "value": output.get("value").and_then(Value::as_u64).unwrap_or_default(),
+        "address": output.get("scriptpubkey_address").and_then(Value::as_str).unwrap_or_default(),
+        "script_pubkey": output.get("scriptpubkey").and_then(Value::as_str).unwrap_or_default(),
+        "still_unspent": !outspend.get("spent").and_then(Value::as_bool).unwrap_or(false),
+        "outspend": outspend
+    }))
 }
 
 fn extract_transaction_hex_from_signed_psbt(signed_psbt: &str) -> Result<(String, String)> {
@@ -1751,6 +4025,31 @@ extern "C" fn rgb_assets(callback: *const Dynamic) -> *const Dynamic {
     native_result(|| {
         spawn_rgb_callback_worker("assets", callback, move || {
             rgb_post_dynamic(&Dynamic::Null, "/v1/assets/list")
+        })
+    })
+}
+extern "C" fn rgb_assets_by_utxo(
+    outpoint: *const Dynamic,
+    address: *const Dynamic,
+    confirmed: bool,
+    callback: *const Dynamic,
+) -> *const Dynamic {
+    let outpoint = unsafe { &*outpoint };
+    let address = unsafe { &*address };
+    let callback = unsafe { &*callback };
+    native_result(|| {
+        ensure!(outpoint.is_str(), "outpoint must be string");
+        ensure!(address.is_str(), "address must be string");
+        let outpoint = outpoint.as_str().trim().to_string();
+        let address = address.as_str().trim().to_string();
+        ensure!(!outpoint.is_empty(), "outpoint must not be empty");
+        spawn_rgb_callback_worker("assets_by_utxo", callback, move || {
+            let payload = json_to_dynamic(&json!({
+                "outpoint": outpoint,
+                "address": if address.is_empty() { Value::Null } else { json!(address) },
+                "confirmed": confirmed
+            }));
+            rgb_post_dynamic(&payload, "/v1/assets/by-utxo")
         })
     })
 }
@@ -2180,7 +4479,7 @@ extern "C" fn ln_rgb_status() -> *const Dynamic {
         let node = current_ln_node();
         let (node_id, status, peers, channels, balances, storage_dir, network) =
             if let Some(node) = node.as_ref() {
-                let balance = node.balance_snapshot();
+                let balance = node.cached_balance_snapshot();
                 (
                     node.node_id().to_string(),
                     node.status_summary(),
@@ -2224,7 +4523,8 @@ extern "C" fn ln_rgb_status() -> *const Dynamic {
                 "total_anchor_channels_reserve_sats": balance.total_anchor_channels_reserve_sats,
                 "total_lightning_balance_sats": balance.total_lightning_balance_sats,
                 "lightning_balances": balance.lightning_balances,
-                "pending_channel_closure_sweeps": balance.pending_channel_closure_sweeps
+                "pending_channel_closure_sweeps": balance.pending_channel_closure_sweeps,
+                "balance_source": "cached"
             }))
         })))
     })
@@ -2340,6 +4640,20 @@ extern "C" fn ln_rgb_events() -> *const Dynamic {
     native_result(|| ln_events_with_limit(100))
 }
 
+extern "C" fn ln_rgb_retry_sweeps() -> *const Dynamic {
+    native_result(|| {
+        let node =
+            current_ln_node().context("LN RGB node is not running; call ln_rgb::start() first")?;
+        node.retry_pending_sweeps();
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "operation": "retry_sweeps",
+            "ok": true,
+            "note": "processed pending LDK events and asked output sweeper to rebroadcast pending spends"
+        })))
+    })
+}
+
 fn ln_events_with_limit(limit: usize) -> Result<Dynamic> {
     let node = running_ln_node()?;
     let mut out = Vec::new();
@@ -2417,6 +4731,60 @@ extern "C" fn ln_rgb_get_addr() -> *const Dynamic {
             "module": "ln_rgb",
             "address": current_ln_hot_address()?
         })))
+    })
+}
+
+extern "C" fn ln_rgb_utxos() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        Ok(ok(node.l1_utxos_json()?))
+    })
+}
+
+extern "C" fn ln_rgb_sync_utxos() -> *const Dynamic {
+    native_result(|| {
+        let node = running_ln_node()?;
+        Ok(ok(node.sync_l1_utxos_json()?))
+    })
+}
+
+extern "C" fn ln_rgb_transfer_with_inputs(
+    recipient: *const Dynamic,
+    amount_sats: u64,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let recipient = unsafe { &*recipient };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(recipient.is_str(), "recipient must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        let node = running_ln_node()?;
+        Ok(ok(node.transfer_l1_with_inputs_json(
+            recipient.as_str(),
+            amount_sats,
+            fee_rate_sat_vb,
+            input_outpoints.as_str(),
+        )?))
+    })
+}
+
+extern "C" fn ln_rgb_transfer_batch_with_inputs(
+    outputs: *const Dynamic,
+    fee_rate_sat_vb: u64,
+    input_outpoints: *const Dynamic,
+) -> *const Dynamic {
+    let outputs = unsafe { &*outputs };
+    let input_outpoints = unsafe { &*input_outpoints };
+    native_result(|| {
+        ensure!(outputs.is_str(), "outputs must be string");
+        ensure!(input_outpoints.is_str(), "input_outpoints must be string");
+        let node = running_ln_node()?;
+        Ok(ok(node.transfer_l1_batch_with_inputs_json(
+            outputs.as_str(),
+            fee_rate_sat_vb,
+            input_outpoints.as_str(),
+        )?))
     })
 }
 
@@ -2644,7 +5012,52 @@ extern "C" fn ln_rgb_invoice(
             .context("create BOLT11 invoice")?;
         Ok(ok(json!({
             "module": "ln_rgb",
-            "invoice": invoice.to_string()
+            "invoice": invoice.to_string(),
+            "payment_hash": invoice.payment_hash().to_string()
+        })))
+    })
+}
+
+extern "C" fn ln_rgb_invoice_for_ident(
+    amount_msat: u64,
+    description: *const Dynamic,
+    expiry_secs: u64,
+    ident: *const Dynamic,
+) -> *const Dynamic {
+    let description = unsafe { &*description };
+    let ident = unsafe { &*ident };
+    native_result(|| {
+        let node = running_ln_node()?;
+        ensure!(description.is_str(), "description must be string");
+        ensure!(ident.is_str(), "ident must be string");
+        let ident = ident.as_str().trim().to_string();
+        ensure!(!ident.is_empty(), "ident must not be empty");
+        let description = if description.as_str().trim().is_empty() {
+            "BiHelix LN invoice".to_string()
+        } else {
+            description.as_str().to_string()
+        };
+        let expiry_secs = (expiry_secs > 0).then_some(expiry_secs).unwrap_or(3600) as u32;
+        let description = Bolt11InvoiceDescription::Direct(
+            Description::new(description).map_err(|err| anyhow::anyhow!("{err:?}"))?,
+        );
+        let invoice = node
+            .receive_bolt11(BtcLnBolt11InvoiceRequest {
+                amount_msat,
+                description,
+                expiry_secs,
+            })
+            .context("create BOLT11 invoice")?;
+        let invoice_text = invoice.to_string();
+        let payment_hash = invoice.payment_hash().to_string();
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
+        store.put_ident_ln_invoice(&ident, &invoice_text)?;
+        store.put_ln_payment_hash_ident(&payment_hash, &ident)?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "invoice": invoice_text,
+            "payment_hash": payment_hash,
+            "ident": ident
         })))
     })
 }
@@ -3052,6 +5465,10 @@ fn console_ln_rgb_config(
             .get("accept_inbound_channels")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        announce_for_forwarding: config
+            .get("announce_for_forwarding")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -3132,74 +5549,6 @@ fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) 
     while LN_SCANNER_STARTED.load(Ordering::SeqCst) {
         let _ = (|| -> Result<()> {
             let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
-            let available = store.list_btc_address_pool_records()?.len();
-            if available < BTC_ADDRESS_POOL_LOW_WATER {
-                let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
-                if count > 0 {
-                    let response = signer_request(
-                        SIGNER_ADDRESS_BATCH_PATH,
-                        &json!({
-                            "account_id": default_account_id()?,
-                            "network": "bitcoin",
-                            "purpose": "low_water_refill",
-                            "count": count,
-                            "timestamp_ms": now_ms()
-                        }),
-                    )?;
-                    let addresses = response
-                        .get("addresses")
-                        .and_then(Value::as_array)
-                        .with_context(|| {
-                            format!("signer batch address response missing `addresses`: {response}")
-                        })?;
-                    ensure!(
-                        addresses.len() == count,
-                        "signer batch address response count mismatch: requested={count}, returned={}",
-                        addresses.len()
-                    );
-                    let existing = store
-                        .list_btc_address_pool_records()?
-                        .into_iter()
-                        .map(|(address, _)| address)
-                        .chain(
-                            store
-                                .list_used_btc_address_pool_records()?
-                                .into_iter()
-                                .map(|(address, _)| address),
-                        )
-                        .chain(
-                            store
-                                .list_ident_btc_addresses()?
-                                .into_iter()
-                                .map(|(_, address)| address),
-                        )
-                        .collect::<std::collections::BTreeSet<_>>();
-                    for response in addresses {
-                        let address = response
-                            .get("address")
-                            .and_then(Value::as_str)
-                            .filter(|address| !address.trim().is_empty())
-                            .with_context(|| {
-                                format!(
-                                    "signer batch address item missing non-empty `address`: {response}"
-                                )
-                            })?;
-                        if existing.contains(address) {
-                            continue;
-                        }
-                        store.put_btc_address_pool_record(
-                            address,
-                            &json!({
-                                "address": address,
-                                "created_at_ms": now_ms(),
-                                "purpose": "low_water_refill",
-                                "signer_response": response
-                            }),
-                        )?;
-                    }
-                }
-            }
-
             store.put_wallet_btc_address(&default_account_id()?)?;
             let esplora = btc_esplora_url();
             let mut addresses = Vec::new();
@@ -3264,71 +5613,15 @@ fn ln_inbound_loop(_node: Value, interval: Duration) {
         let _ = (|| -> Result<()> {
             let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
             let available = store.list_btc_address_pool_records()?.len();
-            if available >= BTC_ADDRESS_POOL_LOW_WATER {
-                return Ok(());
-            }
-            let count = BTC_ADDRESS_POOL_TARGET.saturating_sub(available);
-            if count == 0 {
-                return Ok(());
-            }
-            let response = signer_request(
-                SIGNER_ADDRESS_BATCH_PATH,
-                &json!({
-                    "account_id": default_account_id()?,
-                    "network": "bitcoin",
-                    "purpose": "low_water_refill",
-                    "count": count,
-                    "timestamp_ms": now_ms()
-                }),
-            )?;
-            let addresses = response
-                .get("addresses")
-                .and_then(Value::as_array)
-                .with_context(|| {
-                    format!("signer batch address response missing `addresses`: {response}")
-                })?;
-            ensure!(
-                addresses.len() == count,
-                "signer batch address response count mismatch: requested={count}, returned={}",
-                addresses.len()
-            );
-            let existing = store
-                .list_btc_address_pool_records()?
-                .into_iter()
-                .map(|(address, _)| address)
-                .chain(
-                    store
-                        .list_used_btc_address_pool_records()?
-                        .into_iter()
-                        .map(|(address, _)| address),
-                )
-                .chain(
-                    store
-                        .list_ident_btc_addresses()?
-                        .into_iter()
-                        .map(|(_, address)| address),
-                )
-                .collect::<std::collections::BTreeSet<_>>();
-            for response in addresses {
-                let address = response
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .filter(|address| !address.trim().is_empty())
-                    .with_context(|| {
-                        format!("signer batch address item missing non-empty `address`: {response}")
-                    })?;
-                if existing.contains(address) {
-                    continue;
+            if available < BTC_ADDRESS_POOL_LOW_WATER {
+                match refill_btc_address_pool_to_target(&store, "low_water_refill") {
+                    Ok(added) => eprintln!(
+                        "[zust-console] BTC address pool auto-refilled: available_before={available}, added={added}, low_water={BTC_ADDRESS_POOL_LOW_WATER}, target={BTC_ADDRESS_POOL_TARGET}"
+                    ),
+                    Err(err) => eprintln!(
+                        "[zust-console] BTC address pool auto-refill failed: available={available}, low_water={BTC_ADDRESS_POOL_LOW_WATER}, target={BTC_ADDRESS_POOL_TARGET}; error={err:#}"
+                    ),
                 }
-                store.put_btc_address_pool_record(
-                    address,
-                    &json!({
-                        "address": address,
-                        "created_at_ms": now_ms(),
-                        "purpose": "low_water_refill",
-                        "signer_response": response
-                    }),
-                )?;
             }
             Ok(())
         })();
@@ -3476,12 +5769,10 @@ fn btc_balance_json(ident: &str) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let esplora = btc_esplora_url();
-    let stats = esplora_get_json(&format!(
-        "{}/address/{address}",
-        esplora.trim_end_matches('/')
-    ))
-    .with_context(|| format!("fetch BTC L1 balance for {address}"))?;
+    let (esplora, stats) = btc_esplora_get_json_with_fallback(
+        &format!("address/{address}"),
+        &format!("fetch BTC L1 balance for {address}"),
+    )?;
     let utxos = btc_address_utxos_json(&address, &esplora)?;
     let chain_funded = value_path_u64(&stats, &["chain_stats", "funded_txo_sum"]);
     let chain_spent = value_path_u64(&stats, &["chain_stats", "spent_txo_sum"]);
@@ -3528,11 +5819,191 @@ fn btc_assets_json(ident: &str) -> Result<Value> {
 }
 
 fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
-    esplora_get_json(&format!(
-        "{}/address/{address}/utxo",
-        esplora.trim_end_matches('/')
-    ))
-    .with_context(|| format!("fetch BTC L1 UTXOs for {address}"))
+    if is_electrum_chain_source(esplora) {
+        match electrum_address_utxos_json(address, esplora) {
+            Ok(utxos) => return Ok(utxos),
+            Err(primary_error) => {
+                let mut errors = vec![format!("{esplora}: {primary_error:#}")];
+                for fallback in btc_esplora_urls() {
+                    if fallback.trim_end_matches('/') == esplora.trim_end_matches('/') {
+                        continue;
+                    }
+                    let fallback = fallback.trim_end_matches('/').to_string();
+                    let result = if is_electrum_chain_source(&fallback) {
+                        electrum_address_utxos_json(address, &fallback)
+                    } else {
+                        esplora_get_json(&format!("{fallback}/address/{address}/utxo"))
+                    };
+                    match result {
+                        Ok(utxos) => return Ok(utxos),
+                        Err(err) => errors.push(format!("{fallback}: {err:#}")),
+                    }
+                }
+                bail!(
+                    "fetch BTC L1 UTXOs for {address}: all chain sources failed: {}",
+                    errors.join(" | ")
+                )
+            }
+        }
+    }
+    let path = format!("address/{address}/utxo");
+    match esplora_get_json(&format!("{}/{}", esplora.trim_end_matches('/'), path)) {
+        Ok(utxos) => Ok(utxos),
+        Err(primary_error) => {
+            let mut errors = vec![format!(
+                "{}: {primary_error:#}",
+                esplora.trim_end_matches('/')
+            )];
+            for fallback in btc_esplora_urls() {
+                if fallback.trim_end_matches('/') == esplora.trim_end_matches('/') {
+                    continue;
+                }
+                match esplora_get_json(&format!("{}/{}", fallback.trim_end_matches('/'), path)) {
+                    Ok(utxos) => return Ok(utxos),
+                    Err(err) => errors.push(format!("{}: {err:#}", fallback.trim_end_matches('/'))),
+                }
+            }
+            bail!(
+                "fetch BTC L1 UTXOs for {address}: all Esplora endpoints failed: {}",
+                errors.join(" | ")
+            )
+        }
+    }
+}
+
+fn btc_address_txs_json_with_fallback(address: &str, context: &str) -> Result<(String, Value)> {
+    let mut errors = Vec::new();
+    let path = format!("address/{address}/txs");
+    for source in btc_esplora_urls() {
+        let base = source.trim_end_matches('/').to_string();
+        let result = if is_electrum_chain_source(&base) {
+            electrum_address_txs_json(address, &base)
+        } else {
+            esplora_get_json(&format!("{base}/{path}"))
+        };
+        match result {
+            Ok(json) => return Ok((base, json)),
+            Err(err) => errors.push(format!("{base}: {err:#}")),
+        }
+    }
+    bail!(
+        "{context}: all BTC chain sources failed: {}",
+        errors.join(" | ")
+    )
+}
+
+fn electrum_address_txs_json(address: &str, source: &str) -> Result<Value> {
+    let network = Network::Bitcoin;
+    let address = Address::from_str(address)
+        .with_context(|| format!("invalid BTC address: {address}"))?
+        .require_network(network)
+        .with_context(|| format!("address is not for {network:?}"))?;
+    let script = address.script_pubkey();
+    let script_hash = electrum_script_hash_hex(&script);
+    let history = electrum_rpc(
+        source,
+        "blockchain.scripthash.get_history",
+        json!([script_hash]),
+    )?;
+    let mut txs = Vec::new();
+    for item in history.as_array().cloned().unwrap_or_default() {
+        let txid = item
+            .get("tx_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if txid.is_empty() {
+            continue;
+        }
+        let raw = electrum_rpc(source, "blockchain.transaction.get", json!([txid]))?;
+        let raw_hex = raw
+            .as_str()
+            .with_context(|| format!("Electrum transaction.get returned non-string for {txid}"))?;
+        let raw_tx = hex_to_bytes(raw_hex)?;
+        let tx: Transaction = encode::deserialize(&raw_tx)
+            .with_context(|| format!("decode Electrum raw transaction {txid}"))?;
+        let block_height = item
+            .get("height")
+            .and_then(Value::as_i64)
+            .filter(|height| *height > 0)
+            .map(|height| height as u64);
+        let confirmed = block_height.is_some();
+        let vout = tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(n, output)| {
+                let output_address = if output.script_pubkey == script {
+                    address.to_string()
+                } else {
+                    Address::from_script(&output.script_pubkey, network)
+                        .map(|address| address.to_string())
+                        .unwrap_or_default()
+                };
+                json!({
+                    "n": n,
+                    "scriptpubkey": bytes_to_hex(output.script_pubkey.as_bytes()),
+                    "scriptpubkey_address": output_address,
+                    "value": output.value.to_sat()
+                })
+            })
+            .collect::<Vec<_>>();
+        txs.push(json!({
+            "txid": txid,
+            "vout": vout,
+            "status": {
+                "confirmed": confirmed,
+                "block_height": block_height
+            }
+        }));
+    }
+    Ok(Value::Array(txs))
+}
+
+fn electrum_address_utxos_json(address: &str, source: &str) -> Result<Value> {
+    let network = Network::Bitcoin;
+    let address = Address::from_str(address)
+        .with_context(|| format!("invalid BTC address: {address}"))?
+        .require_network(network)
+        .with_context(|| format!("address is not for {network:?}"))?;
+    let script_hash = electrum_script_hash_hex(&address.script_pubkey());
+    let unspent = electrum_rpc(
+        source,
+        "blockchain.scripthash.listunspent",
+        json!([script_hash]),
+    )?;
+    let utxos = unspent
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|utxo| {
+            let txid = utxo.get("tx_hash")?.as_str()?.to_string();
+            let vout = utxo
+                .get("tx_pos")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let amount = utxo
+                .get("value")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let block_height = utxo
+                .get("height")
+                .and_then(Value::as_i64)
+                .filter(|height| *height > 0)
+                .map(|height| height as u64);
+            Some(json!({
+                "txid": txid,
+                "vout": vout,
+                "value": amount,
+                "status": {
+                    "confirmed": block_height.is_some(),
+                    "block_height": block_height
+                }
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(utxos))
 }
 
 fn scan_utxos_json(address: &str, esplora: &str) -> Result<Value> {
@@ -3613,25 +6084,185 @@ fn rgb_service_data_dir() -> Result<PathBuf> {
         )
 }
 
-fn esplora_get_json(url: &str) -> Result<Value> {
-    let response = attohttpc::get(url)
-        .header("accept", "application/json")
+fn esplora_http_client() -> Result<&'static reqwest::blocking::Client> {
+    if let Some(client) = ESPLORA_HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(BTC_ESPLORA_REQUEST_TIMEOUT_SECS))
+        .pool_idle_timeout(Duration::from_secs(BTC_ESPLORA_POOL_IDLE_TIMEOUT_SECS))
+        .pool_max_idle_per_host(BTC_ESPLORA_POOL_MAX_IDLE_PER_HOST)
+        .user_agent("bihelix-super-bazaar/1.0")
+        .build()
+        .context("build Esplora HTTP client")?;
+    let _ = ESPLORA_HTTP_CLIENT.set(client);
+    ESPLORA_HTTP_CLIENT
+        .get()
+        .context("Esplora HTTP client was not initialized")
+}
+
+fn esplora_get_text(url: &str, accept: &str) -> Result<String> {
+    let response = esplora_http_client()?
+        .get(url)
+        .header("accept", accept)
         .send()
         .with_context(|| format!("GET {url}"))?;
     let status = response.status();
     let body = response
         .text()
         .with_context(|| format!("read Esplora response body from {url}"))?;
+    if !status.is_success() {
+        bail!("Esplora GET {url} failed with HTTP {status}: {body}");
+    }
+    Ok(body)
+}
+
+fn esplora_get_json(url: &str) -> Result<Value> {
+    let body = esplora_get_text(url, "application/json")?;
     let json = if body.trim().is_empty() {
         Value::Null
     } else {
         serde_json::from_str(&body)
             .with_context(|| format!("decode Esplora JSON body from {url}: {body}"))?
     };
-    if !(200..300).contains(&status.as_u16()) {
-        bail!("Esplora GET {url} failed with HTTP {status}: {json}");
-    }
     Ok(json)
+}
+
+fn is_electrum_chain_source(source: &str) -> bool {
+    let source = source.trim();
+    !source.starts_with("http://") && !source.starts_with("https://")
+}
+
+fn electrum_endpoint(source: &str) -> Result<String> {
+    let source = source.trim().trim_end_matches('/');
+    let source = source
+        .strip_prefix("electrum://")
+        .or_else(|| source.strip_prefix("tcp://"))
+        .unwrap_or(source);
+    ensure!(
+        !source.starts_with("ssl://") && !source.starts_with("tls://"),
+        "Electrum TLS endpoints are not supported here; use plaintext tcp/electrum"
+    );
+    let authority = source.split('/').next().unwrap_or_default();
+    ensure!(
+        authority.contains(':'),
+        "Electrum source must include host:port"
+    );
+    Ok(authority.to_string())
+}
+
+fn electrum_rpc(source: &str, method: &str, params: Value) -> Result<Value> {
+    let endpoint = electrum_endpoint(source)?;
+    let address = endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
+        .next()
+        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
+    let mut stream = TcpStream::connect_timeout(
+        &address,
+        Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS),
+    )
+    .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(BTC_ESPLORA_REQUEST_TIMEOUT_SECS)))
+        .context("set Electrum read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(BTC_ESPLORA_REQUEST_TIMEOUT_SECS)))
+        .context("set Electrum write timeout")?;
+    let request = json!({
+        "id": now_ms(),
+        "method": method,
+        "params": params.as_array().cloned().unwrap_or_default()
+    });
+    let request_line = serde_json::to_string(&request).context("encode Electrum request")? + "\n";
+    stream
+        .write_all(request_line.as_bytes())
+        .with_context(|| format!("write Electrum request {method} to {endpoint}"))?;
+    stream
+        .flush()
+        .with_context(|| format!("flush Electrum request {method} to {endpoint}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .with_context(|| format!("read Electrum response {method} from {endpoint}"))?;
+    ensure!(
+        !response_line.trim().is_empty(),
+        "empty Electrum response for {method} from {endpoint}"
+    );
+    let response: Value = serde_json::from_str(&response_line)
+        .with_context(|| format!("decode Electrum response for {method}: {response_line}"))?;
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        bail!("Electrum {method} failed: {error}");
+    }
+    response
+        .get("result")
+        .cloned()
+        .context("Electrum response missing result")
+}
+
+fn electrum_script_hash_hex(script: &ScriptBuf) -> String {
+    let digest = sha256::Hash::hash(script.as_bytes());
+    let mut bytes = digest.to_byte_array();
+    bytes.reverse();
+    bytes_to_hex(&bytes)
+}
+
+fn btc_esplora_get_json_with_fallback(path: &str, context: &str) -> Result<(String, Value)> {
+    let mut errors = Vec::new();
+    let path = path.trim_start_matches('/');
+    for esplora in btc_esplora_urls() {
+        let base = esplora.trim_end_matches('/');
+        if is_electrum_chain_source(base) {
+            errors.push(format!(
+                "{base}: Electrum source cannot serve Esplora path {path}"
+            ));
+            continue;
+        }
+        let url = format!("{base}/{path}");
+        match esplora_get_json(&url) {
+            Ok(json) => return Ok((base.to_string(), json)),
+            Err(err) => errors.push(format!("{base}: {err:#}")),
+        }
+    }
+    bail!(
+        "{context}: all Esplora endpoints failed: {}",
+        errors.join(" | ")
+    )
+}
+
+fn btc_tip_height_with_fallback() -> (String, u64) {
+    let mut errors = Vec::new();
+    for source in btc_esplora_urls() {
+        let base = source.trim_end_matches('/').to_string();
+        if is_electrum_chain_source(&base) {
+            match electrum_rpc(&base, "blockchain.headers.subscribe", json!([])) {
+                Ok(header) => {
+                    let tip_height = header
+                        .get("height")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    return (base, tip_height);
+                }
+                Err(err) => errors.push(format!("{base}: {err:#}")),
+            }
+        } else {
+            let url = format!("{base}/blocks/tip/height");
+            match esplora_get_text(&url, "text/plain") {
+                Ok(text) => {
+                    let tip_height = text.trim().parse::<u64>().unwrap_or_default();
+                    return (base, tip_height);
+                }
+                Err(err) => errors.push(format!("{base}: {err:#}")),
+            }
+        }
+    }
+    eprintln!(
+        "[zust-console] BTC chain tip height fetch failed: {}",
+        errors.join(" | ")
+    );
+    (btc_esplora_url(), 0)
 }
 
 fn parse_http_json_response(path: &str, response: Vec<u8>) -> Result<Value> {
@@ -3737,18 +6368,42 @@ fn signer_node_id() -> Result<String> {
 }
 
 fn btc_esplora_url() -> String {
-    local_dynamic("lightning")
-        .map(|lightning| dynamic_to_json(&lightning))
-        .and_then(|lightning| {
-            lightning
-                .get("config")
-                .and_then(|config| config.get("chain_source"))
-                .and_then(|chain_source| chain_source.get("url"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
+    local_string("btc-chain-source")
+        .or_else(|| local_string("btc-deposit-chain-source"))
+        .or_else(|| {
+            local_dynamic("lightning")
+                .map(|lightning| dynamic_to_json(&lightning))
+                .and_then(|lightning| {
+                    lightning
+                        .get("config")
+                        .and_then(|config| config.get("chain_source"))
+                        .and_then(|chain_source| chain_source.get("url"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
         })
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| LN_ESPLORA_DEFAULT.to_string())
+}
+
+fn btc_esplora_urls() -> Vec<String> {
+    let mut urls = Vec::new();
+    let primary = btc_esplora_url().trim().trim_end_matches('/').to_string();
+    if !primary.is_empty() && !urls.iter().any(|existing| existing == &primary) {
+        urls.push(primary);
+    }
+    for fallback in local_string("btc-esplora-fallback")
+        .unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+    {
+        let fallback = fallback.to_string();
+        if !urls.iter().any(|existing| existing == &fallback) {
+            urls.push(fallback);
+        }
+    }
+    urls
 }
 
 pub(crate) fn request_signature(path: &str, body: &Value) -> Result<Value> {
@@ -3775,7 +6430,11 @@ fn signer_request(path: &str, body: &Value) -> Result<Value> {
     request.push(path);
     request.push_dynamic(body);
     let bytes = dynamic_to_msgpack(&request);
-    let response = console_async_runtime()?.block_on(iroh_call_with_retries(signer_node, bytes))?;
+    let response = thread::spawn(move || {
+        console_async_runtime()?.block_on(iroh_call_with_retries(signer_node, bytes))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("signer request worker thread panicked"))??;
     eprintln!("[zust-console] signer request returned");
     Ok(dynamic_to_json(&response))
 }
@@ -3971,6 +6630,23 @@ fn native_two_string_dynamic_result(
     })
 }
 
+fn native_three_string_dynamic_result(
+    first: *const Dynamic,
+    second: *const Dynamic,
+    third: *const Dynamic,
+    f: impl FnOnce(&str, &str, &str) -> Result<Dynamic>,
+) -> *const Dynamic {
+    let first = unsafe { &*first };
+    let second = unsafe { &*second };
+    let third = unsafe { &*third };
+    native_result(|| {
+        ensure!(first.is_str(), "first argument must be string");
+        ensure!(second.is_str(), "second argument must be string");
+        ensure!(third.is_str(), "third argument must be string");
+        f(first.as_str(), second.as_str(), third.as_str())
+    })
+}
+
 fn required_string(input: &Dynamic, key: &str) -> Result<String> {
     optional_string(input, key)
         .filter(|value| !value.trim().is_empty())
@@ -4006,6 +6682,20 @@ fn hex32_to_bytes(value: &str) -> Result<[u8; 32]> {
         let offset = index * 2;
         *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
             .with_context(|| format!("invalid hex at byte {index}"))?;
+    }
+    Ok(bytes)
+}
+
+fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
+    let value = value.trim();
+    ensure!(value.len() % 2 == 0, "hex string must have even length");
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut index = 0usize;
+    while index < value.len() {
+        let byte = u8::from_str_radix(&value[index..index + 2], 16)
+            .with_context(|| format!("invalid hex at byte {}", index / 2))?;
+        bytes.push(byte);
+        index += 2;
     }
     Ok(bytes)
 }
@@ -4046,6 +6736,19 @@ fn ln_rgb_storage_dir() -> PathBuf {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| PathBuf::from(LN_LDK_DATA_DIR_DEFAULT))
+}
+
+fn btc_wallet_data_dir() -> PathBuf {
+    local_dynamic("btc_wallet/node")
+        .map(|value| dynamic_to_json(&value))
+        .and_then(|value| {
+            value
+                .get("data_dir")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from(".zust-console"))
 }
 
 fn ln_rgb_network_name() -> String {
