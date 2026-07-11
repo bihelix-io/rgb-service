@@ -1881,7 +1881,11 @@ impl LocalDaemonService {
         format!("{account_id}:{outpoint}")
     }
 
-    fn put_account_utxo(&self, account_id: &str, utxo: TrackedUtxo) -> rgb_service_api::Result<()> {
+    pub(crate) fn put_account_utxo(
+        &self,
+        account_id: &str,
+        utxo: TrackedUtxo,
+    ) -> rgb_service_api::Result<()> {
         let utxo = Self::validate_tracked_utxo(utxo)?;
         let keyspace = self
             .db
@@ -2091,7 +2095,7 @@ impl LocalDaemonService {
             .unwrap_or_else(|| TokenCatalogEntry::empty(contract_id, ticker, name, precision)))
     }
 
-    fn put_legacy_address_account(
+    pub(crate) fn put_legacy_address_account(
         &self,
         address: &str,
         account_id: &str,

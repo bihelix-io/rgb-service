@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -22,8 +23,9 @@ use bdk_wallet::{
     bitcoin::{
         consensus::deserialize,
         hashes::{sha256, Hash},
-        Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf,
+        Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, TxOut, Txid,
     },
+    chain::{ChainPosition, ConfirmationBlockTime},
     descriptor::ExtendedDescriptor,
     file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet,
 };
@@ -52,6 +54,7 @@ pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> 
         .route("/account/create", put(create_account))
         .route("/asset/list", get(asset_list))
         .route("/asset", get(query_asset))
+        .route("/utxo", get(utxo))
         .route("/asset/internal/issue", post(issue_asset))
         .route("/estimate/gas", get(estimate_gas))
         .route("/get_fee", get(get_mempool_info))
@@ -109,11 +112,21 @@ async fn create_account(
     Json(req): Json<CreateAccountReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
     let account_id = legacy_account_id(&req.desc);
-    let _wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
+    let wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
     state.service.get_or_create_profile(&account_id)?;
     state
         .service
         .put_legacy_account_desc(&account_id, &req.desc)?;
+    for index in 0..=state.config.reveal_address_count.max(1) {
+        let address = wallet
+            .wallet
+            .peek_address(KeychainKind::External, index)
+            .address
+            .to_string();
+        state
+            .service
+            .put_legacy_address_account(&address, &account_id)?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -204,6 +217,98 @@ struct QueryAssetReq {
     contract_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct LegacyUtxoQuery {
+    address: Option<String>,
+    desc: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LegacyLocalOutput {
+    outpoint: OutPoint,
+    txout: TxOut,
+    keychain: KeychainKind,
+    is_spent: bool,
+    derivation_index: u32,
+    chain_position: LegacyChainPosition,
+}
+
+#[derive(Serialize)]
+enum LegacyChainPosition {
+    Confirmed {
+        anchor: ConfirmationBlockTime,
+        transitively: Option<Txid>,
+    },
+    Unconfirmed {
+        last_seen: Option<u64>,
+    },
+}
+
+impl From<bdk_wallet::LocalOutput> for LegacyLocalOutput {
+    fn from(output: bdk_wallet::LocalOutput) -> Self {
+        let chain_position = match output.chain_position {
+            ChainPosition::Confirmed {
+                anchor,
+                transitively,
+            } => LegacyChainPosition::Confirmed {
+                anchor,
+                transitively,
+            },
+            ChainPosition::Unconfirmed { last_seen, .. } => {
+                LegacyChainPosition::Unconfirmed { last_seen }
+            }
+        };
+        Self {
+            outpoint: output.outpoint,
+            txout: output.txout,
+            keychain: output.keychain,
+            is_spent: output.is_spent,
+            derivation_index: output.derivation_index,
+            chain_position,
+        }
+    }
+}
+
+async fn utxo(
+    State(state): State<LegacyState>,
+    Query(query): Query<LegacyUtxoQuery>,
+) -> Result<Json<Vec<LegacyLocalOutput>>, LegacyHttpError> {
+    // Match wallet-service-v2's QueryListReq behavior: when both are present,
+    // `address` wins and is expanded to its registered descriptor wallet.
+    let desc = if let Some(address) = query.address.as_deref() {
+        let account_id = state
+            .service
+            .resolve_legacy_account_id_for_address(address)?
+            .ok_or_else(|| {
+                RgbServiceError::NotFound(format!("legacy address not found: {address}"))
+            })?;
+        state
+            .service
+            .resolve_legacy_desc_for_account_id(&account_id)?
+            .ok_or_else(|| {
+                RgbServiceError::NotFound(format!(
+                    "legacy desc not found for account: {account_id}"
+                ))
+            })?
+    } else if let Some(desc) = query.desc {
+        desc
+    } else {
+        return Err(
+            RgbServiceError::InvalidRequest("desc or address is required".to_string()).into(),
+        );
+    };
+
+    let mut wallet = open_legacy_wallet(&state.service, &state.config, &desc)?;
+    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
+    let utxos = wallet
+        .wallet
+        .list_unspent()
+        .map(LegacyLocalOutput::from)
+        .collect::<Vec<_>>();
+    wallet.persist()?;
+    Ok(Json(utxos))
+}
+
 #[derive(Serialize)]
 struct LegacyAllocation {
     contract_id: String,
@@ -231,13 +336,10 @@ async fn query_asset(
             .collect::<HashMap<_, _>>();
         for (outpoint, allocations) in list.utxo_assets {
             for allocation in allocations {
-                if query
-                    .address
-                    .as_deref()
-                    .is_some_and(|address| allocation.address.as_deref() != Some(address))
-                {
-                    continue;
-                }
+                // `address` identifies the legacy descriptor wallet; it is not
+                // an allocation filter. Change can live on another revealed
+                // address of the same descriptor, and legacy wallet balances
+                // must include those sibling-address allocations as well.
                 if query
                     .contract_id
                     .as_deref()
@@ -367,6 +469,12 @@ fn legacy_query_account_ids(
             .service
             .resolve_legacy_account_id_for_address(address)?
         {
+            if let Some(desc) = state
+                .service
+                .resolve_legacy_desc_for_account_id(&account_id)?
+            {
+                return legacy_desc_account_ids(state, &desc);
+            }
             return Ok(vec![account_id]);
         }
         return Ok(vec![address.to_string()]);
@@ -556,8 +664,7 @@ async fn transfer_psbt(
 
     let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
         .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
-    let change_address = wallet.wallet.reveal_next_address(KeychainKind::External);
-    let change_script = change_address.script_pubkey();
+    let change_script = legacy_change_script(&wallet.wallet);
     let mut builder = wallet.wallet.build_tx();
     builder
         .ordering(TxOrdering::Untouched)
@@ -667,12 +774,12 @@ fn build_legacy_btc_only_psbt(
     let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
         .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
     let rgb_outpoints = legacy_rgb_allocated_outpoints(state, account_id, wallet)?;
-    let change_address = wallet.wallet.reveal_next_address(KeychainKind::External);
+    let change_script = legacy_change_script(&wallet.wallet);
     let mut builder = wallet.wallet.build_tx();
     builder
         .ordering(TxOrdering::Untouched)
         .fee_rate(fee_rate)
-        .drain_to(change_address.script_pubkey());
+        .drain_to(change_script);
 
     let network = state.service.network()?;
     let mut has_recipient = false;
@@ -915,6 +1022,22 @@ fn find_change_vout(
         })
 }
 
+/// Preserve wallet-service-v2's change-address semantics.
+///
+/// Legacy clients identify a wallet by the first address derived from their
+/// single external descriptor and may display BTC balance for that address
+/// rather than scanning every subsequently revealed address. With a
+/// single-descriptor BDK wallet, `Internal` maps to `External`; peeking index
+/// zero therefore returns the stable legacy change address without advancing
+/// the derivation index. Using `reveal_next_address` here strands change on a
+/// fresh address from the client's point of view and makes its displayed
+/// balance too low.
+fn legacy_change_script(wallet: &Wallet) -> ScriptBuf {
+    wallet
+        .peek_address(KeychainKind::Internal, 0)
+        .script_pubkey()
+}
+
 #[derive(Deserialize)]
 struct TransferCallbackReq {
     tx: Option<String>,
@@ -952,6 +1075,7 @@ async fn transfer_callback(
 
     let has_transfer_id_field = req.transfer_id.is_some();
     let has_desc = req.desc.is_some();
+    let request_desc = req.desc.clone();
     let transfer_id = req.transfer_id.unwrap_or_else(|| txid.clone());
     let desc_account_id = req.desc.as_deref().map(legacy_account_id);
     state.service.logger().info(format!(
@@ -985,7 +1109,62 @@ async fn transfer_callback(
     }
     // Broadcast the signed transaction via the configured chain backend.
     broadcast_legacy_tx(&state.service, &tx, &txid)?;
+    let wallet_desc = match request_desc {
+        Some(desc) => Some(desc),
+        None => match account_id.as_deref() {
+            Some(account_id) => state
+                .service
+                .resolve_legacy_desc_for_account_id(account_id)?,
+            None => None,
+        },
+    };
+    if let Some(desc) = wallet_desc.as_deref() {
+        apply_legacy_signed_tx(&state, &desc, account_id.as_deref(), &tx)?;
+    }
     Ok(StatusCode::OK)
+}
+
+fn apply_legacy_signed_tx(
+    state: &LegacyState,
+    desc: &str,
+    rgb_account_id: Option<&str>,
+    tx: &bdk_wallet::bitcoin::Transaction,
+) -> Result<(), LegacyHttpError> {
+    let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
+    let seen_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+        .as_secs();
+    wallet
+        .wallet
+        .apply_unconfirmed_txs([(tx.clone(), seen_at)]);
+
+    let canonical_account_id = legacy_account_id(desc);
+    state
+        .service
+        .put_legacy_account_desc(&canonical_account_id, desc)?;
+    for (vout, output) in tx.output.iter().enumerate() {
+        if !wallet.wallet.is_mine(output.script_pubkey.clone()) {
+            continue;
+        }
+        let address = Address::from_script(&output.script_pubkey, state.service.network()?)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .to_string();
+        state
+            .service
+            .put_legacy_address_account(&address, &canonical_account_id)?;
+        if let Some(account_id) = rgb_account_id {
+            state.service.put_account_utxo(
+                account_id,
+                TrackedUtxo {
+                    outpoint: OutPoint::new(tx.compute_txid(), vout as u32).to_string(),
+                    address: Some(address),
+                    confirmed: false,
+                },
+            )?;
+        }
+    }
+    wallet.persist()
 }
 
 #[derive(Deserialize)]
@@ -1227,5 +1406,70 @@ impl IntoResponse for LegacyHttpError {
             None => serde_json::json!({ "message": message }),
         };
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_wallet::bitcoin::Network;
+
+    const LEGACY_DESCRIPTOR_KEY: &str = "[a49cd98b/84'/827166'/0']xpub6Bz49QXuN7g57fzNQJA8sbQKu8ihjcaPKCwYUq3HXXn5LXNn6ejuXEUSmcHgAFAdtyBgxFyumSNivxp5gtwbN7XkUTEMh4vuLTBfW3ff82T/0/*";
+
+    #[test]
+    fn legacy_change_address_stays_at_index_zero_for_all_supported_script_types() {
+        let descriptors = [
+            format!("pkh({LEGACY_DESCRIPTOR_KEY})"),
+            format!("sh(wpkh({LEGACY_DESCRIPTOR_KEY}))"),
+            format!("wpkh({LEGACY_DESCRIPTOR_KEY})"),
+            format!("tr({LEGACY_DESCRIPTOR_KEY})"),
+        ];
+
+        for descriptor in descriptors {
+            let descriptor = ExtendedDescriptor::from_str(&descriptor).unwrap();
+            let mut wallet = Wallet::create_single(descriptor)
+                .network(Network::Bitcoin)
+                .create_wallet_no_persist()
+                .unwrap();
+            let _ = wallet.reveal_addresses_to(KeychainKind::External, 20);
+
+            let first_external = wallet
+                .peek_address(KeychainKind::External, 0)
+                .script_pubkey();
+            assert_eq!(legacy_change_script(&wallet), first_external);
+
+            let next_external = wallet
+                .reveal_next_address(KeychainKind::External)
+                .script_pubkey();
+            assert_ne!(next_external, first_external);
+            assert_eq!(legacy_change_script(&wallet), first_external);
+        }
+    }
+
+    #[test]
+    fn legacy_utxo_json_keeps_bdk_v1_chain_position_shape() {
+        let output = LegacyLocalOutput {
+            outpoint: OutPoint::null(),
+            txout: TxOut {
+                value: Amount::from_sat(9_985_779),
+                script_pubkey: ScriptBuf::new(),
+            },
+            keychain: KeychainKind::External,
+            is_spent: false,
+            derivation_index: 21,
+            chain_position: LegacyChainPosition::Unconfirmed {
+                last_seen: Some(42),
+            },
+        };
+
+        let value = serde_json::to_value(output).unwrap();
+        assert_eq!(value["derivation_index"], 21);
+        assert_eq!(
+            value["chain_position"],
+            serde_json::json!({"Unconfirmed": {"last_seen": 42}})
+        );
+        assert!(value["chain_position"]["Unconfirmed"]
+            .get("first_seen")
+            .is_none());
     }
 }
