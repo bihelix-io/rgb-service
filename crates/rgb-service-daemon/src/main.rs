@@ -49,8 +49,8 @@ use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
     import_rgb20_stock_and_allocations,
     issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
-    list_rgb20_allocation_outpoints, list_rgb20_assets_for_utxos, list_rgb20_contracts,
-    normalize_electrum_url, prepare_rgb20_psbt, rgbstd::{
+    list_rgb20_assets_for_utxos, list_rgb20_contracts, normalize_electrum_url, prepare_rgb20_psbt,
+    rgbstd::{
         contract::FilterIncludeAll,
         persistence::{fs::FsBinStore, StashReadProvider, Stock},
         stl::AssetSpec,
@@ -181,6 +181,10 @@ fn decode_script_address_usage() -> &'static str {
 
 fn inspect_daemon_legacy_usage() -> &'static str {
     "usage: rgb-service inspect-daemon-legacy-account <config.toml> <account_id_or_address>"
+}
+
+fn repair_daemon_account_utxos_usage() -> &'static str {
+    "usage: rgb-service repair-daemon-account-utxos <config.toml> <account_id> <outpoint>..."
 }
 
 fn trace_wallet_v2_contract_usage() -> &'static str {
@@ -899,6 +903,48 @@ fn inspect_daemon_legacy_account(
     Ok(())
 }
 
+fn repair_daemon_account_utxos(
+    service: &LocalDaemonService,
+    account_id: &str,
+    outpoints: &[String],
+) -> rgb_service_api::Result<()> {
+    if outpoints.is_empty() {
+        return Err(RgbServiceError::InvalidRequest(
+            "at least one outpoint is required".to_string(),
+        ));
+    }
+    let existing = service
+        .list_account_utxos(account_id)?
+        .into_iter()
+        .map(|utxo| utxo.outpoint)
+        .collect::<BTreeSet<_>>();
+    service.remove_account_utxos(account_id, existing)?;
+
+    let address = Address::from_str(account_id)
+        .ok()
+        .map(|_| account_id.to_string());
+    for outpoint in outpoints {
+        OutPoint::from_str(outpoint)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        service.put_account_utxo(
+            account_id,
+            TrackedUtxo {
+                outpoint: outpoint.clone(),
+                address: address.clone(),
+                confirmed: true,
+            },
+        )?;
+    }
+    if address.is_some() {
+        service.put_legacy_address_account(account_id, account_id)?;
+    }
+    println!(
+        "repaired account_id={account_id} tracked_utxos={}",
+        outpoints.len()
+    );
+    Ok(())
+}
+
 fn parse_wallet_v2_data_dir_options(
     args: &[String],
 ) -> Result<WalletV2DataDirOptions, Box<dyn std::error::Error>> {
@@ -1001,6 +1047,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&config.service.data_dir)?;
         let service = LocalDaemonService::new(config).await?;
         inspect_daemon_legacy_account(&service, account_or_address)?;
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "repair-daemon-account-utxos")
+    {
+        let config_path = args.get(2).ok_or(repair_daemon_account_utxos_usage())?;
+        let account_id = args.get(3).ok_or(repair_daemon_account_utxos_usage())?;
+        let outpoints = args.get(4..).ok_or(repair_daemon_account_utxos_usage())?;
+        let config = load_config(config_path)?;
+        fs::create_dir_all(&config.service.data_dir)?;
+        let service = LocalDaemonService::new(config).await?;
+        repair_daemon_account_utxos(&service, account_id, outpoints)?;
         return Ok(());
     }
     if args
@@ -1926,32 +1985,8 @@ impl LocalDaemonService {
         &self,
         account_id: &str,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
-        let mut tracked = self.list_account_utxos(account_id)?;
-        let mut known_outpoints = tracked
-            .iter()
-            .map(|utxo| utxo.outpoint.clone())
-            .collect::<HashSet<_>>();
-        let stock_dir = self.account_stock_dir(account_id);
-        let allocation_outpoints = list_rgb20_allocation_outpoints(&stock_dir)
-            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-        let address = Address::from_str(account_id)
-            .ok()
-            .map(|_| account_id.to_string());
-        for outpoint in allocation_outpoints {
-            let outpoint = outpoint.to_string();
-            if !known_outpoints.insert(outpoint.clone()) {
-                continue;
-            }
-            let utxo = TrackedUtxo {
-                outpoint,
-                address: address.clone(),
-                confirmed: true,
-            };
-            self.put_account_utxo(account_id, utxo.clone())?;
-            tracked.push(utxo);
-        }
-
-        let utxos = tracked
+        let utxos = self
+            .list_account_utxos(account_id)?
             .into_iter()
             .map(|utxo| {
                 Ok(Rgb20TrackedUtxo {
