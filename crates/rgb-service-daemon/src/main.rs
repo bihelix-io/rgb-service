@@ -1350,13 +1350,9 @@ impl ConfiguredAuthVerifier {
     fn permission_purposes(permission: &Permission) -> &'static [&'static str] {
         match permission {
             Permission::ReadRnaBalance => &["read_rna_balance", "rna_balance"],
-            Permission::ReadAssets => &[
-                "read_assets",
-                "list_assets",
-                "assets_by_utxo",
-                "balance",
-                "balance_breakdown",
-            ],
+            Permission::ReadAssets => {
+                &["read_assets", "list_assets", "balance", "balance_breakdown"]
+            }
             Permission::IssueAsset => &["issue_asset"],
             Permission::PrepareTransfer => &["prepare_transfer"],
             Permission::CommitTransfer => &["commit_transfer"],
@@ -3243,12 +3239,8 @@ impl RgbServiceApi for LocalDaemonService {
 
     async fn assets_by_utxo(
         &self,
-        req: Authorized<UtxoAssetsRequest>,
+        payload: UtxoAssetsRequest,
     ) -> rgb_service_api::Result<UtxoAssetsResponse> {
-        let route = "/v1/assets/by-utxo";
-        let purpose = "assets_by_utxo";
-        let payload = req.payload;
-        self.charge_rna(&payload.account_id, route, purpose, self.rna.query_fee)?;
         let stock_dir = self.account_stock_dir(&payload.account_id);
         let outpoint = OutPoint::from_str(&payload.outpoint)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;

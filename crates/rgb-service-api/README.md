@@ -60,8 +60,8 @@ POST /v1/transfers/cancel
 POST /v1/test/rgb
 ```
 
-`POST /v1/assets/by-utxo` 使用 `ReadAssets` 权限和 `assets_by_utxo` 签名 purpose。
-请求 payload 包含 `account_id`、`outpoint`、可选 `address` 和 `confirmed`；响应包含
+`POST /v1/assets/by-utxo` 是只读接口，直接接收 JSON，不要求请求签名，也不扣 RNA。
+请求包含 `account_id`、`outpoint`、可选 `address` 和 `confirmed`；响应包含
 daemon stock 中该 outpoint 的 `assets` 元数据及 `allocations`。该接口只查询已经由
 daemon 接受并验证的 RGB 状态，不导入 consignment，也不根据 BTC dust 猜测 RGB 入账。
 

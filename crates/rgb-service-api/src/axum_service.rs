@@ -131,9 +131,8 @@ async fn list_assets(
 
 async fn assets_by_utxo(
     State(state): State<ApiState>,
-    Json(req): Json<SignedRequest<UtxoAssetsRequest>>,
+    Json(req): Json<UtxoAssetsRequest>,
 ) -> Result<Json<UtxoAssetsResponse>, HttpError> {
-    let req = authorize(&state, Permission::ReadAssets, req).await?;
     Ok(Json(state.service.assets_by_utxo(req).await?))
 }
 

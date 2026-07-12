@@ -78,11 +78,11 @@ impl RgbServiceApi for TestRgbService {
 
     async fn assets_by_utxo(
         &self,
-        req: Authorized<UtxoAssetsRequest>,
+        req: UtxoAssetsRequest,
     ) -> rgb_service_api::Result<UtxoAssetsResponse> {
-        let outpoint = req.payload.outpoint;
+        let outpoint = req.outpoint;
         Ok(UtxoAssetsResponse {
-            account_id: req.payload.account_id,
+            account_id: req.account_id,
             outpoint: outpoint.clone(),
             assets: vec![RgbAssetInfo {
                 asset_id: "rgb:asset-1".to_string(),
@@ -252,21 +252,17 @@ async fn token_list_route_is_public() {
 #[tokio::test]
 async fn assets_by_utxo_route_returns_allocations_for_outpoint() {
     let app = router(Arc::new(TestRgbService), Arc::new(AllowAllAuth));
-    let signed = SignedRequest {
-        payload: UtxoAssetsRequest {
-            account_id: account("alice"),
-            outpoint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1"
-                .to_string(),
-            address: Some("bc1qexample".to_string()),
-            confirmed: true,
-        },
-        signature: test_signature(),
+    let request = UtxoAssetsRequest {
+        account_id: account("alice"),
+        outpoint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1".to_string(),
+        address: Some("bc1qexample".to_string()),
+        confirmed: true,
     };
     let req = Request::builder()
         .method("POST")
         .uri("/v1/assets/by-utxo")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&signed).unwrap()))
+        .body(Body::from(serde_json::to_vec(&request).unwrap()))
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
