@@ -1949,7 +1949,7 @@ impl LocalDaemonService {
             .join(format!("{stock_name}_pending"))
     }
 
-    fn pending_status_is_terminal(status_path: &Path) -> bool {
+    fn pending_status(status_path: &Path) -> Option<String> {
         fs::read(status_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1959,6 +1959,10 @@ impl LocalDaemonService {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
+    }
+
+    fn pending_status_is_terminal(status_path: &Path) -> bool {
+        Self::pending_status(status_path)
             .is_some_and(|status| matches!(status.as_str(), "confirmed" | "invalid"))
     }
 
@@ -2046,6 +2050,21 @@ impl LocalDaemonService {
                     summary.pending += report.pending;
                     summary.skipped += report.skipped;
                     if report.promoted > 0 {
+                        if let Some(account_id) = stock_dir
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(|name| name.to_str())
+                        {
+                            let updated = self.mark_account_utxos_confirmed_for_txids(
+                                account_id,
+                                report.promoted_txids.iter().copied().collect(),
+                            )?;
+                            if updated > 0 {
+                                self.logger.info(format!(
+                                    "rgb pending recovery confirmed account utxos account_id={account_id} count={updated}"
+                                ));
+                            }
+                        }
                         self.logger.info(format!(
                             "rgb pending recovery promoted stock_dir={} txids={:?}",
                             stock_dir.display(),
@@ -2119,10 +2138,87 @@ impl LocalDaemonService {
         Ok(utxos)
     }
 
+    fn mark_account_utxos_confirmed_for_txids(
+        &self,
+        account_id: &str,
+        confirmed_txids: BTreeSet<Txid>,
+    ) -> rgb_service_api::Result<usize> {
+        if confirmed_txids.is_empty() {
+            return Ok(0);
+        }
+        let updates = self
+            .list_account_utxos(account_id)?
+            .into_iter()
+            .filter_map(|mut utxo| {
+                if utxo.confirmed {
+                    return None;
+                }
+                let outpoint = OutPoint::from_str(&utxo.outpoint).ok()?;
+                if !confirmed_txids.contains(&outpoint.txid) {
+                    return None;
+                }
+                utxo.confirmed = true;
+                Some(utxo)
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let keyspace = self
+            .db
+            .keyspace("account_utxos", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        for utxo in &updates {
+            let key = Self::account_utxo_key(account_id, &utxo.outpoint);
+            let bytes = serde_json::to_vec(utxo)
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            tx.insert(&keyspace, key.as_bytes(), bytes);
+        }
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        Ok(updates.len())
+    }
+
+    fn reconcile_account_utxo_confirmations(
+        &self,
+        account_id: &str,
+    ) -> rgb_service_api::Result<usize> {
+        let pending_root = Self::pending_stock_root(&self.account_stock_dir(account_id));
+        if !pending_root.exists() {
+            return Ok(0);
+        }
+        let entries = fs::read_dir(&pending_root).map_err(|err| {
+            RgbServiceError::Backend(format!(
+                "read RGB pending stock dir {}: {err}",
+                pending_root.display()
+            ))
+        })?;
+        let confirmed_txids = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                Self::pending_status(&entry.path().join("pending-status.json")).as_deref()
+                    == Some("confirmed")
+            })
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<Txid>().ok())
+            .collect::<BTreeSet<_>>();
+        self.mark_account_utxos_confirmed_for_txids(account_id, confirmed_txids)
+    }
+
     fn account_rgb20_utxos(
         &self,
         account_id: &str,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
+        let reconciled = self.reconcile_account_utxo_confirmations(account_id)?;
+        if reconciled > 0 {
+            self.logger.info(format!(
+                "reconciled confirmed rgb account utxos account_id={account_id} count={reconciled}"
+            ));
+        }
         let utxos = self
             .list_account_utxos(account_id)?
             .into_iter()
@@ -4463,6 +4559,99 @@ query_fee = 1
         assert_eq!(replay.balance_after, 100_007);
         assert_eq!(replay.current_balance, 100_007);
         assert!(replay.idempotent_replay);
+
+        drop(service);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_pending_stock_reconciles_account_utxo() {
+        let data_dir = env::temp_dir().join(format!(
+            "rgb-service-daemon-confirmation-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = LocalDaemonService::new(DaemonConfig {
+            service: ServiceConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: DaemonRnaConfig {
+                issue_fee: 1000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+        let account_id = "bc1q-confirmation-test";
+        let confirmed_txid =
+            Txid::from_str("3af5f6efa45256793e3cb85ca837e70cef5b3a5b3880bc4d175a0fb0d493539c")
+                .unwrap();
+        let invalid_txid =
+            Txid::from_str("755cf300000000000000000000000000000000000000000000000000000071f0")
+                .unwrap();
+        service
+            .put_account_utxo(
+                account_id,
+                TrackedUtxo {
+                    outpoint: format!("{confirmed_txid}:0"),
+                    address: Some(account_id.to_string()),
+                    confirmed: false,
+                },
+            )
+            .unwrap();
+        service
+            .put_account_utxo(
+                account_id,
+                TrackedUtxo {
+                    outpoint: format!("{invalid_txid}:1"),
+                    address: Some(account_id.to_string()),
+                    confirmed: false,
+                },
+            )
+            .unwrap();
+
+        let pending_root =
+            LocalDaemonService::pending_stock_root(&service.account_stock_dir(account_id));
+        let confirmed_dir = pending_root.join(confirmed_txid.to_string());
+        let invalid_dir = pending_root.join(invalid_txid.to_string());
+        fs::create_dir_all(&confirmed_dir).unwrap();
+        fs::create_dir_all(&invalid_dir).unwrap();
+        fs::write(
+            confirmed_dir.join("pending-status.json"),
+            serde_json::to_vec(&json!({"status": "confirmed"})).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            invalid_dir.join("pending-status.json"),
+            serde_json::to_vec(&json!({"status": "invalid"})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            service
+                .reconcile_account_utxo_confirmations(account_id)
+                .unwrap(),
+            1
+        );
+        let utxos = service.list_account_utxos(account_id).unwrap();
+        assert!(utxos
+            .iter()
+            .any(|utxo| utxo.outpoint == format!("{confirmed_txid}:0") && utxo.confirmed));
+        assert!(utxos
+            .iter()
+            .any(|utxo| utxo.outpoint == format!("{invalid_txid}:1") && !utxo.confirmed));
+        assert_eq!(
+            service
+                .reconcile_account_utxo_confirmations(account_id)
+                .unwrap(),
+            0
+        );
 
         drop(service);
         fs::remove_dir_all(data_dir).unwrap();
