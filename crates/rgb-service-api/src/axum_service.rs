@@ -28,6 +28,7 @@ pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> R
     let state = ApiState { service, auth };
     Router::new()
         .route("/v1/rna/balance", post(rna_balance))
+        .route("/v1/daemon-rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
         .route("/v1/assets/list", post(list_assets))
         .route("/v1/assets/by-utxo", post(assets_by_utxo))

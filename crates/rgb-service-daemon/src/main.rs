@@ -13,11 +13,13 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, State},
-    http::{header::CACHE_CONTROL, HeaderValue, Request},
+    extract::{ConnectInfo, Query, State},
+    http::{header::CACHE_CONTROL, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
+    routing::{get, post},
     serve,
+    Json, Router,
 };
 use bdk_electrum::electrum_client::{self, ElectrumApi};
 use bdk_esplora::esplora_client;
@@ -84,7 +86,8 @@ const ELECTRUM_TIMEOUT_SECS: u8 = 10;
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
     service: ServiceConfig,
-    rna: RnaConfig,
+    #[serde(rename = "daemon_rna", alias = "rna")]
+    daemon_rna: DaemonRnaConfig,
     #[serde(default)]
     legacy: LegacyConfig,
 }
@@ -150,22 +153,22 @@ fn default_legacy_reveal_address_count() -> u32 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RnaConfig {
+struct DaemonRnaConfig {
     issue_fee: u64,
     transfer_fee: u64,
     query_fee: u64,
 }
 
-impl RnaConfig {
+impl DaemonRnaConfig {
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.issue_fee == 0 {
-            return Err("rna.issue_fee must be greater than zero".into());
+            return Err("daemon_rna.issue_fee must be greater than zero".into());
         }
         if self.transfer_fee == 0 {
-            return Err("rna.transfer_fee must be greater than zero".into());
+            return Err("daemon_rna.transfer_fee must be greater than zero".into());
         }
         if self.query_fee == 0 {
-            return Err("rna.query_fee must be greater than zero".into());
+            return Err("daemon_rna.query_fee must be greater than zero".into());
         }
         Ok(())
     }
@@ -1103,6 +1106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_recovery_scanner(Arc::clone(&service));
     let auth = Arc::new(ConfiguredAuthVerifier);
     let mut app = router(service.clone(), auth);
+    app = app.merge(internal_daemon_rna_router(Arc::clone(&service)));
     if legacy_config.enabled {
         service
             .logger
@@ -1139,8 +1143,142 @@ fn load_config(path: &str) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
     if config.service.esplora_url.trim().is_empty() {
         return Err("service.esplora_url must not be empty".into());
     }
-    config.rna.validate()?;
+    config.daemon_rna.validate()?;
     Ok(config)
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalDaemonRnaBalanceQuery {
+    account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalDaemonRnaCreditRequest {
+    account_id: String,
+    amount: u64,
+    reason: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalDaemonRnaBalanceResponse {
+    account_id: String,
+    daemon_rna_balance: u64,
+    unit: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalDaemonRnaCreditResponse {
+    account_id: String,
+    amount: u64,
+    balance_before: u64,
+    balance_after: u64,
+    current_balance: u64,
+    unit: &'static str,
+    idempotent_replay: bool,
+}
+
+#[derive(Debug)]
+struct DaemonRnaCreditResult {
+    balance_before: u64,
+    balance_after: u64,
+    current_balance: u64,
+    idempotent_replay: bool,
+}
+
+type InternalHttpError = (StatusCode, Json<Value>);
+
+fn internal_daemon_rna_router(service: Arc<LocalDaemonService>) -> Router {
+    Router::new()
+        .route(
+            "/internal/daemon-rna/balance",
+            get(internal_daemon_rna_balance),
+        )
+        .route(
+            "/internal/daemon-rna/credit",
+            post(internal_daemon_rna_credit),
+        )
+        .with_state(service)
+}
+
+fn require_loopback(remote: SocketAddr) -> Result<(), InternalHttpError> {
+    if remote.ip().is_loopback() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "DAEMON_RNA internal endpoint is loopback-only"})),
+    ))
+}
+
+fn internal_backend_error(service: &LocalDaemonService, err: RgbServiceError) -> InternalHttpError {
+    let status = match &err {
+        RgbServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        RgbServiceError::Forbidden(_) => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    service
+        .logger
+        .warn(format!("DAEMON_RNA internal endpoint failed: {err}"));
+    (
+        status,
+        Json(json!({"error": "DAEMON_RNA operation failed"})),
+    )
+}
+
+async fn internal_daemon_rna_balance(
+    State(service): State<Arc<LocalDaemonService>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Query(query): Query<InternalDaemonRnaBalanceQuery>,
+) -> Result<Json<InternalDaemonRnaBalanceResponse>, InternalHttpError> {
+    require_loopback(remote)?;
+    let profile = service
+        .get_or_create_profile(&query.account_id)
+        .map_err(|err| internal_backend_error(&service, err))?;
+    let balance = LocalDaemonService::profile_daemon_rna_balance(&profile)
+        .map_err(|err| internal_backend_error(&service, err))?;
+    Ok(Json(InternalDaemonRnaBalanceResponse {
+        account_id: query.account_id,
+        daemon_rna_balance: balance,
+        unit: "DAEMON_RNA",
+    }))
+}
+
+async fn internal_daemon_rna_credit(
+    State(service): State<Arc<LocalDaemonService>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    Json(req): Json<InternalDaemonRnaCreditRequest>,
+) -> Result<Json<InternalDaemonRnaCreditResponse>, InternalHttpError> {
+    require_loopback(remote)?;
+    if req.account_id.trim().is_empty()
+        || req.amount == 0
+        || req.reason.trim().is_empty()
+        || req.idempotency_key.trim().is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "account_id, positive amount, reason and idempotency_key are required"
+            })),
+        ));
+    }
+    let credited = service
+        .credit_daemon_rna(
+            &req.account_id,
+            req.amount,
+            &req.reason,
+            &req.idempotency_key,
+        )
+        .map_err(|err| internal_backend_error(&service, err))?;
+    Ok(Json(InternalDaemonRnaCreditResponse {
+        account_id: req.account_id,
+        amount: req.amount,
+        balance_before: credited.balance_before,
+        balance_after: credited.balance_after,
+        current_balance: credited.current_balance,
+        unit: "DAEMON_RNA",
+        idempotent_replay: credited.idempotent_replay,
+    }))
 }
 
 async fn access_log_middleware(
@@ -1488,10 +1626,11 @@ impl AuthVerifier for ConfiguredAuthVerifier {
 
 struct LocalDaemonService {
     config: ServiceConfig,
-    rna: RnaConfig,
+    daemon_rna: DaemonRnaConfig,
     db: SingleWriterTxDatabase,
     logger: DaemonLogger,
     pending_stock_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
+    daemon_rna_mutation: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -1747,8 +1886,10 @@ impl LocalDaemonService {
         fs::create_dir_all(&kv_dir)?;
         let db = SingleWriterTxDatabase::builder(&kv_dir).open()?;
         logger.info(format!(
-            "rna issue_fee={} transfer_fee={} query_fee={}",
-            config.rna.issue_fee, config.rna.transfer_fee, config.rna.query_fee
+            "DAEMON_RNA issue_fee={} transfer_fee={} query_fee={}",
+            config.daemon_rna.issue_fee,
+            config.daemon_rna.transfer_fee,
+            config.daemon_rna.query_fee
         ));
         let pending_stock_dirs = Self::discover_pending_stock_dirs(&config.service.data_dir)?;
         logger.info(format!(
@@ -1757,10 +1898,11 @@ impl LocalDaemonService {
         ));
         Ok(Self {
             config: config.service,
-            rna: config.rna,
+            daemon_rna: config.daemon_rna,
             db,
             logger,
             pending_stock_dirs: Arc::new(Mutex::new(pending_stock_dirs)),
+            daemon_rna_mutation: Mutex::new(()),
         })
     }
 
@@ -2899,6 +3041,8 @@ impl LocalDaemonService {
     fn new_profile(&self, id: &str, now: u64) -> Value {
         json!({
             "id": id,
+            "daemon_rna_balance": 0_u64,
+            // Kept in sync for clients and data readers deployed before the rename.
             "rna_balance": 0_u64,
             "created_at_ms": now,
             "updated_at_ms": now
@@ -2927,13 +3071,21 @@ impl LocalDaemonService {
         Ok(Some(dynamic_to_json_value(&dynamic)?))
     }
 
-    fn profile_rna_balance(profile: &Value) -> rgb_service_api::Result<u64> {
+    fn profile_daemon_rna_balance(profile: &Value) -> rgb_service_api::Result<u64> {
         profile
-            .get("rna_balance")
+            .get("daemon_rna_balance")
+            .or_else(|| profile.get("rna_balance"))
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                RgbServiceError::Backend("profile missing numeric rna_balance".to_string())
+                RgbServiceError::Backend(
+                    "profile missing numeric daemon_rna_balance/rna_balance".to_string(),
+                )
             })
+    }
+
+    fn set_profile_daemon_rna_balance(profile: &mut Value, balance: u64) {
+        profile["daemon_rna_balance"] = json!(balance);
+        profile["rna_balance"] = json!(balance);
     }
 
     fn put_profile(&self, id: &str, profile: &Value) -> rgb_service_api::Result<()> {
@@ -2965,7 +3117,7 @@ impl LocalDaemonService {
         Ok(profile)
     }
 
-    fn charge_rna(
+    fn charge_daemon_rna(
         &self,
         account_id: &str,
         route: &str,
@@ -2974,9 +3126,12 @@ impl LocalDaemonService {
     ) -> rgb_service_api::Result<u64> {
         if account_id.trim().is_empty() {
             return Err(RgbServiceError::Unauthorized(
-                "account_id must not be empty for RNA metering".to_string(),
+                "account_id must not be empty for DAEMON_RNA metering".to_string(),
             ));
         }
+        let _mutation = self.daemon_rna_mutation.lock().map_err(|_| {
+            RgbServiceError::Backend("DAEMON_RNA mutation lock poisoned".to_string())
+        })?;
         let now = now_ms();
         let profile_keyspace = self
             .db
@@ -2989,20 +3144,21 @@ impl LocalDaemonService {
         let mut profile = self
             .load_profile(account_id)?
             .unwrap_or_else(|| self.new_profile(account_id, now));
-        let current = Self::profile_rna_balance(&profile)?;
+        let current = Self::profile_daemon_rna_balance(&profile)?;
         if current < amount {
             return Err(RgbServiceError::Forbidden(format!(
-                "insufficient RNA balance for {purpose}: required {amount}, available {current}"
+                "insufficient DAEMON_RNA balance for {purpose}: required {amount}, available {current}"
             )));
         }
         let new_balance = current - amount;
-        profile["rna_balance"] = json!(new_balance);
+        Self::set_profile_daemon_rna_balance(&mut profile, new_balance);
         profile["updated_at_ms"] = json!(now);
         let event_id = format!("{now}:{account_id}:{purpose}");
         let event = json!({
             "event_id": event_id,
             "account_id": account_id,
             "kind": "debit",
+            "unit": "DAEMON_RNA",
             "route": route,
             "purpose": purpose,
             "amount": amount,
@@ -3022,12 +3178,12 @@ impl LocalDaemonService {
             .persist(PersistMode::SyncAll)
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         self.logger.info(format!(
-            "rna debit account_id={account_id} purpose={purpose} amount={amount} balance_after={new_balance}"
+            "DAEMON_RNA debit account_id={account_id} purpose={purpose} amount={amount} balance_after={new_balance}"
         ));
         Ok(new_balance)
     }
 
-    fn refund_rna(
+    fn refund_daemon_rna(
         &self,
         account_id: &str,
         route: &str,
@@ -3035,6 +3191,9 @@ impl LocalDaemonService {
         amount: u64,
         reason: &str,
     ) -> rgb_service_api::Result<u64> {
+        let _mutation = self.daemon_rna_mutation.lock().map_err(|_| {
+            RgbServiceError::Backend("DAEMON_RNA mutation lock poisoned".to_string())
+        })?;
         let now = now_ms();
         let profile_keyspace = self
             .db
@@ -3046,20 +3205,21 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         let mut profile = self.load_profile(account_id)?.ok_or_else(|| {
             RgbServiceError::Backend(format!(
-                "profile missing for RNA refund account_id={account_id}"
+                "profile missing for DAEMON_RNA refund account_id={account_id}"
             ))
         })?;
-        let current = Self::profile_rna_balance(&profile)?;
+        let current = Self::profile_daemon_rna_balance(&profile)?;
         let new_balance = current
             .checked_add(amount)
-            .ok_or_else(|| RgbServiceError::Backend("RNA balance overflow".to_string()))?;
-        profile["rna_balance"] = json!(new_balance);
+            .ok_or_else(|| RgbServiceError::Backend("DAEMON_RNA balance overflow".to_string()))?;
+        Self::set_profile_daemon_rna_balance(&mut profile, new_balance);
         profile["updated_at_ms"] = json!(now);
         let event_id = format!("{now}:{account_id}:{purpose}:refund");
         let event = json!({
             "event_id": event_id,
             "account_id": account_id,
             "kind": "refund",
+            "unit": "DAEMON_RNA",
             "route": route,
             "purpose": purpose,
             "amount": amount,
@@ -3080,12 +3240,140 @@ impl LocalDaemonService {
             .persist(PersistMode::SyncAll)
             .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
         self.logger.info(format!(
-            "rna refund account_id={account_id} purpose={purpose} amount={amount} balance_after={new_balance} reason={reason}"
+            "DAEMON_RNA refund account_id={account_id} purpose={purpose} amount={amount} balance_after={new_balance} reason={reason}"
         ));
         Ok(new_balance)
     }
 
-    fn refund_rna_on_error<T>(
+    fn credit_daemon_rna(
+        &self,
+        account_id: &str,
+        amount: u64,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> rgb_service_api::Result<DaemonRnaCreditResult> {
+        if account_id.trim().is_empty()
+            || amount == 0
+            || reason.trim().is_empty()
+            || idempotency_key.trim().is_empty()
+        {
+            return Err(RgbServiceError::InvalidRequest(
+                "account_id, positive amount, reason and idempotency_key are required".to_string(),
+            ));
+        }
+        if account_id.len() > 256 || reason.len() > 512 || idempotency_key.len() > 128 {
+            return Err(RgbServiceError::InvalidRequest(
+                "DAEMON_RNA credit request field is too long".to_string(),
+            ));
+        }
+
+        let _mutation = self.daemon_rna_mutation.lock().map_err(|_| {
+            RgbServiceError::Backend("DAEMON_RNA mutation lock poisoned".to_string())
+        })?;
+        let now = now_ms();
+        let profile_keyspace = self
+            .db
+            .keyspace("profiles", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let logs_keyspace = self
+            .db
+            .keyspace("usage_logs", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let idempotency_digest =
+            sha256::Hash::hash(format!("{account_id}\0{idempotency_key}").as_bytes());
+        let event_id = format!("daemon-rna-credit:{idempotency_digest}");
+
+        if let Some(bytes) = logs_keyspace
+            .get(event_id.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+        {
+            let event: Value = serde_json::from_slice(bytes.as_ref())
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let recorded_amount = event.get("amount").and_then(Value::as_u64).ok_or_else(|| {
+                RgbServiceError::Backend(
+                    "DAEMON_RNA credit event missing numeric amount".to_string(),
+                )
+            })?;
+            if recorded_amount != amount {
+                return Err(RgbServiceError::InvalidRequest(
+                    "idempotency_key was already used with a different amount".to_string(),
+                ));
+            }
+            let balance_before = event
+                .get("balance_before")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    RgbServiceError::Backend(
+                        "DAEMON_RNA credit event missing balance_before".to_string(),
+                    )
+                })?;
+            let balance_after = event
+                .get("balance_after")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    RgbServiceError::Backend(
+                        "DAEMON_RNA credit event missing balance_after".to_string(),
+                    )
+                })?;
+            let profile = self.load_profile(account_id)?.ok_or_else(|| {
+                RgbServiceError::Backend(format!(
+                    "profile missing for replayed DAEMON_RNA credit account_id={account_id}"
+                ))
+            })?;
+            return Ok(DaemonRnaCreditResult {
+                balance_before,
+                balance_after,
+                current_balance: Self::profile_daemon_rna_balance(&profile)?,
+                idempotent_replay: true,
+            });
+        }
+
+        let mut profile = self
+            .load_profile(account_id)?
+            .unwrap_or_else(|| self.new_profile(account_id, now));
+        let balance_before = Self::profile_daemon_rna_balance(&profile)?;
+        let balance_after = balance_before
+            .checked_add(amount)
+            .ok_or_else(|| RgbServiceError::Backend("DAEMON_RNA balance overflow".to_string()))?;
+        Self::set_profile_daemon_rna_balance(&mut profile, balance_after);
+        profile["updated_at_ms"] = json!(now);
+        let event = json!({
+            "event_id": event_id,
+            "account_id": account_id,
+            "kind": "credit",
+            "unit": "DAEMON_RNA",
+            "route": "/internal/daemon-rna/credit",
+            "purpose": "manual_credit",
+            "amount": amount,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "reason": reason,
+            "idempotency_key": idempotency_key,
+            "created_at_ms": now
+        });
+        let profile_bytes = dynamic_to_msgpack(&json_value_to_dynamic(&profile)?);
+        let event_bytes =
+            serde_json::to_vec(&event).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&profile_keyspace, account_id.as_bytes(), profile_bytes);
+        tx.insert(&logs_keyspace, event_id.as_bytes(), event_bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.logger.info(format!(
+            "DAEMON_RNA credit account_id={account_id} amount={amount} balance_before={balance_before} balance_after={balance_after} reason={reason} idempotency_key={idempotency_key}"
+        ));
+        Ok(DaemonRnaCreditResult {
+            balance_before,
+            balance_after,
+            current_balance: balance_after,
+            idempotent_replay: false,
+        })
+    }
+
+    fn refund_daemon_rna_on_error<T>(
         &self,
         result: rgb_service_api::Result<T>,
         account_id: &str,
@@ -3095,10 +3383,10 @@ impl LocalDaemonService {
     ) -> rgb_service_api::Result<T> {
         if let Err(err) = &result {
             if let Err(refund_err) =
-                self.refund_rna(account_id, route, purpose, amount, &err.to_string())
+                self.refund_daemon_rna(account_id, route, purpose, amount, &err.to_string())
             {
                 self.logger.info(format!(
-                    "rna refund failed account_id={account_id} purpose={purpose} amount={amount} error={refund_err}"
+                    "DAEMON_RNA refund failed account_id={account_id} purpose={purpose} amount={amount} error={refund_err}"
                 ));
             }
         }
@@ -3113,13 +3401,16 @@ impl RgbServiceApi for LocalDaemonService {
         req: Authorized<RnaBalanceRequest>,
     ) -> rgb_service_api::Result<RnaBalanceResponse> {
         let profile = self.get_or_create_profile(&req.payload.account_id)?;
+        let daemon_rna_balance = Self::profile_daemon_rna_balance(&profile)?;
         Ok(RnaBalanceResponse {
             account_id: req.payload.account_id,
-            rna_balance: Self::profile_rna_balance(&profile)?,
+            daemon_rna_balance,
+            rna_balance: daemon_rna_balance,
+            unit: "DAEMON_RNA".to_string(),
             new_profile_grant: 0,
-            issue_fee: self.rna.issue_fee,
-            transfer_fee: self.rna.transfer_fee,
-            query_fee: self.rna.query_fee,
+            issue_fee: self.daemon_rna.issue_fee,
+            transfer_fee: self.daemon_rna.transfer_fee,
+            query_fee: self.daemon_rna.query_fee,
         })
     }
 
@@ -3129,13 +3420,13 @@ impl RgbServiceApi for LocalDaemonService {
     ) -> rgb_service_api::Result<IssueAssetResponse> {
         let route = "/v1/assets/issue";
         let purpose = "issue_asset";
-        let amount = self.rna.issue_fee;
+        let amount = self.daemon_rna.issue_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         let ticker = payload.ticker.clone();
         let allocation_outpoint = payload.allocation_outpoint.clone();
         let issued_utxo = Self::issue_utxo(allocation_outpoint.clone(), payload.utxos.clone());
-        self.charge_rna(&account_id, route, purpose, amount)?;
+        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
         let result = (|| {
             let stock_dir = self.account_stock_dir(&account_id);
             let outpoint = OutPoint::from_str(&payload.allocation_outpoint)
@@ -3169,18 +3460,18 @@ impl RgbServiceApi for LocalDaemonService {
                 "rgb issue failed account_id={account_id} ticker={ticker} allocation_outpoint={allocation_outpoint} error={err}"
             )),
         }
-        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
+        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn list_assets(
         &self,
         req: Authorized<ListAssetsRequest>,
     ) -> rgb_service_api::Result<ListAssetsResponse> {
-        self.charge_rna(
+        self.charge_daemon_rna(
             &req.payload.account_id,
             "/v1/assets/list",
             "list_assets",
-            self.rna.query_fee,
+            self.daemon_rna.query_fee,
         )?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
@@ -3420,7 +3711,7 @@ impl RgbServiceApi for LocalDaemonService {
     ) -> rgb_service_api::Result<PrepareTransferResponse> {
         let route = "/v1/transfers/prepare";
         let purpose = "prepare_transfer";
-        let amount = self.rna.transfer_fee;
+        let amount = self.daemon_rna.transfer_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.recipient.trim().is_empty() {
@@ -3428,7 +3719,7 @@ impl RgbServiceApi for LocalDaemonService {
                 "recipient account_id must not be empty".to_string(),
             ));
         }
-        self.charge_rna(&account_id, route, purpose, amount)?;
+        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
         let result = (|| {
             let stock_dir = self.account_stock_dir(&account_id);
             let psbt = payload
@@ -3483,7 +3774,7 @@ impl RgbServiceApi for LocalDaemonService {
                 anchor_psbt: Some(hex_encode(&prepared.psbt.serialize())),
             })
         })();
-        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
+        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn commit_transfer(
@@ -3578,7 +3869,7 @@ impl RgbServiceApi for LocalDaemonService {
     ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
         let route = "/v1/ln/channels/open/prepare";
         let purpose = "ln_channel_open_prepare";
-        let amount = self.rna.transfer_fee;
+        let amount = self.daemon_rna.transfer_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.channel_id.trim().is_empty() {
@@ -3627,7 +3918,7 @@ impl RgbServiceApi for LocalDaemonService {
                 "RGB LN funding PSBT must include an OP_RETURN carrier output".to_string(),
             ));
         }
-        self.charge_rna(&account_id, route, purpose, amount)?;
+        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
         let result = (|| {
             let operation_id = Self::require_nonce(&payload.asset_authorization)?;
             let stock_dir = self.account_stock_dir(&account_id);
@@ -3676,7 +3967,7 @@ impl RgbServiceApi for LocalDaemonService {
                 anchor_psbt: hex_encode(&prepared.psbt.serialize()),
             })
         })();
-        self.refund_rna_on_error(result, &account_id, route, purpose, amount)
+        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
     }
 
     async fn ln_channel_funding_ref(
@@ -4066,6 +4357,116 @@ fn hex_decode(value: &str) -> rgb_service_api::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use bitcoin::secp256k1::SecretKey;
+
+    fn daemon_config_with_metering_section(section: &str) -> String {
+        format!(
+            r#"
+[service]
+bind = "127.0.0.1:8091"
+network = "mainnet"
+data_dir = "/tmp/rgb-service-test"
+esplora_url = "https://example.invalid"
+
+[{section}]
+issue_fee = 1000
+transfer_fee = 100
+query_fee = 1
+"#
+        )
+    }
+
+    #[test]
+    fn daemon_rna_config_accepts_legacy_rna_section() {
+        let config: DaemonConfig =
+            toml::from_str(&daemon_config_with_metering_section("rna")).unwrap();
+        assert_eq!(config.daemon_rna.issue_fee, 1000);
+        assert_eq!(config.daemon_rna.transfer_fee, 100);
+        assert_eq!(config.daemon_rna.query_fee, 1);
+    }
+
+    #[test]
+    fn daemon_rna_config_accepts_renamed_section() {
+        let config: DaemonConfig =
+            toml::from_str(&daemon_config_with_metering_section("daemon_rna")).unwrap();
+        assert_eq!(config.daemon_rna.issue_fee, 1000);
+        assert_eq!(config.daemon_rna.transfer_fee, 100);
+        assert_eq!(config.daemon_rna.query_fee, 1);
+    }
+
+    #[test]
+    fn daemon_rna_balance_reads_legacy_profile_and_prefers_new_field() {
+        let legacy = json!({"rna_balance": 42_u64});
+        assert_eq!(
+            LocalDaemonService::profile_daemon_rna_balance(&legacy).unwrap(),
+            42
+        );
+
+        let migrated = json!({
+            "daemon_rna_balance": 43_u64,
+            "rna_balance": 42_u64
+        });
+        assert_eq!(
+            LocalDaemonService::profile_daemon_rna_balance(&migrated).unwrap(),
+            43
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_rna_credit_migrates_legacy_balance_and_is_idempotent() {
+        let data_dir = env::temp_dir().join(format!(
+            "rgb-service-daemon-rna-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = LocalDaemonService::new(DaemonConfig {
+            service: ServiceConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: DaemonRnaConfig {
+                issue_fee: 1000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+        service
+            .put_profile(
+                "ln-hot-wallet",
+                &json!({
+                    "id": "ln-hot-wallet",
+                    "rna_balance": 7_u64,
+                    "created_at_ms": now_ms(),
+                    "updated_at_ms": now_ms()
+                }),
+            )
+            .unwrap();
+
+        let credited = service
+            .credit_daemon_rna("ln-hot-wallet", 100_000, "test seed", "test-seed-1")
+            .unwrap();
+        assert_eq!(credited.balance_before, 7);
+        assert_eq!(credited.balance_after, 100_007);
+        assert!(!credited.idempotent_replay);
+        let profile = service.load_profile("ln-hot-wallet").unwrap().unwrap();
+        assert_eq!(profile["daemon_rna_balance"], json!(100_007_u64));
+        assert_eq!(profile["rna_balance"], json!(100_007_u64));
+
+        let replay = service
+            .credit_daemon_rna("ln-hot-wallet", 100_000, "test seed", "test-seed-1")
+            .unwrap();
+        assert_eq!(replay.balance_after, 100_007);
+        assert_eq!(replay.current_balance, 100_007);
+        assert!(replay.idempotent_replay);
+
+        drop(service);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
 
     #[test]
     fn parse_network_accepts_mainnet_alias() {

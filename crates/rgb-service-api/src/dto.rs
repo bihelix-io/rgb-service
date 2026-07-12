@@ -25,7 +25,12 @@ pub struct RnaBalanceRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RnaBalanceResponse {
     pub account_id: AccountId,
+    #[serde(default)]
+    pub daemon_rna_balance: u64,
+    /// Legacy compatibility alias for `daemon_rna_balance`.
     pub rna_balance: u64,
+    #[serde(default)]
+    pub unit: String,
     pub new_profile_grant: u64,
     pub issue_fee: u64,
     pub transfer_fee: u64,

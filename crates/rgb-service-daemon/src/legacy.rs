@@ -899,7 +899,7 @@ fn legacy_rgb_fee_amount(state: &LegacyState) -> u64 {
     state
         .config
         .rgb_fee_amount
-        .unwrap_or(state.service.rna.transfer_fee)
+        .unwrap_or(state.service.daemon_rna.transfer_fee)
 }
 
 fn parse_legacy_rgb_assignments(
