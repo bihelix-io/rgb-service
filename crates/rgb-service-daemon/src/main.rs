@@ -65,6 +65,7 @@ use rgb_service_local::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal};
+use tower_http::cors::CorsLayer;
 
 mod legacy;
 
@@ -1117,6 +1118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&service),
         access_log_middleware,
     ));
+    app = app.layer(CorsLayer::very_permissive());
     let listener = TcpListener::bind(bind).await?;
 
     serve(
@@ -4505,7 +4507,10 @@ fn hex_decode(value: &str) -> rgb_service_api::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{header, Method};
+    use axum::routing::put;
     use bitcoin::secp256k1::SecretKey;
+    use tower::ServiceExt;
 
     fn daemon_config_with_metering_section(section: &str) -> String {
         format!(
@@ -4531,6 +4536,36 @@ query_fee = 1
         assert_eq!(config.daemon_rna.issue_fee, 1000);
         assert_eq!(config.daemon_rna.transfer_fee, 100);
         assert_eq!(config.daemon_rna.query_fee, 1);
+    }
+
+    #[tokio::test]
+    async fn cors_allows_legacy_account_create_preflight() {
+        let app = Router::new()
+            .route(
+                "/account/create",
+                put(|| async { StatusCode::OK }),
+            )
+            .layer(CorsLayer::very_permissive());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/account/create")
+                    .header(header::ORIGIN, "https://wallet.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS));
     }
 
     #[test]
