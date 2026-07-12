@@ -443,11 +443,18 @@ fn legacy_desc_account_ids(
         .network(state.service.network()?)
         .create_wallet_no_persist()
         .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-    for index in 0..state.config.reveal_address_count.max(1) {
+    for index in 0..=state.config.reveal_address_count.max(1) {
         let address = wallet
             .peek_address(KeychainKind::External, index)
             .address
             .to_string();
+        // Receiver consignments are stored under their address account before
+        // a legacy wallet registers its descriptor. Keep that address-owned
+        // stock reachable after `/account/create` installs the address -> desc
+        // mapping; otherwise registration makes an existing balance disappear.
+        if state.service.account_stock_dir(&address).exists() && seen.insert(address.clone()) {
+            account_ids.push(address.clone());
+        }
         if let Some(account_id) = state.service.resolve_legacy_account_id_for_address(&address)? {
             if seen.insert(account_id.clone()) {
                 account_ids.push(account_id);
