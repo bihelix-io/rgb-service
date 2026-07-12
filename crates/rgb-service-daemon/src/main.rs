@@ -49,8 +49,8 @@ use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
     import_rgb20_stock_and_allocations,
     issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
-    list_rgb20_assets_for_utxos, list_rgb20_contracts, normalize_electrum_url, prepare_rgb20_psbt,
-    rgbstd::{
+    list_rgb20_allocation_outpoints, list_rgb20_assets_for_utxos, list_rgb20_contracts,
+    normalize_electrum_url, prepare_rgb20_psbt, rgbstd::{
         contract::FilterIncludeAll,
         persistence::{fs::FsBinStore, StashReadProvider, Stock},
         stl::AssetSpec,
@@ -1926,8 +1926,32 @@ impl LocalDaemonService {
         &self,
         account_id: &str,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
-        let utxos = self
-            .list_account_utxos(account_id)?
+        let mut tracked = self.list_account_utxos(account_id)?;
+        let mut known_outpoints = tracked
+            .iter()
+            .map(|utxo| utxo.outpoint.clone())
+            .collect::<HashSet<_>>();
+        let stock_dir = self.account_stock_dir(account_id);
+        let allocation_outpoints = list_rgb20_allocation_outpoints(&stock_dir)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let address = Address::from_str(account_id)
+            .ok()
+            .map(|_| account_id.to_string());
+        for outpoint in allocation_outpoints {
+            let outpoint = outpoint.to_string();
+            if !known_outpoints.insert(outpoint.clone()) {
+                continue;
+            }
+            let utxo = TrackedUtxo {
+                outpoint,
+                address: address.clone(),
+                confirmed: true,
+            };
+            self.put_account_utxo(account_id, utxo.clone())?;
+            tracked.push(utxo);
+        }
+
+        let utxos = tracked
             .into_iter()
             .map(|utxo| {
                 Ok(Rgb20TrackedUtxo {
@@ -2440,13 +2464,15 @@ impl LocalDaemonService {
                     confirmed: Some(allocation.confirmed),
                 });
         }
-        self.remove_account_utxos(
-            account_id,
-            known_outpoints
-                .difference(&rgb_outpoints)
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-        )?;
+        if !Self::stock_has_active_pending(&stock_dir) {
+            self.remove_account_utxos(
+                account_id,
+                known_outpoints
+                    .difference(&rgb_outpoints)
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+            )?;
+        }
         Ok(ListAssetsResponse {
             assets,
             utxo_assets,

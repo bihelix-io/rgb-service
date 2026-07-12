@@ -903,6 +903,30 @@ pub fn list_rgb20_assets_for_utxos(
     list_rgb20_assets_from_stock(&stock, utxos)
 }
 
+pub fn list_rgb20_allocation_outpoints(stock_dir: &Path) -> Result<Vec<OutPoint>> {
+    let stock = open_or_create_stock(stock_dir)?;
+    let mut outpoints = HashSet::new();
+
+    for contract in stock
+        .contracts()
+        .map_err(|err| anyhow!("failed to list RGB contracts: {err:?}"))?
+    {
+        let contract_data = stock
+            .contract_data(contract.id)
+            .map_err(|err| anyhow!("failed to load RGB contract data: {err:?}"))?;
+        let Ok(allocations) = contract_data.fungible("assetOwner", FilterIncludeAll) else {
+            continue;
+        };
+        outpoints.extend(
+            allocations
+                .into_iter()
+                .map(|allocation| allocation.seal.to_outpoint()),
+        );
+    }
+
+    Ok(outpoints.into_iter().collect())
+}
+
 fn list_rgb20_assets_from_stock(
     stock: &Stock,
     utxos: impl IntoIterator<Item = Rgb20TrackedUtxo>,
