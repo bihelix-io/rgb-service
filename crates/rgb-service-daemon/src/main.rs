@@ -2050,6 +2050,17 @@ impl LocalDaemonService {
                     summary.pending += report.pending;
                     summary.skipped += report.skipped;
                     if report.promoted > 0 {
+                        match self.sync_token_catalog_from_stock(&stock_dir) {
+                            Ok(added) if added > 0 => self.logger.info(format!(
+                                "rgb pending recovery registered token catalog stock_dir={} count={added}",
+                                stock_dir.display()
+                            )),
+                            Ok(_) => {}
+                            Err(err) => self.logger.info(format!(
+                                "rgb pending recovery token catalog sync failed stock_dir={} error={err}",
+                                stock_dir.display()
+                            )),
+                        }
                         if let Some(account_id) = stock_dir
                             .parent()
                             .and_then(Path::file_name)
@@ -2376,6 +2387,45 @@ impl LocalDaemonService {
         Ok(entries)
     }
 
+    fn put_token_catalog_entry(
+        &self,
+        entry: &TokenCatalogEntry,
+    ) -> rgb_service_api::Result<()> {
+        let keyspace = self
+            .db
+            .keyspace("token_catalog", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec(entry).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&keyspace, entry.contract_id.as_bytes(), bytes);
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    fn sync_token_catalog_from_stock(&self, stock_dir: &Path) -> rgb_service_api::Result<usize> {
+        let contracts = list_rgb20_contracts(stock_dir)
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let mut added = 0;
+        for contract in contracts {
+            let contract_id = contract.contract_id.to_string();
+            if self.get_token_catalog_entry(&contract_id)?.is_some() {
+                continue;
+            }
+            self.put_token_catalog_entry(&TokenCatalogEntry::empty(
+                contract_id,
+                contract.ticker,
+                contract.name,
+                contract.precision,
+            ))?;
+            added += 1;
+        }
+        Ok(added)
+    }
+
     fn catalog_entry_for_contract(
         &self,
         contract_id: String,
@@ -2383,9 +2433,12 @@ impl LocalDaemonService {
         name: String,
         precision: u8,
     ) -> rgb_service_api::Result<TokenCatalogEntry> {
-        Ok(self
-            .get_token_catalog_entry(&contract_id)?
-            .unwrap_or_else(|| TokenCatalogEntry::empty(contract_id, ticker, name, precision)))
+        if let Some(entry) = self.get_token_catalog_entry(&contract_id)? {
+            return Ok(entry);
+        }
+        let entry = TokenCatalogEntry::empty(contract_id, ticker, name, precision);
+        self.put_token_catalog_entry(&entry)?;
+        Ok(entry)
     }
 
     pub(crate) fn put_legacy_address_account(
@@ -4652,6 +4705,50 @@ query_fee = 1
                 .unwrap(),
             0
         );
+
+        drop(service);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovered_token_catalog_entry_is_persisted() {
+        let data_dir = env::temp_dir().join(format!(
+            "rgb-service-daemon-token-catalog-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = LocalDaemonService::new(DaemonConfig {
+            service: ServiceConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: DaemonRnaConfig {
+                issue_fee: 1000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+
+        let contract_id = "rgb:test-token-catalog".to_string();
+        let discovered = service
+            .catalog_entry_for_contract(
+                contract_id.clone(),
+                "MCU616".to_string(),
+                "MCU616".to_string(),
+                8,
+            )
+            .unwrap();
+        assert_eq!(discovered.contract_id, contract_id);
+        let entries = service.list_token_catalog_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ticker, "MCU616");
+        assert_eq!(entries[0].precision, 8);
 
         drop(service);
         fs::remove_dir_all(data_dir).unwrap();
