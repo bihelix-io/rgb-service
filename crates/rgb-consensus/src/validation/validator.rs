@@ -26,7 +26,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use amplify::confinement::{Collection, ConfinedOrdMap};
-use bitcoin::{Transaction as Tx, Txid};
+use bitcoin::{Transaction as Tx, TxOut, Txid};
 use strict_types::TypeSystem;
 
 use super::status::{Failure, Warning};
@@ -44,6 +44,26 @@ use crate::{
     AssignmentType, Assignments, BundleId, ChainNet, ContractId, KnownTransition, OpId, Operation,
     Opout, RevealedState, SchemaId, TransitionBundle,
 };
+
+fn dbc_output_matches_method(outputs: &[TxOut], proof_method: CloseMethod) -> Option<bool> {
+    let mut has_dbc_output = false;
+
+    for output in outputs {
+        let output_method = if output.script_pubkey.is_op_return() {
+            CloseMethod::OpretFirst
+        } else if output.script_pubkey.is_p2tr() {
+            CloseMethod::TapretFirst
+        } else {
+            continue;
+        };
+        has_dbc_output = true;
+        if output_method == proof_method {
+            return Some(true);
+        }
+    }
+
+    has_dbc_output.then_some(false)
+}
 
 /// Error validating a consignment.
 #[derive(Clone, PartialEq, Eq, Debug, Display, Error, From)]
@@ -461,22 +481,15 @@ impl<
             }
             Ok(commitment) => {
                 // [VALIDATION]: Verify commitment
-                let Some(output) =
-                    witness.tx.output.iter().find(|out| {
-                        out.script_pubkey.is_op_return() || out.script_pubkey.is_p2tr()
-                    })
+                let proof_method = witness.proof.method();
+                let Some(method_matches) =
+                    dbc_output_matches_method(&witness.tx.output, proof_method)
                 else {
                     return Err(ValidationError::InvalidConsignment(Failure::NoDbcOutput(
                         witness.txid,
                     )));
                 };
-                let output_method = if output.script_pubkey.is_op_return() {
-                    CloseMethod::OpretFirst
-                } else {
-                    CloseMethod::TapretFirst
-                };
-                let proof_method = witness.proof.method();
-                if proof_method != output_method {
+                if !method_matches {
                     return Err(ValidationError::InvalidConsignment(Failure::InvalidProofType(
                         witness.txid,
                         proof_method,
@@ -552,5 +565,39 @@ impl<
             &state_by_type,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+
+    use super::dbc_output_matches_method;
+    use crate::seals::txout::CloseMethod;
+
+    fn txout(script_pubkey: ScriptBuf) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey,
+        }
+    }
+
+    #[test]
+    fn opret_proof_accepts_opret_after_regular_taproot_output() {
+        let outputs = [
+            txout(ScriptBuf::from_bytes([vec![0x51, 0x20], vec![0u8; 32]].concat())),
+            txout(ScriptBuf::from_bytes(vec![0x6a])),
+        ];
+
+        assert_eq!(dbc_output_matches_method(&outputs, CloseMethod::OpretFirst), Some(true));
+    }
+
+    #[test]
+    fn reports_missing_and_mismatched_dbc_outputs() {
+        let p2wpkh = txout(ScriptBuf::from_bytes([vec![0x00, 0x14], vec![0u8; 20]].concat()));
+        assert_eq!(dbc_output_matches_method(&[p2wpkh], CloseMethod::OpretFirst), None);
+
+        let taproot = txout(ScriptBuf::from_bytes([vec![0x51, 0x20], vec![0u8; 32]].concat()));
+        assert_eq!(dbc_output_matches_method(&[taproot], CloseMethod::OpretFirst), Some(false));
     }
 }
