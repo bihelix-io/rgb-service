@@ -13,18 +13,10 @@ cargo run -p zust-console -- -e 'ln_rgb::status()'
 ```zs
 root::add("local/rgb-service", "http://3.1.207.115:8091");
 root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
-root::add("local/signer-node", "417c33530ab6097e5e2538ffd16e833ee4337318015f201452a540c49adb4158");
-root::add("local/signer-request", {
-  attempts: 60,
-  retry_interval_ms: 0,
-  timeout_ms: 60000,
-});
 ```
 
-`local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/signer-node` 是 signer App
-的 iroh node id。`local/rgb-service` 是 RGB daemon 的 HTTP 地址。
-`local/signer-request` 控制 signer Iroh 请求重试；它只重试签名请求，不重试
-RGB daemon POST。
+`local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/rgb-service` 是 RGB daemon
+的 HTTP 地址。console 不再连接 signer App，也不再启动 Iroh signer endpoint。
 
 常用 REPL 命令：
 
@@ -34,82 +26,12 @@ RGB daemon POST。
 :quit
 ```
 
-## Signer App 协议
+## 签名边界
 
-签名请求通过 iroh 发送，消息格式是 Dynamic msgpack：
-
-```text
-[path, body]
-```
-
-console 目前会调用这些 signer path：
-
-```text
-/v1/signer/request-signature
-/v1/signer/asset-authorization
-/v1/signer/psbt/sign
-/v1/signer/address/batch
-```
-
-批量地址请求：
-
-```json
-{
-  "account_id": "bc1q...",
-  "network": "bitcoin",
-  "purpose": "low_water_refill",
-  "count": 20,
-  "timestamp_ms": 1780000000000
-}
-```
-
-批量地址返回：
-
-```json
-{
-  "account_id": "bc1q...",
-  "network": "bitcoin",
-  "count": 20,
-  "addresses": [
-    {
-      "address": "bc1...",
-      "derivation_path": "m/84'/0'/0'/0/12",
-      "index": 12,
-      "script_pubkey": "0014..."
-    }
-  ]
-}
-```
-
-PSBT 签名请求：
-
-```json
-{
-  "account_id": "bc1q...",
-  "ident": "alice",
-  "domain": "bihelix-btc-wallet",
-  "psbt": "...",
-  "signing_accounts": [
-    {
-      "kind": "derived",
-      "ident": "alice",
-      "account_id": "bc1q...",
-      "address": "bc1q...",
-      "source": "local_address_pool",
-      "derivation_path": "m/84'/0'/0'/0/12",
-      "index": 12,
-      "script_pubkey": "0014...",
-      "signer_response": {}
-    }
-  ],
-  "policy": {},
-  "expires_at_ms": 1780000300000,
-  "timestamp_ms": 1780000000000
-}
-```
-
-当 `ident == ""` 时，`signing_accounts[0].kind` 是 `"default"`，`address`
-就是 `local/btc-addr`。
+地址池通过配置的 xpub 本地派生，不需要 signer App。console 不持有充值地址私钥，
+因此不会自动签名 PSBT，也不会代替调用方生成 daemon 请求签名。需要认证的 daemon
+请求必须由调用方提供 `signature`；需要广播的交易必须先由对应钱包签名，再调用
+`btc::broadcast_psbt` 或 `btc::broadcast_psbt_checked`。
 
 ## 本地状态
 
@@ -123,8 +45,8 @@ Fjall 本地存储位于 `.zust-console/local-store`。这是 console 的本地�
 | `ident_btc_address` | `ident -> btc_address` 的收款地址分配映射。 |
 | `wallet_btc_address` | 默认钱包地址缓存。 |
 | `btc_deposit_records` | 已扫描到的 BTC 入账记录，key 为 `txid:vout`。 |
-| `btc_address_pool_available` | 未使用的 signer 派生地址池记录。 |
-| `btc_address_pool_used` | 已分配的 signer 派生地址记录，包含 signer 元数据。 |
+| `btc_address_pool_available` | 未使用的 xpub 派生地址池记录。 |
+| `btc_address_pool_used` | 已分配的 xpub 派生地址记录。 |
 | `ident_ln_invoice` | 预留的旧版/本地 LN invoice 映射。 |
 | `ln_payment_hash_ident` | 预留的旧版/本地 LN payment 映射。 |
 
@@ -155,7 +77,7 @@ BTC 相关接口使用 `ident` 字符串选择地址：
 
 ```text
 ""      -> 默认 local/btc-addr
-"alice" -> btc::get_deposit_address("alice") 分配的 signer 派生地址
+"alice" -> btc::get_deposit_address("alice") 分配的 xpub 派生地址
 ```
 
 当前 BTC 函数：
@@ -167,13 +89,12 @@ BTC 相关接口使用 `ident` 字符串选择地址：
 | `btc::status(ident)` | 返回选中 BTC 地址余额，并附带 `btc::assets(ident)` 结果。 |
 | `btc::utxos(ident)` | 通过 Esplora 列出选中地址的 UTXO。 |
 | `btc::assets(ident)` | 查询选中地址在 RGB daemon 中已维护的资产列表。 |
-| `btc::get_deposit_address(ident)` | 返回已有分配地址，或从本地 signer 派生地址池取一个地址。`""` 返回默认账户。 |
+| `btc::get_deposit_address(ident)` | 返回已有分配地址，或从本地 xpub 派生地址池取一个地址。`""` 返回默认账户。 |
 | `btc::lookup_address_ident(address)` | 从本地记录反查已分配地址对应的 ident。 |
 | `btc::scan_deposits(ident)` | 通过 Esplora 扫描默认/ident 地址，并持久化入账记录。 |
 | `btc::scan_ident_deposits(ident)` | 旧式 ident 扫描别名；要求 ident 非空。 |
 | `btc::address_pool_status()` | 返回地址池可用/已用数量，以及可用地址记录。 |
-| `btc::refill_address_pool(count)` | 向 signer App 请求 `count` 个新地址，并放入可用地址池。 |
-| `btc::sign_psbt(psbt, ident)` | 将 PSBT 和选中签名账户元数据发送到 `/v1/signer/psbt/sign`。 |
+| `btc::refill_address_pool(count)` | 根据 xpub 派生 `count` 个新地址并放入可用地址池。 |
 | `btc::broadcast(tx_hex)` | 通过 Esplora `/tx` 广播 raw transaction hex。 |
 | `btc::tx_status(txid)` | 读取 Esplora 交易确认状态。 |
 
@@ -185,7 +106,7 @@ btc::get_deposit_address("alice")
 btc::balance("alice")
 btc::utxos("alice")
 btc::scan_deposits("alice")
-btc::sign_psbt(psbt, "alice")
+btc::broadcast_psbt(signed_psbt)
 ```
 
 当前 scanner 是小规模/admin 用法：每次只扫描一个选中的地址。它还不是生产级
@@ -195,15 +116,13 @@ block indexer。
 
 `rgb` 模块访问 `local/rgb-service`。除 `rgb::token_list()` 外，RGB 调用都会
 启动后台线程并立刻返回 `{ ok: true, status: "spawned" }`；最终结果通过最后一个
-callback 参数返回。需要签名的调用会在后台线程里按 `local/signer-request`
-重试 signer Iroh 请求，拿到签名后只 POST 一次 RGB daemon。
+callback 参数返回。console 不自动生成签名；认证请求必须由调用方在 payload 中提供
+`signature`。
 
 | 函数 | 路由 / 说明 |
 | --- | --- |
-| `rgb::signed(payload, callback)` | 对任意 payload 返回 `{ payload, signature }` 到 callback。 |
+| `rgb::signed(payload, callback)` | 校验调用方提供的 `signature`，返回 `{ payload, signature }` 到 callback。 |
 | `rgb::rna_balance(callback)` | POST `/v1/rna/balance`，结果进 callback。 |
-| `rgb::request_signature(payload, callback)` | 直接通过 `/v1/signer/request-signature` 请求签名，结果进 callback。 |
-| `rgb::asset_authorization(asset_id, amount, purpose, recipient, anchor_psbt, expires_at_ms, callback)` | 直接请求 signer asset authorization。默认值用 `""`/`0`，结果进 callback。 |
 | `rgb::request(route, payload, callback)` | POST 任意 RGB daemon route，结果进 callback。 |
 | `rgb::issue(ticker, name, precision, supply, allocation_outpoint, callback)` | POST `/v1/assets/issue`，结果进 callback。 |
 | `rgb::assets(callback)` | 对默认账户 POST `/v1/assets/list`，结果进 callback。 |
@@ -211,8 +130,8 @@ callback 参数返回。需要签名的调用会在后台线程里按 `local/sig
 | `rgb::token_list()` | GET `/v1/tokens/list`；公开 token/contract 列表。 |
 | `rgb::balance(asset_id, scope, callback)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`，结果进 callback。 |
 | `rgb::balance_breakdown(asset_id, callback)` | POST `/v1/balance/breakdown`，结果进 callback。 |
-| `rgb::prepare_transfer(asset_id, amount, recipient, unsigned_anchor_psbt, change_vout, recipient_vout, fee_rate_sat_vb, callback)` | 先请求 asset authorization，再 POST `/v1/transfers/prepare`，结果进 callback。 |
-| `rgb::commit_transfer(asset_id, amount, transfer_id, txid, signed_anchor_psbt, callback)` | 先请求 asset authorization，再 POST `/v1/transfers/commit`，结果进 callback。 |
+| `rgb::prepare_transfer(asset_id, amount, recipient, unsigned_anchor_psbt, change_vout, recipient_vout, fee_rate_sat_vb, callback)` | 需要调用方先完成 asset authorization，再由调用方直接调用 daemon。 |
+| `rgb::commit_transfer(asset_id, amount, transfer_id, txid, signed_anchor_psbt, callback)` | 需要调用方先完成 asset authorization，再由调用方直接调用 daemon。 |
 | `rgb::test(scenario, callback)` | POST `/v1/test/rgb`。传 `""` 表示 `full_rgb20_lifecycle`，结果进 callback。 |
 
 示例：
@@ -303,13 +222,12 @@ ln_rgb::send_rgb_payment("...", 1000, "", "...", 1)
 
 ## 当前运行说明
 
-- `btc::get_deposit_address(ident)` 会消费本地 signer 派生地址池；只有地址池低于
-  low water 时才会请求 signer App 补充。
+- `btc::get_deposit_address(ident)` 会消费本地 xpub 派生地址池；只有地址池低于
+  low water 时才会按 xpub 自动补充。
 - `btc::scan_deposits(ident)` 适合小规模/admin 流程。大型托管钱包需要替换为
   基于 block/indexer 的 scanner。
-- `btc::sign_psbt(psbt, ident)` 本地不持有私钥。它会把 PSBT 和地址派生元数据
-  发送给 signer App。
-- `rgb::*` 不再使用本地 RGB stock，也不再使用 Iroh consignment transport。
+- console 不持有充值地址私钥，不提供自动 PSBT 签名；签名后的 PSBT 由调用方提交。
+- `rgb::*` 不使用外部 signer 或 Iroh consignment transport。
   Consignment 管理属于 `rgb-service-daemon`。
 - LN 使用本地热钱包。它和 `local/btc-addr` 是分开的，channel 操作需要单独给
   LN 热钱包充值。

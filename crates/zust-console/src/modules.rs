@@ -38,21 +38,14 @@ use bitcoin::{
     Address, Amount, CompressedPublicKey, Network, NetworkKind, OutPoint, ScriptBuf, Sequence,
     Transaction, TxIn, TxOut, Witness,
 };
-use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
-use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
+use dynamic::{Dynamic, FromJson, ToJson, Type};
+use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
 use lightning::ln::msgs::SocketAddress;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use vm::{Vm, ZustCallback};
 
-const SIGNER_ALPN: &[u8] = b"bihelix/signer/1";
-const SIGNER_REQUEST_SIGNATURE_PATH: &str = "/v1/signer/request-signature";
-const SIGNER_ASSET_AUTHORIZATION_PATH: &str = "/v1/signer/asset-authorization";
-const SIGNER_PSBT_SIGN_PATH: &str = "/v1/signer/psbt/sign";
-const SIGNER_TIMEOUT_MS_DEFAULT: u64 = 60000;
-const SIGNER_ATTEMPTS_DEFAULT: usize = 60;
-const SIGNER_RETRY_DELAY_MS_DEFAULT: u64 = 0;
 const LN_SCAN_DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 const LN_NODE_DEFAULT_PATH: &str = ".zust-console/ln-node.json";
 const LN_DATA_DIR_DEFAULT: &str = ".zust-console/lightning";
@@ -71,9 +64,6 @@ const BTC_ADDRESS_XPUB_LOOKUP_LIMIT: u32 = 20_000;
 const BTC_ADDRESS_XPUB_LOOKUP_MARGIN: u32 = 1_000;
 const RGB_CALLBACK_WORKER_COUNT: usize = 4;
 const RGB_CALLBACK_QUEUE_CAPACITY: usize = 64;
-static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
-static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
-static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static ESPLORA_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 static LN_RGB_NODE: OnceLock<Mutex<Option<Arc<LnRgbBtcLnBackend>>>> = OnceLock::new();
 type RgbCallbackJob = Box<dyn FnOnce() + Send + 'static>;
@@ -755,13 +745,6 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "btc",
-        "sign_psbt",
-        &[Type::Str, Type::Str],
-        Type::Any,
-        btc_sign_psbt as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "btc",
         "broadcast",
         &[Type::Str],
         Type::Any,
@@ -858,28 +841,6 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
-        "request_signature",
-        &[Type::Any, Type::Any],
-        Type::Any,
-        rgb_request_signature as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
-        "asset_authorization",
-        &[
-            Type::Str,
-            Type::U64,
-            Type::Str,
-            Type::Str,
-            Type::Str,
-            Type::U64,
-            Type::Any,
-        ],
-        Type::Any,
-        rgb_asset_authorization as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
         "request",
         &[Type::Str, Type::Any, Type::Any],
         Type::Any,
@@ -912,6 +873,27 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Str, Type::Str, Type::Bool, Type::Any],
         Type::Any,
         rgb_assets_by_utxo as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
+        "assets_by_utxo_sync",
+        &[Type::Str, Type::Str, Type::Bool],
+        Type::Any,
+        rgb_assets_by_utxo_sync as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
+        "assert_psbt_no_assets",
+        &[Type::Str],
+        Type::Any,
+        rgb_assert_psbt_no_assets as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
+        "scan_utxos",
+        &[Type::Str],
+        Type::Any,
+        rgb_scan_utxos as *const u8,
     )?;
     jit.add_native_module_ptr(
         "rgb",
@@ -1946,13 +1928,6 @@ extern "C" fn btc_assets(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |ident| Ok(json_to_dynamic(&btc_assets_json(ident)?)))
 }
 
-extern "C" fn btc_sign_psbt(psbt: *const Dynamic, ident: *const Dynamic) -> *const Dynamic {
-    native_two_string_dynamic_result(psbt, ident, |psbt, ident| {
-        ensure!(!psbt.trim().is_empty(), "psbt must not be empty");
-        Ok(json_to_dynamic(&sign_psbt_json(psbt, ident)?))
-    })
-}
-
 extern "C" fn btc_broadcast(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |tx_hex| {
         Ok(json_to_dynamic(&broadcast_raw_transaction_json(tx_hex)?))
@@ -2462,7 +2437,7 @@ extern "C" fn btc_transfer(
             });
         }
         let unsigned_psbt = psbt.to_string();
-        let sign = sign_psbt_json(&unsigned_psbt, &ident)?;
+        let sign = external_signature_unavailable::<Value>()?;
         let signed_psbt = ["psbt", "signed_psbt", "signed_anchor_psbt"]
             .iter()
             .find_map(|key| sign.get(*key).and_then(Value::as_str))
@@ -2675,7 +2650,7 @@ extern "C" fn btc_transfer_with_inputs(
             });
         }
         let unsigned_psbt = psbt.to_string();
-        let sign = sign_psbt_json(&unsigned_psbt, &ident)?;
+        let sign = external_signature_unavailable::<Value>()?;
         let signed_psbt = ["psbt", "signed_psbt", "signed_anchor_psbt"]
             .iter()
             .find_map(|key| sign.get(*key).and_then(Value::as_str))
@@ -3504,22 +3479,6 @@ extern "C" fn btc_tx_status(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
-fn sign_psbt_json(psbt: &str, ident: &str) -> Result<Value> {
-    ensure!(!psbt.trim().is_empty(), "psbt must not be empty");
-    let signing_account = btc_account_for_ident(ident)?;
-    let body = json!({
-        "account_id": default_account_id()?,
-        "ident": ident,
-        "domain": "bihelix-btc-wallet",
-        "psbt": psbt,
-        "signing_accounts": [signing_account],
-        "policy": {},
-        "expires_at_ms": now_ms() + 300000,
-        "timestamp_ms": now_ms()
-    });
-    signer_request(SIGNER_PSBT_SIGN_PATH, &body)
-}
-
 fn broadcast_raw_transaction_json(tx_hex: &str) -> Result<Value> {
     ensure!(!tx_hex.trim().is_empty(), "tx_hex must not be empty");
     ensure_btc_transaction_finalized(tx_hex)?;
@@ -3895,98 +3854,6 @@ extern "C" fn rgb_signed(input: *const Dynamic, callback: *const Dynamic) -> *co
     })
 }
 
-extern "C" fn rgb_request_signature(
-    input: *const Dynamic,
-    callback: *const Dynamic,
-) -> *const Dynamic {
-    let input = unsafe { &*input };
-    let callback = unsafe { &*callback };
-    native_result(|| {
-        let input = input.deep_clone();
-        spawn_rgb_callback_worker("request_signature", callback, move || {
-            let body = signed_body(&input)?;
-            let signature = request_signature(SIGNER_REQUEST_SIGNATURE_PATH, &body)?;
-            Ok(ok(json!({
-                "status": "signed",
-                "account_id": default_account_id()?,
-                "signer_node": signer_node_id()?,
-                "transport": "iroh",
-                "signature": signature
-            })))
-        })
-    })
-}
-
-extern "C" fn rgb_asset_authorization(
-    asset_id: *const Dynamic,
-    amount: u64,
-    purpose: *const Dynamic,
-    recipient: *const Dynamic,
-    anchor_psbt: *const Dynamic,
-    expires_at_ms: u64,
-    callback: *const Dynamic,
-) -> *const Dynamic {
-    let asset_id = unsafe { &*asset_id };
-    let purpose = unsafe { &*purpose };
-    let recipient = unsafe { &*recipient };
-    let anchor_psbt = unsafe { &*anchor_psbt };
-    let callback = unsafe { &*callback };
-    native_result(|| {
-        ensure!(asset_id.is_str(), "asset_id must be string");
-        ensure!(purpose.is_str(), "purpose must be string");
-        ensure!(recipient.is_str(), "recipient must be string");
-        ensure!(anchor_psbt.is_str(), "anchor_psbt must be string");
-        let asset_id = asset_id.as_str().to_string();
-        let purpose = if purpose.as_str().trim().is_empty() {
-            "l1_transfer".to_string()
-        } else {
-            purpose.as_str().to_string()
-        };
-        let recipient =
-            (!recipient.as_str().trim().is_empty()).then(|| recipient.as_str().to_string());
-        let anchor_psbt =
-            (!anchor_psbt.as_str().trim().is_empty()).then(|| anchor_psbt.as_str().to_string());
-        let expires_at_ms = (expires_at_ms > 0)
-            .then_some(expires_at_ms)
-            .unwrap_or_else(|| now_ms() + 300000);
-        spawn_rgb_callback_worker("asset_authorization", callback, move || {
-            let body = json!({
-                "account_id": default_account_id()?,
-                "permission": "asset_authorization",
-                "payload": {
-                    "account_id": default_account_id()?,
-                    "asset_id": asset_id,
-                    "amount": amount,
-                    "purpose": purpose,
-                    "recipient": recipient,
-                    "anchor_psbt": anchor_psbt,
-                    "expires_at_ms": expires_at_ms
-                },
-                "domain": "bihelix-rgb-service",
-                "expires_at_ms": expires_at_ms,
-                "timestamp_ms": now_ms()
-            });
-            let signature = request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &body)?;
-            let payload = body.get("payload").cloned().unwrap_or(Value::Null);
-            Ok(ok(json!({
-                "status": "signed",
-                "account_id": default_account_id()?,
-                "signer_node": signer_node_id()?,
-                "transport": "iroh",
-                "asset_authorization_request": {
-                    "asset_id": payload.get("asset_id").cloned().unwrap_or(Value::Null),
-                    "amount": payload.get("amount").cloned().unwrap_or(Value::Null),
-                    "purpose": payload.get("purpose").cloned().unwrap_or(Value::Null),
-                    "recipient": payload.get("recipient").cloned().unwrap_or(Value::Null),
-                    "anchor_psbt": payload.get("anchor_psbt").cloned().unwrap_or(Value::Null),
-                    "expires_at_ms": payload.get("expires_at_ms").cloned().unwrap_or(Value::Null),
-                },
-                "signature": signature
-            })))
-        })
-    })
-}
-
 extern "C" fn rgb_request(
     route: *const Dynamic,
     payload: *const Dynamic,
@@ -4114,6 +3981,138 @@ extern "C" fn rgb_assets_by_utxo(
         })
     })
 }
+fn rgb_assets_by_utxo_json(outpoint: &str, address: &str, confirmed: bool) -> Result<Value> {
+    let payload = json_to_dynamic(&json!({
+        "account_id": address,
+        "outpoint": outpoint,
+        "address": if address.is_empty() { Value::Null } else { json!(address) },
+        "confirmed": confirmed
+    }));
+    let response = dynamic_to_json(&rgb_public_post_dynamic(&payload, "/v1/assets/by-utxo")?);
+    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+        let error = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("RGB daemon UTXO query failed");
+        bail!("{error}");
+    }
+    if let Some(error) = response
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|error| !error.trim().is_empty())
+    {
+        bail!("{error}");
+    }
+    let returned_outpoint = response
+        .get("outpoint")
+        .and_then(Value::as_str)
+        .context("RGB daemon UTXO query response missing outpoint")?;
+    ensure!(
+        returned_outpoint == outpoint,
+        "RGB daemon UTXO query returned mismatched outpoint: requested={outpoint} returned={returned_outpoint}"
+    );
+    Ok(response)
+}
+
+extern "C" fn rgb_assets_by_utxo_sync(
+    outpoint: *const Dynamic,
+    address: *const Dynamic,
+    confirmed: bool,
+) -> *const Dynamic {
+    let outpoint = unsafe { &*outpoint };
+    let address = unsafe { &*address };
+    native_result(|| {
+        ensure!(outpoint.is_str(), "outpoint must be string");
+        ensure!(address.is_str(), "address must be string");
+        let outpoint = outpoint.as_str().trim();
+        let address = address.as_str().trim();
+        ensure!(!outpoint.is_empty(), "outpoint must not be empty");
+        Ok(json_to_dynamic(&rgb_assets_by_utxo_json(
+            outpoint, address, confirmed,
+        )?))
+    })
+}
+
+extern "C" fn rgb_assert_psbt_no_assets(input: *const Dynamic) -> *const Dynamic {
+    let input = unsafe { &*input };
+    native_result(|| {
+        ensure!(input.is_str(), "signed_psbt must be string");
+        let signed_psbt = input.as_str().trim();
+        ensure!(!signed_psbt.is_empty(), "signed_psbt must not be empty");
+        let psbt = Psbt::from_str(signed_psbt).context("decode signed PSBT base64")?;
+        let mut checked = Vec::with_capacity(psbt.unsigned_tx.input.len());
+        for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+            let outpoint = txin.previous_output.to_string();
+            let psbt_input = psbt
+                .inputs
+                .get(index)
+                .with_context(|| format!("signed PSBT input metadata missing at index {index}"))?;
+            let previous_output = psbt_input
+                .witness_utxo
+                .as_ref()
+                .or_else(|| {
+                    psbt_input
+                        .non_witness_utxo
+                        .as_ref()
+                        .and_then(|transaction| {
+                            transaction.output.get(txin.previous_output.vout as usize)
+                        })
+                })
+                .with_context(|| {
+                    format!("signed PSBT input {outpoint} is missing previous output metadata")
+                })?;
+            let address = Address::from_script(&previous_output.script_pubkey, Network::Bitcoin)
+                .with_context(|| format!("derive source address for signed PSBT input {outpoint}"))?
+                .to_string();
+            let response = rgb_assets_by_utxo_json(&outpoint, &address, true)
+                .with_context(|| format!("check RGB allocations for PSBT input {outpoint}"))?;
+            let allocations = response
+                .get("allocations")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            ensure!(
+                allocations.is_empty(),
+                "BTC sweep PSBT contains RGB-bearing outpoint {outpoint}"
+            );
+            checked.push(json!({
+                "outpoint": outpoint,
+                "address": address,
+                "allocation_count": 0
+            }));
+        }
+        Ok(ok(json!({
+            "module": "rgb",
+            "operation": "assert_psbt_no_assets",
+            "safe": true,
+            "input_count": checked.len(),
+            "inputs": checked
+        })))
+    })
+}
+
+extern "C" fn rgb_scan_utxos(address: *const Dynamic) -> *const Dynamic {
+    let address = unsafe { &*address };
+    native_result(|| {
+        ensure!(address.is_str(), "address must be string");
+        let address = address.as_str().trim().to_string();
+        ensure!(!address.is_empty(), "address must not be empty");
+        let esplora = btc_esplora_url();
+        let utxos = scan_utxos_json(&address, &esplora)?;
+        let recorded = record_daemon_account_utxos(&address, &utxos)?;
+        let count = utxos.as_array().map(Vec::len).unwrap_or_default();
+        Ok(ok(json!({
+            "module": "rgb",
+            "operation": "scan_utxos",
+            "account_id": address,
+            "address": address,
+            "count": count,
+            "recorded": recorded,
+            "utxos": utxos
+        })))
+    })
+}
+
 extern "C" fn rgb_token_list() -> *const Dynamic {
     native_result(|| {
         let response = http_get_json(&daemon_route_url("/v1/tokens/list")?)?;
@@ -4224,7 +4223,7 @@ extern "C" fn rgb_prepare_transfer(
                 "recipient": recipient.clone(),
                 "anchor_psbt": unsigned_anchor_psbt.clone(),
                 "expires_at_ms": expires_at_ms,
-                "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &auth_body)?
+                "signature": external_signature_unavailable::<Value>()?
             });
             let payload = json!({
                 "asset_id": asset_id,
@@ -4298,7 +4297,7 @@ extern "C" fn rgb_transfer(
                 "recipient": recipient.clone(),
                 "anchor_psbt": unsigned_anchor_psbt.clone(),
                 "expires_at_ms": expires_at_ms,
-                "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &prepare_auth_body)?
+                "signature": external_signature_unavailable::<Value>()?
             });
             let prepare_payload = Dynamic::map(Default::default());
             prepare_payload.insert("asset_id", asset_id.clone());
@@ -4351,7 +4350,7 @@ extern "C" fn rgb_transfer(
             let prepared_anchor_psbt_base64 = Psbt::deserialize(&prepared_anchor_psbt_bytes)
                 .context("decode prepared anchor PSBT hex")?
                 .to_string();
-            let sign = sign_psbt_json(&prepared_anchor_psbt_base64, "")?;
+            let sign = external_signature_unavailable::<Value>()?;
             let signed_anchor_psbt = ["psbt", "signed_psbt", "signed_anchor_psbt"]
                 .iter()
                 .find_map(|key| sign.get(*key).and_then(Value::as_str))
@@ -4396,7 +4395,7 @@ extern "C" fn rgb_transfer(
                 "recipient": Value::Null,
                 "anchor_psbt": signed_anchor_psbt.clone(),
                 "expires_at_ms": commit_expires_at_ms,
-                "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &commit_auth_body)?
+                "signature": external_signature_unavailable::<Value>()?
             });
             let commit_payload = Dynamic::map(Default::default());
             commit_payload.insert("transfer_id", transfer_id.clone());
@@ -4481,7 +4480,7 @@ extern "C" fn rgb_commit_transfer(
                 "recipient": Value::Null,
                 "anchor_psbt": signed_anchor_psbt.clone(),
                 "expires_at_ms": expires_at_ms,
-                "signature": request_signature(SIGNER_ASSET_AUTHORIZATION_PATH, &auth_body)?
+                "signature": external_signature_unavailable::<Value>()?
             });
             let payload = json!({
                 "transfer_id": transfer_id,
@@ -4850,21 +4849,20 @@ extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
         ensure!(source_address.is_str(), "source_address must be string");
         let source_outpoint_text = source_outpoint.as_str().trim();
         let source_address_text = source_address.as_str().trim();
-        let source_outpoint = OutPoint::from_str(source_outpoint_text)
-            .with_context(|| format!("invalid external RGB source outpoint: {source_outpoint_text}"))?;
+        let source_outpoint = OutPoint::from_str(source_outpoint_text).with_context(|| {
+            format!("invalid external RGB source outpoint: {source_outpoint_text}")
+        })?;
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         let xpub_config = btc_address_xpub_config()?
             .context("BTC address xpub is required to describe the external RGB source input")?;
-        let (public_key, fingerprint, derivation_path) = btc_xpub_input_key_source(
-            &store,
-            &xpub_config,
-            source_address_text,
-        )?
-        .with_context(|| {
-            format!(
+        let (public_key, fingerprint, derivation_path) =
+            btc_xpub_input_key_source(&store, &xpub_config, source_address_text)?.with_context(
+                || {
+                    format!(
                 "external RGB source address is not in the configured xpub: {source_address_text}"
             )
-        })?;
+                },
+            )?;
         let node = running_ln_node()?;
         let mut result = node.prepare_external_rgb_l1_sweep_json(
             asset_id.as_str(),
@@ -4877,8 +4875,8 @@ extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
             .get("partially_signed_psbt")
             .and_then(Value::as_str)
             .context("external RGB sweep prepare result missing PSBT")?;
-        let mut psbt = Psbt::from_str(psbt_text)
-            .context("decode partially signed external RGB sweep PSBT")?;
+        let mut psbt =
+            Psbt::from_str(psbt_text).context("decode partially signed external RGB sweep PSBT")?;
         let source_input_index = psbt
             .unsigned_tx
             .input
@@ -4919,8 +4917,14 @@ extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
             "prepared_anchor_psbt".to_string(),
             json!(bytes_to_hex(&psbt_bytes)),
         );
-        object.insert("source_public_key".to_string(), json!(public_key.to_string()));
-        object.insert("source_fingerprint".to_string(), json!(fingerprint.to_string()));
+        object.insert(
+            "source_public_key".to_string(),
+            json!(public_key.to_string()),
+        );
+        object.insert(
+            "source_fingerprint".to_string(),
+            json!(fingerprint.to_string()),
+        );
         object.insert(
             "source_derivation_path".to_string(),
             json!(derivation_path.to_string()),
@@ -4929,7 +4933,10 @@ extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
             "sparrow_action".to_string(),
             json!("sign_external_rgb_input_and_return_psbt_without_broadcasting"),
         );
-        object.insert("artifact_path".to_string(), json!(psbt_path.display().to_string()));
+        object.insert(
+            "artifact_path".to_string(),
+            json!(psbt_path.display().to_string()),
+        );
         object.insert("artifact_sha256".to_string(), json!(psbt_sha256));
         let metadata_path = artifact_dir.join(format!(
             "rgb-custody-sweep-{safe_transfer_id}-metadata.json"
@@ -4978,7 +4985,10 @@ extern "C" fn ln_rgb_commit_external_rgb_l1_sweep(
     let transfer_id = unsafe { &*transfer_id };
     let txid = unsafe { &*txid };
     native_result(|| {
-        ensure!(source_account_id.is_str(), "source_account_id must be string");
+        ensure!(
+            source_account_id.is_str(),
+            "source_account_id must be string"
+        );
         ensure!(asset_id.is_str(), "asset_id must be string");
         ensure!(transfer_id.is_str(), "transfer_id must be string");
         ensure!(txid.is_str(), "txid must be string");
@@ -6242,6 +6252,59 @@ fn scan_utxos_json(address: &str, esplora: &str) -> Result<Value> {
     Ok(Value::Array(tracked))
 }
 
+fn record_daemon_account_utxos(account_id: &str, utxos: &Value) -> Result<usize> {
+    let data_dir = rgb_service_data_dir()?;
+    let db_dir = data_dir.join("kv");
+    ensure!(
+        db_dir.is_dir(),
+        "RGB service database not found at {}; set `local/rgb-service-data` to daemon service.data_dir on the SSH host",
+        db_dir.display()
+    );
+    let db = SingleWriterTxDatabase::builder(&db_dir)
+        .open()
+        .with_context(|| format!("open RGB service database {}", db_dir.display()))?;
+    let keyspace = db
+        .keyspace("account_utxos", KeyspaceCreateOptions::default)
+        .context("open RGB service account_utxos keyspace")?;
+    let mut tx = db.write_tx();
+    let mut recorded = 0usize;
+    for utxo in utxos.as_array().cloned().unwrap_or_default() {
+        let outpoint = utxo
+            .get("outpoint")
+            .and_then(Value::as_str)
+            .context("scanned UTXO missing outpoint")?;
+        OutPoint::from_str(outpoint).with_context(|| format!("invalid outpoint {outpoint}"))?;
+        let key = format!("{account_id}:{outpoint}");
+        let bytes = serde_json::to_vec(&utxo).context("encode account UTXO")?;
+        tx.insert(&keyspace, key.as_bytes(), bytes);
+        recorded += 1;
+    }
+    tx.commit().context("record RGB account UTXOs")?;
+    db.persist(PersistMode::SyncAll)
+        .context("persist RGB account UTXOs")?;
+    Ok(recorded)
+}
+
+fn rgb_service_data_dir() -> Result<PathBuf> {
+    local_string("rgb-service-data")
+        .or_else(|| {
+            local_dynamic("rgb-service-config")
+                .map(|value| dynamic_to_json(&value))
+                .and_then(|value| {
+                    value
+                        .get("service")
+                        .and_then(|service| service.get("data_dir"))
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("data_dir").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+        })
+        .map(PathBuf::from)
+        .context(
+            "missing root value `local/rgb-service-data`; set it to daemon service.data_dir on the SSH host",
+        )
+}
+
 fn esplora_http_client() -> Result<&'static reqwest::blocking::Client> {
     if let Some(client) = ESPLORA_HTTP_CLIENT.get() {
         return Ok(client);
@@ -6462,26 +6525,11 @@ fn signed_request(input: &Dynamic, route: &str) -> Result<Dynamic> {
     let signature = input
         .get_dynamic("signature")
         .map(|signature| dynamic_to_json(&signature))
-        .map(Ok)
-        .unwrap_or_else(|| request_signature(SIGNER_REQUEST_SIGNATURE_PATH, &payload))?;
+        .context("missing caller-provided signature; signer-app/Iroh signing is removed")?;
     Ok(json_to_dynamic(&json!({
         "payload": payload,
         "signature": signature
     })))
-}
-
-fn signed_body(input: &Dynamic) -> Result<Value> {
-    let permission = optional_string(input, "permission")
-        .or_else(|| optional_string(input, "operation"))
-        .unwrap_or_else(|| "request_signature".to_string());
-    Ok(json!({
-        "account_id": default_account_id()?,
-        "permission": permission,
-        "payload": signed_payload(input, "")?,
-        "domain": optional_string(input, "domain").unwrap_or_else(|| "bihelix-rgb-service".to_string()),
-        "expires_at_ms": optional_u64(input, "expires_at_ms").unwrap_or_else(|| now_ms() + 300000),
-        "timestamp_ms": now_ms()
-    }))
 }
 
 fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
@@ -6519,10 +6567,6 @@ fn signed_payload(input: &Dynamic, route: &str) -> Result<Value> {
 
 pub(crate) fn default_account_id() -> Result<String> {
     local_string("btc-addr").context("missing root value `local/btc-addr`")
-}
-
-fn signer_node_id() -> Result<String> {
-    local_string("signer-node").context("missing root value `local/signer-node`")
 }
 
 fn btc_esplora_url() -> String {
@@ -6564,173 +6608,10 @@ fn btc_esplora_urls() -> Vec<String> {
     urls
 }
 
-pub(crate) fn request_signature(path: &str, body: &Value) -> Result<Value> {
-    let response = signer_request(path, body)?;
-    if let Some(signature) = response.get("signature").cloned() {
-        return Ok(signature);
-    }
-    if let Some(signature) = response
-        .get("asset_authorization")
-        .and_then(|value| value.get("signature"))
-        .cloned()
-    {
-        return Ok(signature);
-    }
-    bail!("signer response missing `signature`: {response}")
-}
-
-fn signer_request(path: &str, body: &Value) -> Result<Value> {
-    let signer_node = signer_node_id()?;
-    let path = path.to_string();
-    let body = json_to_dynamic(body);
-    eprintln!("[zust-console] signer request start: path={path}, signer={signer_node}");
-    let mut request = Dynamic::list(Vec::<Dynamic>::new());
-    request.push(path);
-    request.push_dynamic(body);
-    let bytes = dynamic_to_msgpack(&request);
-    let response = thread::spawn(move || {
-        console_async_runtime()?.block_on(iroh_call_with_retries(signer_node, bytes))
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("signer request worker thread panicked"))??;
-    eprintln!("[zust-console] signer request returned");
-    Ok(dynamic_to_json(&response))
-}
-
-fn console_async_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    if let Some(runtime) = CONSOLE_ASYNC_RUNTIME.get() {
-        return Ok(runtime);
-    }
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build zust-console async runtime")?;
-    let _ = CONSOLE_ASYNC_RUNTIME.set(runtime);
-    CONSOLE_ASYNC_RUNTIME
-        .get()
-        .context("zust-console async runtime was not initialized")
-}
-
-async fn iroh_call_with_retries(signer_node: String, bytes: Vec<u8>) -> Result<Dynamic> {
-    let remote_id = EndpointId::from_str(&signer_node)
-        .with_context(|| format!("invalid local/signer-node iroh id: {signer_node}"))?;
-    let remote_addr = EndpointAddr::new(remote_id);
-    let endpoint = console_iroh_endpoint().await?;
-    let config = local_dynamic("signer-request");
-    let attempts = config
-        .as_ref()
-        .and_then(|config| optional_u64(config, "attempts"))
-        .map(|attempts| attempts.max(1) as usize)
-        .unwrap_or(SIGNER_ATTEMPTS_DEFAULT);
-    let timeout = Duration::from_millis(
-        config
-            .as_ref()
-            .and_then(|config| optional_u64(config, "timeout_ms"))
-            .unwrap_or(SIGNER_TIMEOUT_MS_DEFAULT)
-            .max(1),
-    );
-    let retry_delay = Duration::from_millis(
-        config
-            .as_ref()
-            .and_then(|config| optional_u64(config, "retry_interval_ms"))
-            .or_else(|| {
-                config
-                    .as_ref()
-                    .and_then(|config| optional_u64(config, "interval_ms"))
-            })
-            .unwrap_or(SIGNER_RETRY_DELAY_MS_DEFAULT),
-    );
-
-    let mut last_error = None;
-    for attempt in 1..=attempts {
-        eprintln!("[zust-console] signer attempt {attempt}/{attempts}");
-        let result = tokio::time::timeout(
-            timeout,
-            iroh_call(&endpoint, remote_addr.clone(), bytes.clone(), timeout),
-        )
-        .await;
-        match result {
-            Ok(Ok(response)) => return Ok(response),
-            Ok(Err(err)) => {
-                eprintln!("[zust-console] signer attempt {attempt} failed: {err:#}");
-                last_error = Some(err);
-            }
-            Err(err) => {
-                let err = anyhow::anyhow!(
-                    "signer iroh request timed out after {}ms: {err}",
-                    timeout.as_millis()
-                );
-                eprintln!("[zust-console] signer attempt {attempt} failed: {err:#}");
-                last_error = Some(err);
-            }
-        }
-        if attempt < attempts {
-            tokio::time::sleep(retry_delay).await;
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("signer iroh request failed")))
-        .with_context(|| format!("signer iroh request failed after {attempts} attempts"))
-}
-
-async fn iroh_call(
-    endpoint: &Endpoint,
-    remote_addr: EndpointAddr,
-    bytes: Vec<u8>,
-    timeout: Duration,
-) -> Result<Dynamic> {
-    eprintln!("[zust-console] iroh connect signer");
-    let conn = tokio::time::timeout(timeout, endpoint.connect(remote_addr, SIGNER_ALPN))
-        .await
-        .context("connect signer iroh endpoint timed out")?
-        .context("connect signer iroh endpoint")?;
-    eprintln!("[zust-console] iroh open bi stream");
-    let (mut send, mut recv) = tokio::time::timeout(timeout, conn.open_bi())
-        .await
-        .context("open signer iroh stream timed out")?
-        .context("open signer iroh stream")?;
-    eprintln!("[zust-console] iroh write request: bytes={}", bytes.len());
-    tokio::time::timeout(timeout, send.write_all(&bytes))
-        .await
-        .context("write signer msgpack request timed out")?
-        .context("write signer msgpack request")?;
-    eprintln!("[zust-console] iroh finish request stream");
-    send.finish().context("finish signer request stream")?;
-    eprintln!("[zust-console] iroh read response");
-    let response = tokio::time::timeout(timeout, recv.read_to_end(1024 * 1024))
-        .await
-        .context("read signer msgpack response timed out")?
-        .context("read signer msgpack response")?;
-    eprintln!(
-        "[zust-console] iroh response received: bytes={}",
-        response.len()
-    );
-    eprintln!("[zust-console] signer response decode msgpack");
-    msgpack_to_dynamic(&response)
-}
-
-fn console_iroh_secret() -> SecretKey {
-    CONSOLE_IROH_SECRET.get_or_init(SecretKey::generate).clone()
-}
-
-async fn console_iroh_endpoint() -> Result<Endpoint> {
-    if let Some(endpoint) = CONSOLE_IROH_ENDPOINT.get() {
-        return Ok(endpoint.clone());
-    }
-
-    eprintln!("[zust-console] iroh bind endpoint");
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(console_iroh_secret())
-        .alpns(vec![SIGNER_ALPN.to_vec()])
-        .bind()
-        .await
-        .context("bind signer iroh endpoint")?;
-    eprintln!("[zust-console] iroh wait online");
-    endpoint.online().await;
-    eprintln!("[zust-console] iroh online");
-
-    let _ = CONSOLE_IROH_ENDPOINT.set(endpoint.clone());
-    Ok(endpoint)
+fn external_signature_unavailable<T>() -> Result<T> {
+    bail!(
+        "external signer-app/Iroh signing has been removed; provide a caller-signed PSBT or request signature"
+    )
 }
 
 fn ok(value: Value) -> Dynamic {
@@ -6771,20 +6652,6 @@ fn native_string_dynamic_result(
     native_result(|| {
         ensure!(input.is_str(), "expected string argument");
         f(input.as_str())
-    })
-}
-
-fn native_two_string_dynamic_result(
-    first: *const Dynamic,
-    second: *const Dynamic,
-    f: impl FnOnce(&str, &str) -> Result<Dynamic>,
-) -> *const Dynamic {
-    let first = unsafe { &*first };
-    let second = unsafe { &*second };
-    native_result(|| {
-        ensure!(first.is_str(), "first argument must be string");
-        ensure!(second.is_str(), "second argument must be string");
-        f(first.as_str(), second.as_str())
     })
 }
 
@@ -6941,21 +6808,6 @@ fn dynamic_to_json(value: &Dynamic) -> Value {
     let mut json = String::new();
     value.to_json(&mut json);
     serde_json::from_str(&json).expect("zust Dynamic ToJson emitted invalid JSON")
-}
-
-fn dynamic_to_msgpack(value: &Dynamic) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    value.encode(&mut bytes);
-    bytes
-}
-
-fn msgpack_to_dynamic(bytes: &[u8]) -> Result<Dynamic> {
-    let (dynamic, consumed) = Dynamic::decode(bytes)?;
-    ensure!(
-        consumed == bytes.len(),
-        "trailing data after Zust Dynamic msgpack payload"
-    );
-    Ok(dynamic)
 }
 
 fn ln_node_path(input: &Dynamic) -> PathBuf {

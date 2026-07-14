@@ -4,3 +4,6 @@
 *.orig
 .cargo-ok
 crates/zust-console/.zust-console/
+/artifacts/
+/crates/zust-console/wallet-data/
+/examples/test_sync.rs

@@ -28,7 +28,6 @@ bitcoin = { version = "0.32.7", features = ["base64", "serde", "secp-recovery"] 
 dynamic = { workspace = true }
 fjall = { workspace = true }
 getrandom = "0.3"
-iroh = "1.0.0-rc.0"
 lightning = { path = "../ln-rgb-lightning" }
 lightning-background-processor = "0.2.0"
 lightning-invoice = "0.34.0"
