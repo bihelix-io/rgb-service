@@ -134,6 +134,20 @@ impl LocalNodeStore {
             .collect()
     }
 
+    pub fn count_btc_deposit_records(&self) -> Result<usize> {
+        let keyspace = self.keyspace(BTC_DEPOSIT_RECORDS_PARTITION)?;
+        self.inner
+            .db
+            .read_tx()
+            .iter(&keyspace)
+            .try_fold(0usize, |count, item| {
+                item.into_inner().with_context(|| {
+                    format!("iterate local Fjall partition `{BTC_DEPOSIT_RECORDS_PARTITION}`")
+                })?;
+                Ok(count + 1)
+            })
+    }
+
     pub fn put_btc_address_pool_record(&self, address: &str, record: &Value) -> Result<()> {
         let bytes = serde_json::to_vec(record).context("encode BTC address pool record")?;
         self.put_bytes(BTC_ADDRESS_POOL_PARTITION, address, &bytes)

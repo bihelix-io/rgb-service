@@ -12,7 +12,6 @@ cargo run -p zust-console -- -e 'ln_rgb::status()'
 
 ```zs
 root::add("local/rgb-service", "http://3.1.207.115:8091");
-root::add("local/rgb-service-data", "/home/ubuntu/rgb-service-data");
 root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 root::add("local/signer-node", "417c33530ab6097e5e2538ffd16e833ee4337318015f201452a540c49adb4158");
 root::add("local/signer-request", {
@@ -24,8 +23,6 @@ root::add("local/signer-request", {
 
 `local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/signer-node` 是 signer App
 的 iroh node id。`local/rgb-service` 是 RGB daemon 的 HTTP 地址。
-`local/rgb-service-data` 只给 SSH 运维 console 使用，指向 daemon 的
-`service.data_dir`，用于本地维护 daemon-owned 状态，不是公开 HTTP 权限入口。
 `local/signer-request` 控制 signer Iroh 请求重试；它只重试签名请求，不重试
 RGB daemon POST。
 
@@ -211,7 +208,6 @@ callback 参数返回。需要签名的调用会在后台线程里按 `local/sig
 | `rgb::issue(ticker, name, precision, supply, allocation_outpoint, callback)` | POST `/v1/assets/issue`，结果进 callback。 |
 | `rgb::assets(callback)` | 对默认账户 POST `/v1/assets/list`，结果进 callback。 |
 | `rgb::assets_by_utxo(outpoint, address, confirmed, callback)` | 对默认托管账户 POST `/v1/assets/by-utxo`，返回该 L1 outpoint 已验证的 RGB allocations。 |
-| `rgb::scan_utxos(addr)` | SSH 运维函数：通过 Esplora 扫描地址 UTXO，并直接写入 daemon 本地 `account_utxos`。不经过 HTTP 管理入口。 |
 | `rgb::token_list()` | GET `/v1/tokens/list`；公开 token/contract 列表。 |
 | `rgb::balance(asset_id, scope, callback)` | POST `/v1/balance`。`scope` 传 `""` 表示 `all`，结果进 callback。 |
 | `rgb::balance_breakdown(asset_id, callback)` | POST `/v1/balance/breakdown`，结果进 callback。 |
@@ -227,7 +223,6 @@ rgb::rna_balance(|result| {
   result
 })
 rgb::token_list()
-rgb::scan_utxos("bc1...")
 rgb::balance("...", "", |result| {
   root::add("local/rgb/balance", result);
   result
@@ -278,7 +273,6 @@ ln_rgb::start()
 | `ln_rgb::status()` | 返回 runtime 状态、余额、peer/channel 数量。 |
 | `ln_rgb::scanner_status()` | 返回 BTC 地址池/scanner 状态。 |
 | `ln_rgb::spawn_scanner(interval_ms)` | 启动地址池补充 scanner 线程。 |
-| `ln_rgb::events()` | 取出最多 100 条待处理 LN debug event。 |
 | `ln_rgb::get_node_id()` | 返回 LN node id。 |
 | `ln_rgb::get_addr()` | 返回 LN 热钱包 L1 充值地址。 |
 | `ln_rgb::amount()` | 返回可用链上余额 + LN 余额快照，单位 sats。 |

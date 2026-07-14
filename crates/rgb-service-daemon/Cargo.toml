@@ -23,6 +23,7 @@ axum = { workspace = true, features = ["tokio", "query"] }
 bdk_electrum = "0.23.2"
 bdk_esplora = { version = "0.22.2", features = ["blocking"] }
 bdk_wallet = { version = "=2.2.0", features = ["file_store"] }
+bincode = "1.3"
 bitcoin = { workspace = true }
 dynamic = { workspace = true }
 fjall = { workspace = true }

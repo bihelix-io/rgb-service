@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -25,10 +24,11 @@ use bdk_wallet::{
         hashes::{sha256, Hash},
         Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, TxOut, Txid,
     },
-    chain::{ChainPosition, ConfirmationBlockTime},
+    chain::{ChainPosition, ConfirmationBlockTime, Merge},
     descriptor::ExtendedDescriptor,
-    file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet,
+    file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet, WalletPersister,
 };
+use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
 use rgb_service_local::{
     is_electrum_url, list_rgb20_assets_for_utxos, normalize_electrum_url, prepare_rgb20_psbt,
@@ -102,6 +102,65 @@ async fn health() -> &'static str {
     "ok"
 }
 
+const LEGACY_BLOCKING_MAX_CONCURRENCY: usize = 4;
+const LEGACY_BLOCKING_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LEGACY_BLOCKING_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn legacy_blocking_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(LEGACY_BLOCKING_MAX_CONCURRENCY)))
+}
+
+async fn run_legacy_blocking<T, F>(operation: &'static str, task: F) -> Result<T, LegacyHttpError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LegacyHttpError> + Send + 'static,
+{
+    let permit = tokio::time::timeout(
+        LEGACY_BLOCKING_QUEUE_TIMEOUT,
+        Arc::clone(legacy_blocking_semaphore()).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        LegacyHttpError::with_status(
+            RgbServiceError::Backend(format!(
+                "{operation} blocking queue timed out after {} seconds",
+                LEGACY_BLOCKING_QUEUE_TIMEOUT.as_secs()
+            )),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })?
+    .map_err(|_| {
+        LegacyHttpError::with_status(
+            RgbServiceError::Backend(format!("{operation} blocking executor is closed")),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })?;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        // Keep the permit until the synchronous work actually exits. A timed-out
+        // spawn_blocking task cannot be cancelled safely, so releasing it when the
+        // HTTP timeout fires would allow detached work to grow without a bound.
+        let _permit = permit;
+        task()
+    });
+
+    match tokio::time::timeout(LEGACY_BLOCKING_EXECUTION_TIMEOUT, handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => Err(RgbServiceError::Backend(format!(
+            "{operation} blocking worker failed: {err}"
+        ))
+        .into()),
+        Err(_) => Err(LegacyHttpError::with_status(
+            RgbServiceError::Backend(format!(
+                "{operation} timed out after {} seconds",
+                LEGACY_BLOCKING_EXECUTION_TIMEOUT.as_secs()
+            )),
+            StatusCode::GATEWAY_TIMEOUT,
+        )),
+    }
+}
+
 #[derive(Deserialize)]
 struct CreateAccountReq {
     desc: String,
@@ -111,23 +170,26 @@ async fn create_account(
     State(state): State<LegacyState>,
     Json(req): Json<CreateAccountReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
-    let account_id = legacy_account_id(&req.desc);
-    let wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
-    state.service.get_or_create_profile(&account_id)?;
-    state
-        .service
-        .put_legacy_account_desc(&account_id, &req.desc)?;
-    for index in 0..=state.config.reveal_address_count.max(1) {
-        let address = wallet
-            .wallet
-            .peek_address(KeychainKind::External, index)
-            .address
-            .to_string();
+    run_legacy_blocking("legacy account/create", move || {
+        let account_id = legacy_account_id(&req.desc);
+        let wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
+        state.service.get_or_create_profile(&account_id)?;
         state
             .service
-            .put_legacy_address_account(&address, &account_id)?;
-    }
-    Ok(StatusCode::OK)
+            .put_legacy_account_desc(&account_id, &req.desc)?;
+        for index in 0..=state.config.reveal_address_count.max(1) {
+            let address = wallet
+                .wallet
+                .peek_address(KeychainKind::External, index)
+                .address
+                .to_string();
+            state
+                .service
+                .put_legacy_address_account(&address, &account_id)?;
+        }
+        Ok(StatusCode::OK)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -154,24 +216,27 @@ async fn asset_list(
     State(state): State<LegacyState>,
     Query(query): Query<AssetListQuery>,
 ) -> Result<Json<Vec<LegacyAssetInfo>>, LegacyHttpError> {
-    let issuer_desc = legacy_asset_list_issuer_desc(&state.service, &query)?;
-    let mut entries = state.service.list_token_catalog_entries()?;
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let assets = entries
-        .into_iter()
-        .filter(|entry| {
-            query
-                .contract_id
-                .as_deref()
-                .is_none_or(|contract_id| contract_id == entry.contract_id)
-                && issuer_desc
+    run_legacy_blocking("legacy asset/list", move || {
+        let issuer_desc = legacy_asset_list_issuer_desc(&state.service, &query)?;
+        let mut entries = state.service.list_token_catalog_entries()?;
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let assets = entries
+            .into_iter()
+            .filter(|entry| {
+                query
+                    .contract_id
                     .as_deref()
-                    .is_none_or(|desc| desc == entry.issuer_desc)
-        })
-        .map(|entry| entry.into_asset_info())
-        .map(legacy_asset_info)
-        .collect();
-    Ok(Json(assets))
+                    .is_none_or(|contract_id| contract_id == entry.contract_id)
+                    && issuer_desc
+                        .as_deref()
+                        .is_none_or(|desc| desc == entry.issuer_desc)
+            })
+            .map(|entry| entry.into_asset_info())
+            .map(legacy_asset_info)
+            .collect();
+        Ok(Json(assets))
+    })
+    .await
 }
 
 fn legacy_asset_list_issuer_desc(
@@ -273,40 +338,43 @@ async fn utxo(
     State(state): State<LegacyState>,
     Query(query): Query<LegacyUtxoQuery>,
 ) -> Result<Json<Vec<LegacyLocalOutput>>, LegacyHttpError> {
-    // Match wallet-service-v2's QueryListReq behavior: when both are present,
-    // `address` wins and is expanded to its registered descriptor wallet.
-    let desc = if let Some(address) = query.address.as_deref() {
-        let account_id = state
-            .service
-            .resolve_legacy_account_id_for_address(address)?
-            .ok_or_else(|| {
-                RgbServiceError::NotFound(format!("legacy address not found: {address}"))
-            })?;
-        state
-            .service
-            .resolve_legacy_desc_for_account_id(&account_id)?
-            .ok_or_else(|| {
-                RgbServiceError::NotFound(format!(
-                    "legacy desc not found for account: {account_id}"
-                ))
-            })?
-    } else if let Some(desc) = query.desc {
-        desc
-    } else {
-        return Err(
-            RgbServiceError::InvalidRequest("desc or address is required".to_string()).into(),
-        );
-    };
+    run_legacy_blocking("legacy utxo", move || {
+        // Match wallet-service-v2's QueryListReq behavior: when both are present,
+        // `address` wins and is expanded to its registered descriptor wallet.
+        let desc = if let Some(address) = query.address.as_deref() {
+            let account_id = state
+                .service
+                .resolve_legacy_account_id_for_address(address)?
+                .ok_or_else(|| {
+                    RgbServiceError::NotFound(format!("legacy address not found: {address}"))
+                })?;
+            state
+                .service
+                .resolve_legacy_desc_for_account_id(&account_id)?
+                .ok_or_else(|| {
+                    RgbServiceError::NotFound(format!(
+                        "legacy desc not found for account: {account_id}"
+                    ))
+                })?
+        } else if let Some(desc) = query.desc {
+            desc
+        } else {
+            return Err(
+                RgbServiceError::InvalidRequest("desc or address is required".to_string()).into(),
+            );
+        };
 
-    let mut wallet = open_legacy_wallet(&state.service, &state.config, &desc)?;
-    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
-    let utxos = wallet
-        .wallet
-        .list_unspent()
-        .map(LegacyLocalOutput::from)
-        .collect::<Vec<_>>();
-    wallet.persist()?;
-    Ok(Json(utxos))
+        let mut wallet = open_legacy_wallet(&state.service, &state.config, &desc)?;
+        sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
+        let utxos = wallet
+            .wallet
+            .list_unspent()
+            .map(LegacyLocalOutput::from)
+            .collect::<Vec<_>>();
+        wallet.persist()?;
+        Ok(Json(utxos))
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -324,59 +392,62 @@ async fn query_asset(
     State(state): State<LegacyState>,
     Query(query): Query<QueryAssetReq>,
 ) -> Result<Json<BTreeMap<String, Vec<LegacyAllocation>>>, LegacyHttpError> {
-    let account_ids = legacy_query_account_ids(&state, &query)?;
-    let mut result = BTreeMap::<String, Vec<LegacyAllocation>>::new();
-    let mut seen = HashSet::<(String, String, Option<String>)>::new();
-    for account_id in account_ids {
-        let list = state.service.legacy_list_assets(&account_id)?;
-        let metadata = list
-            .assets
-            .into_iter()
-            .map(|asset| (asset.contract_id.clone(), asset))
-            .collect::<HashMap<_, _>>();
-        for (outpoint, allocations) in list.utxo_assets {
-            for allocation in allocations {
-                // `address` identifies the legacy descriptor wallet; it is not
-                // an allocation filter. Change can live on another revealed
-                // address of the same descriptor, and legacy wallet balances
-                // must include those sibling-address allocations as well.
-                if query
-                    .contract_id
-                    .as_deref()
-                    .is_some_and(|contract_id| contract_id != allocation.asset_id)
-                {
-                    continue;
+    run_legacy_blocking("legacy asset", move || {
+        let account_ids = legacy_query_account_ids(&state, &query)?;
+        let mut result = BTreeMap::<String, Vec<LegacyAllocation>>::new();
+        let mut seen = HashSet::<(String, String, Option<String>)>::new();
+        for account_id in account_ids {
+            let list = state.service.legacy_list_assets(&account_id)?;
+            let metadata = list
+                .assets
+                .into_iter()
+                .map(|asset| (asset.contract_id.clone(), asset))
+                .collect::<HashMap<_, _>>();
+            for (outpoint, allocations) in list.utxo_assets {
+                for allocation in allocations {
+                    // `address` identifies the legacy descriptor wallet; it is not
+                    // an allocation filter. Change can live on another revealed
+                    // address of the same descriptor, and legacy wallet balances
+                    // must include those sibling-address allocations as well.
+                    if query
+                        .contract_id
+                        .as_deref()
+                        .is_some_and(|contract_id| contract_id != allocation.asset_id)
+                    {
+                        continue;
+                    }
+                    let Some(asset) = metadata.get(&allocation.asset_id) else {
+                        continue;
+                    };
+                    if !seen.insert((
+                        outpoint.clone(),
+                        allocation.asset_id.clone(),
+                        allocation.address.clone(),
+                    )) {
+                        continue;
+                    }
+                    result
+                        .entry(outpoint.clone())
+                        .or_default()
+                        .push(LegacyAllocation {
+                            contract_id: asset.contract_id.clone(),
+                            ticker: Some(asset.ticker.clone()),
+                            rgb_amount: allocation.amount,
+                            address: allocation.address,
+                            status: if allocation.confirmed.unwrap_or(true) {
+                                "Confirmed".to_string()
+                            } else {
+                                "Pending".to_string()
+                            },
+                            decimal: Some(i16::from(asset.precision)),
+                            txid: outpoint.split(':').next().map(ToString::to_string),
+                        });
                 }
-                let Some(asset) = metadata.get(&allocation.asset_id) else {
-                    continue;
-                };
-                if !seen.insert((
-                    outpoint.clone(),
-                    allocation.asset_id.clone(),
-                    allocation.address.clone(),
-                )) {
-                    continue;
-                }
-                result
-                    .entry(outpoint.clone())
-                    .or_default()
-                    .push(LegacyAllocation {
-                        contract_id: asset.contract_id.clone(),
-                        ticker: Some(asset.ticker.clone()),
-                        rgb_amount: allocation.amount,
-                        address: allocation.address,
-                        status: if allocation.confirmed.unwrap_or(true) {
-                            "Confirmed".to_string()
-                        } else {
-                            "Pending".to_string()
-                        },
-                        decimal: Some(i16::from(asset.precision)),
-                        txid: outpoint.split(':').next().map(ToString::to_string),
-                    });
             }
         }
-    }
-    Ok(Json(result))
+        Ok(Json(result))
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -452,10 +523,13 @@ fn legacy_desc_account_ids(
         // a legacy wallet registers its descriptor. Keep that address-owned
         // stock reachable after `/account/create` installs the address -> desc
         // mapping; otherwise registration makes an existing balance disappear.
-        if state.service.account_stock_dir(&address).exists() && seen.insert(address.clone()) {
+        if state.service.account_stock_has_data(&address) && seen.insert(address.clone()) {
             account_ids.push(address.clone());
         }
-        if let Some(account_id) = state.service.resolve_legacy_account_id_for_address(&address)? {
+        if let Some(account_id) = state
+            .service
+            .resolve_legacy_account_id_for_address(&address)?
+        {
             if seen.insert(account_id.clone()) {
                 account_ids.push(account_id);
             }
@@ -510,45 +584,49 @@ async fn issue_asset(
     State(state): State<LegacyState>,
     Json(req): Json<IssueAssetReq>,
 ) -> Result<Json<IssueAssetResp>, LegacyHttpError> {
-    let _ = (&req.terms, &req.issuer);
-    let account_id = legacy_account_id(&req.desc);
-    let mut wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
-    sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
-    let allocation_outpoint = match req.utxo {
-        Some(utxo) => OutPoint::from_str(&utxo)
-            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
-        None => wallet
-            .wallet
-            .list_unspent()
-            .next()
-            .map(|utxo| utxo.outpoint)
-            .ok_or_else(|| {
-                RgbServiceError::InvalidRequest(
-                    "utxo is required when the descriptor wallet has no synced UTXO".to_string(),
-                )
-            })?,
-    };
-    let issued = rgb_service_local::issue_rgb20_fixed_with_chain_source(
-        &state.service.account_stock_dir(&account_id),
-        state.service.network()?,
-        &state.service.chain_source(),
-        rgb_service_local::Rgb20IssueRequest {
-            ticker: req.ticker,
-            name: req.name,
-            amount: req.amount,
-            precision: req.precision,
-            utxo: allocation_outpoint,
-        },
-    )
-    .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-    state.service.put_account_utxo(
-        &account_id,
-        tracked_utxo_for_wallet(&wallet, allocation_outpoint),
-    )?;
-    wallet.persist()?;
-    Ok(Json(IssueAssetResp {
-        contract_id: issued.contract_id.to_string(),
-    }))
+    run_legacy_blocking("legacy asset/internal/issue", move || {
+        let _ = (&req.terms, &req.issuer);
+        let account_id = legacy_account_id(&req.desc);
+        let mut wallet = open_legacy_wallet(&state.service, &state.config, &req.desc)?;
+        sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
+        let allocation_outpoint = match req.utxo {
+            Some(utxo) => OutPoint::from_str(&utxo)
+                .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?,
+            None => wallet
+                .wallet
+                .list_unspent()
+                .next()
+                .map(|utxo| utxo.outpoint)
+                .ok_or_else(|| {
+                    RgbServiceError::InvalidRequest(
+                        "utxo is required when the descriptor wallet has no synced UTXO"
+                            .to_string(),
+                    )
+                })?,
+        };
+        let issued = rgb_service_local::issue_rgb20_fixed_with_chain_source(
+            &state.service.account_stock_dir(&account_id),
+            state.service.network()?,
+            &state.service.chain_source(),
+            rgb_service_local::Rgb20IssueRequest {
+                ticker: req.ticker,
+                name: req.name,
+                amount: req.amount,
+                precision: req.precision,
+                utxo: allocation_outpoint,
+            },
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        state.service.put_account_utxo(
+            &account_id,
+            tracked_utxo_for_wallet(&wallet, allocation_outpoint),
+        )?;
+        wallet.persist()?;
+        Ok(Json(IssueAssetResp {
+            contract_id: issued.contract_id.to_string(),
+        }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -581,8 +659,10 @@ struct LegacyParsedRgbAssignment {
 
 async fn transfer_psbt(
     State(state): State<LegacyState>,
-    Json(mut req): Json<TransferReq>,
+    Json(req): Json<TransferReq>,
 ) -> Result<Json<TransferPsbtResp>, LegacyHttpError> {
+    run_legacy_blocking("legacy transfer/psbt", move || {
+    let mut req = req;
     if req.assign.is_empty() {
         return Err(RgbServiceError::InvalidRequest("assign is empty".to_string()).into());
     }
@@ -770,6 +850,8 @@ async fn transfer_psbt(
     Ok(Json(TransferPsbtResp {
         psbt: prepared.psbt.to_string(),
     }))
+    })
+    .await
 }
 
 fn build_legacy_btc_only_psbt(
@@ -1058,6 +1140,7 @@ async fn transfer_callback(
     State(state): State<LegacyState>,
     Json(req): Json<TransferCallbackReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
+    run_legacy_blocking("legacy transfer/callback", move || {
     // Parse the signed transaction (the caller submits the fully-signed tx;
     // the daemon is responsible for broadcasting it, mirroring wallet-v2).
     let tx: bdk_wallet::bitcoin::Transaction = match (req.txid.clone(), req.tx.clone()) {
@@ -1129,6 +1212,8 @@ async fn transfer_callback(
         apply_legacy_signed_tx(&state, &desc, account_id.as_deref(), &tx)?;
     }
     Ok(StatusCode::OK)
+    })
+    .await
 }
 
 fn apply_legacy_signed_tx(
@@ -1142,9 +1227,7 @@ fn apply_legacy_signed_tx(
         .duration_since(UNIX_EPOCH)
         .map_err(|err| RgbServiceError::Backend(err.to_string()))?
         .as_secs();
-    wallet
-        .wallet
-        .apply_unconfirmed_txs([(tx.clone(), seen_at)]);
+    wallet.wallet.apply_unconfirmed_txs([(tx.clone(), seen_at)]);
 
     let canonical_account_id = legacy_account_id(desc);
     state
@@ -1184,18 +1267,21 @@ async fn transfer_cancel(
     State(state): State<LegacyState>,
     Json(req): Json<TransferCancelReq>,
 ) -> Result<impl IntoResponse, LegacyHttpError> {
-    let account_id = legacy_account_id(&req.desc);
-    if let Some(transfer_id) = req.transfer_id {
-        state
-            .service
-            .legacy_remove_prepared_transfer(&account_id, &transfer_id)?;
-    }
-    Ok(StatusCode::OK)
+    run_legacy_blocking("legacy transfer/cancel", move || {
+        let account_id = legacy_account_id(&req.desc);
+        if let Some(transfer_id) = req.transfer_id {
+            state
+                .service
+                .legacy_remove_prepared_transfer(&account_id, &transfer_id)?;
+        }
+        Ok(StatusCode::OK)
+    })
+    .await
 }
 
 struct LegacyWallet {
-    wallet: PersistedWallet<file_store::Store<ChangeSet>>,
-    db: file_store::Store<ChangeSet>,
+    wallet: PersistedWallet<LegacyWalletDb>,
+    db: LegacyWalletDb,
 }
 
 impl LegacyWallet {
@@ -1209,6 +1295,153 @@ impl LegacyWallet {
     }
 }
 
+struct LegacyWalletDb {
+    db: SingleWriterTxDatabase,
+    wallets: SingleWriterTxKeyspace,
+    account_hash: String,
+}
+
+impl LegacyWalletDb {
+    fn new(db: SingleWriterTxDatabase, account_hash: impl Into<String>) -> Result<Self, String> {
+        let wallets = db
+            .keyspace("legacy_wallets", KeyspaceCreateOptions::default)
+            .map_err(|err| err.to_string())?;
+        Ok(Self {
+            db,
+            wallets,
+            account_hash: account_hash.into(),
+        })
+    }
+
+    fn load_changeset(&self) -> Result<ChangeSet, String> {
+        self.wallets
+            .get(self.account_hash.as_bytes())
+            .map_err(|err| err.to_string())?
+            .map(|bytes| bincode::deserialize(bytes.as_ref()).map_err(|err| err.to_string()))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    fn store_changeset(&self, changeset: &ChangeSet) -> Result<(), String> {
+        let bytes = bincode::serialize(changeset).map_err(|err| err.to_string())?;
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.wallets, self.account_hash.as_bytes(), bytes);
+        tx.commit().map_err(|err| err.to_string())?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl WalletPersister for LegacyWalletDb {
+    type Error = String;
+
+    fn initialize(persister: &mut Self) -> Result<ChangeSet, Self::Error> {
+        persister.load_changeset()
+    }
+
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        let mut aggregate = persister.load_changeset()?;
+        aggregate.merge(changeset.clone());
+        persister.store_changeset(&aggregate)
+    }
+}
+
+fn migrate_one_legacy_wallet_file(
+    service: &LocalDaemonService,
+    account_hash: &str,
+    target: &mut LegacyWalletDb,
+) -> Result<bool, LegacyHttpError> {
+    if !target
+        .load_changeset()
+        .map_err(RgbServiceError::Backend)?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    let source = service
+        .config
+        .data_dir
+        .join("legacy-wallets")
+        .join(account_hash)
+        .join(BDK_FILE);
+    if !source.is_file() {
+        return Ok(false);
+    }
+    let (_, changeset) =
+        file_store::Store::<ChangeSet>::load(LEGACY_BDK_MAGIC, &source).map_err(|err| {
+            RgbServiceError::Backend(format!(
+                "load legacy wallet file {}: {err}",
+                source.display()
+            ))
+        })?;
+    let Some(changeset) = changeset else {
+        return Ok(false);
+    };
+    target
+        .store_changeset(&changeset)
+        .map_err(RgbServiceError::Backend)?;
+    Ok(true)
+}
+
+pub(crate) fn migrate_legacy_wallets_to_database(
+    service: &LocalDaemonService,
+) -> Result<usize, RgbServiceError> {
+    const MIGRATION: &[u8] = b"legacy_wallet_files_to_shared_v1";
+    let migrations = service
+        .db
+        .keyspace("schema_migrations", KeyspaceCreateOptions::default)
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    if migrations
+        .get(MIGRATION)
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+        .is_some()
+    {
+        return Ok(0);
+    }
+
+    let legacy_dir = service.config.data_dir.join("legacy-wallets");
+    let mut migrated = 0usize;
+    if legacy_dir.is_dir() {
+        let mut entries = std::fs::read_dir(&legacy_dir)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if !entry
+                .file_type()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let account_hash = entry.file_name().to_string_lossy().to_string();
+            let mut target = LegacyWalletDb::new(service.db.clone(), &account_hash)
+                .map_err(RgbServiceError::Backend)?;
+            if migrate_one_legacy_wallet_file(service, &account_hash, &mut target)
+                .map_err(|err| err.err)?
+            {
+                migrated += 1;
+            }
+        }
+    }
+
+    let mut tx = service.db.write_tx();
+    tx.insert(
+        &migrations,
+        MIGRATION,
+        format!("migrated={migrated}").as_bytes(),
+    );
+    tx.commit()
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    service
+        .db
+        .persist(PersistMode::SyncAll)
+        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    Ok(migrated)
+}
+
 fn open_legacy_wallet(
     service: &LocalDaemonService,
     config: &LegacyConfig,
@@ -1217,10 +1450,10 @@ fn open_legacy_wallet(
     let network = service.network()?;
     let descriptor = ExtendedDescriptor::from_str(desc)
         .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-    let dir = legacy_wallet_dir(&service.config.data_dir, desc);
-    std::fs::create_dir_all(&dir).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-    let (mut db, _) = file_store::Store::load_or_create(LEGACY_BDK_MAGIC, dir.join(BDK_FILE))
-        .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+    let account_hash = legacy_account_hash(desc);
+    let mut db =
+        LegacyWalletDb::new(service.db.clone(), &account_hash).map_err(RgbServiceError::Backend)?;
+    migrate_one_legacy_wallet_file(service, &account_hash, &mut db)?;
     let mut wallet = match Wallet::load()
         .descriptor(KeychainKind::External, Some(descriptor.clone()))
         .check_network(network)
@@ -1347,12 +1580,6 @@ fn tracked_utxo_for_wallet(wallet: &LegacyWallet, outpoint: OutPoint) -> Tracked
     }
 }
 
-fn legacy_wallet_dir(data_dir: &Path, desc: &str) -> PathBuf {
-    data_dir
-        .join("legacy-wallets")
-        .join(legacy_account_hash(desc))
-}
-
 pub(crate) fn legacy_account_id(desc: &str) -> String {
     format!("legacy-desc:{}", legacy_account_hash(desc))
 }
@@ -1372,6 +1599,7 @@ fn legacy_transfer_id(psbt: &Psbt) -> String {
 struct LegacyHttpError {
     err: RgbServiceError,
     legacy_code: Option<u8>,
+    status: Option<StatusCode>,
 }
 
 impl LegacyHttpError {
@@ -1379,6 +1607,15 @@ impl LegacyHttpError {
         Self {
             err,
             legacy_code: Some(legacy_code),
+            status: None,
+        }
+    }
+
+    fn with_status(err: RgbServiceError, status: StatusCode) -> Self {
+        Self {
+            err,
+            legacy_code: None,
+            status: Some(status),
         }
     }
 }
@@ -1388,13 +1625,14 @@ impl From<RgbServiceError> for LegacyHttpError {
         Self {
             err,
             legacy_code: None,
+            status: None,
         }
     }
 }
 
 impl IntoResponse for LegacyHttpError {
     fn into_response(self) -> Response {
-        let status = match &self.err {
+        let status = self.status.unwrap_or_else(|| match &self.err {
             RgbServiceError::Unauthorized(_) | RgbServiceError::SignatureRequired(_) => {
                 StatusCode::UNAUTHORIZED
             }
@@ -1406,7 +1644,7 @@ impl IntoResponse for LegacyHttpError {
             RgbServiceError::Conflict(_) => StatusCode::CONFLICT,
             RgbServiceError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             RgbServiceError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        });
         let message = self.err.to_string();
         let body = match self.legacy_code {
             Some(code) => serde_json::json!({ "code": code, "message": message }),
@@ -1478,5 +1716,37 @@ mod tests {
         assert!(value["chain_position"]["Unconfirmed"]
             .get("first_seen")
             .is_none());
+    }
+
+    #[test]
+    fn legacy_wallet_state_roundtrips_through_shared_fjall_database() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rgb-legacy-wallet-db-{suffix}"));
+        std::fs::create_dir_all(&path).unwrap();
+        let database = SingleWriterTxDatabase::builder(&path).open().unwrap();
+        let descriptor =
+            ExtendedDescriptor::from_str(&format!("wpkh({LEGACY_DESCRIPTOR_KEY})")).unwrap();
+        let mut persister = LegacyWalletDb::new(database.clone(), "account-a").unwrap();
+        let mut wallet = Wallet::create_single(descriptor.clone())
+            .network(Network::Bitcoin)
+            .create_wallet(&mut persister)
+            .unwrap();
+        let revealed = wallet.reveal_next_address(KeychainKind::External).address;
+        wallet.persist(&mut persister).unwrap();
+
+        let mut reopened = LegacyWalletDb::new(database, "account-a").unwrap();
+        let wallet = Wallet::load()
+            .descriptor(KeychainKind::External, Some(descriptor))
+            .check_network(Network::Bitcoin)
+            .load_wallet(&mut reopened)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wallet.peek_address(KeychainKind::External, 0).address,
+            revealed
+        );
     }
 }

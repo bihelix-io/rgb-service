@@ -5,6 +5,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, SyncSender, TrySendError},
     Arc, Mutex, OnceLock,
 };
 use std::thread;
@@ -38,7 +39,6 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Witness,
 };
 use dynamic::{Dynamic, FromJson, MsgPack, MsgUnpack, ToJson, Type};
-use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase};
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use lightning::ln::msgs::SocketAddress;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
@@ -69,11 +69,16 @@ const BTC_ADDRESS_POOL_TARGET: usize = 20;
 const BTC_ADDRESS_XPUB_DEFAULT_PATH: &str = "0/*";
 const BTC_ADDRESS_XPUB_LOOKUP_LIMIT: u32 = 20_000;
 const BTC_ADDRESS_XPUB_LOOKUP_MARGIN: u32 = 1_000;
+const RGB_CALLBACK_WORKER_COUNT: usize = 4;
+const RGB_CALLBACK_QUEUE_CAPACITY: usize = 64;
 static CONSOLE_IROH_SECRET: OnceLock<SecretKey> = OnceLock::new();
 static CONSOLE_IROH_ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 static CONSOLE_ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static ESPLORA_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 static LN_RGB_NODE: OnceLock<Mutex<Option<Arc<LnRgbBtcLnBackend>>>> = OnceLock::new();
+type RgbCallbackJob = Box<dyn FnOnce() + Send + 'static>;
+static RGB_CALLBACK_QUEUE: OnceLock<std::result::Result<SyncSender<RgbCallbackJob>, String>> =
+    OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -910,13 +915,6 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
-        "scan_utxos",
-        &[Type::Str],
-        Type::Any,
-        rgb_scan_utxos as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "rgb",
         "token_list",
         &[],
         Type::Any,
@@ -1069,6 +1067,34 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
+        "transfer_rgb_l1",
+        &[Type::Str, Type::U64, Type::Str, Type::U64],
+        Type::Any,
+        ln_rgb_transfer_rgb_l1 as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "prepare_external_rgb_l1_sweep",
+        &[Type::Str, Type::U64, Type::Str, Type::Str, Type::U64],
+        Type::Any,
+        ln_rgb_prepare_external_rgb_l1_sweep as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "commit_rgb_l1_transfer",
+        &[Type::Str, Type::U64, Type::Str, Type::Str],
+        Type::Any,
+        ln_rgb_commit_rgb_l1_transfer as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
+        "commit_external_rgb_l1_sweep",
+        &[Type::Str, Type::Str, Type::U64, Type::Str, Type::Str],
+        Type::Any,
+        ln_rgb_commit_external_rgb_l1_sweep as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
         "amount",
         &[],
         Type::Any,
@@ -1150,13 +1176,6 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
         &[Type::Str],
         Type::Any,
         ln_rgb_pay as *const u8,
-    )?;
-    jit.add_native_module_ptr(
-        "ln_rgb",
-        "events",
-        &[],
-        Type::Any,
-        ln_rgb_events as *const u8,
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
@@ -1337,6 +1356,8 @@ extern "C" fn btc_verify_message(
 }
 
 extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
+    const MAX_RETURNED_DEPOSITS: usize = 100;
+
     native_string_dynamic_result(input, |ident_filter| {
         let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
         store.put_wallet_btc_address(&default_account_id()?)?;
@@ -1437,7 +1458,9 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
                         &record,
                     )?;
                     persisted += 1;
-                    deposits.push(record);
+                    if deposits.len() < MAX_RETURNED_DEPOSITS {
+                        deposits.push(record);
+                    }
                 }
             }
             let utxos = btc_address_utxos_json(&address, &scan_esplora)?;
@@ -1490,7 +1513,9 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
                     &record,
                 )?;
                 persisted += 1;
-                deposits.push(record);
+                if deposits.len() < MAX_RETURNED_DEPOSITS {
+                    deposits.push(record);
+                }
             }
         }
         Ok(json_to_dynamic(&json!({
@@ -1502,16 +1527,14 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "persisted": persisted,
             "deposits": deposits,
-            "stored_deposits": store
-                .list_btc_deposit_records()?
-                .into_iter()
-                .map(|(_, record)| record)
-                .collect::<Vec<_>>()
+            "stored_deposits_count": store.count_btc_deposit_records()?
         })))
     })
 }
 
 extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
+    const MAX_RETURNED_DEPOSITS: usize = 100;
+
     native_string_dynamic_result(input, |ident_filter| {
         let ident_filter = ident_filter.to_string();
         ensure!(!ident_filter.trim().is_empty(), "ident must not be empty");
@@ -1596,7 +1619,9 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
                         &record,
                     )?;
                     persisted += 1;
-                    deposits.push(record);
+                    if deposits.len() < MAX_RETURNED_DEPOSITS {
+                        deposits.push(record);
+                    }
                 }
             }
             let utxos = btc_address_utxos_json(&address, &scan_esplora)?;
@@ -1649,7 +1674,9 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
                     &record,
                 )?;
                 persisted += 1;
-                deposits.push(record);
+                if deposits.len() < MAX_RETURNED_DEPOSITS {
+                    deposits.push(record);
+                }
             }
         }
         Ok(json_to_dynamic(&json!({
@@ -1661,11 +1688,7 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
             "scanner_started": LN_SCANNER_STARTED.load(Ordering::SeqCst),
             "persisted": persisted,
             "deposits": deposits,
-            "stored_deposits": store
-                .list_btc_deposit_records()?
-                .into_iter()
-                .map(|(_, record)| record)
-                .collect::<Vec<_>>()
+            "stored_deposits_count": store.count_btc_deposit_records()?
         })))
     })
 }
@@ -3792,6 +3815,36 @@ fn extract_transaction_hex_from_signed_psbt(signed_psbt: &str) -> Result<(String
     Ok((tx_hex, txid))
 }
 
+fn rgb_callback_queue() -> Result<&'static SyncSender<RgbCallbackJob>> {
+    match RGB_CALLBACK_QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<RgbCallbackJob>(RGB_CALLBACK_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for worker_index in 0..RGB_CALLBACK_WORKER_COUNT {
+            let receiver = Arc::clone(&receiver);
+            thread::Builder::new()
+                .name(format!("zust-rgb-worker-{worker_index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let receiver = match receiver.lock() {
+                            Ok(receiver) => receiver,
+                            Err(_) => break,
+                        };
+                        match receiver.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    };
+                    job();
+                })
+                .map_err(|err| format!("spawn RGB callback worker {worker_index}: {err}"))?;
+        }
+        Ok(sender)
+    }) {
+        Ok(sender) => Ok(sender),
+        Err(err) => bail!("{err}"),
+    }
+}
+
 fn spawn_rgb_callback_worker<F>(
     operation: &'static str,
     callback: &Dynamic,
@@ -3803,26 +3856,33 @@ where
     let Some(callback) = callback.as_custom::<ZustCallback>().cloned() else {
         bail!("callback must be a Zust callback, for example `|result| {{ ... }}`");
     };
-    thread::Builder::new()
-        .name(format!("zust-rgb-{operation}"))
-        .spawn(move || {
-            let result = work().unwrap_or_else(|err| {
-                json_to_dynamic(&json!({
-                    "ok": false,
-                    "module": "rgb",
-                    "operation": operation,
-                    "error": format!("{err:#}")
-                }))
-            });
-            if let Err(err) = callback.call1(result) {
-                eprintln!("[zust-console] rgb::{operation} callback failed: {err:#}");
-            }
-        })
-        .with_context(|| format!("spawn RGB {operation} worker"))?;
+    let job: RgbCallbackJob = Box::new(move || {
+        let result = work().unwrap_or_else(|err| {
+            json_to_dynamic(&json!({
+                "ok": false,
+                "module": "rgb",
+                "operation": operation,
+                "error": format!("{err:#}")
+            }))
+        });
+        if let Err(err) = callback.call1(result) {
+            eprintln!("[zust-console] rgb::{operation} callback failed: {err:#}");
+        }
+    });
+    let queue = rgb_callback_queue()?;
+    match queue.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            bail!("RGB callback worker queue is full; retry later")
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            bail!("RGB callback worker queue is disconnected")
+        }
+    }
     Ok(ok(json!({
         "module": "rgb",
         "operation": operation,
-        "status": "spawned"
+        "status": "queued"
     })))
 }
 
@@ -4045,33 +4105,13 @@ extern "C" fn rgb_assets_by_utxo(
         ensure!(!outpoint.is_empty(), "outpoint must not be empty");
         spawn_rgb_callback_worker("assets_by_utxo", callback, move || {
             let payload = json_to_dynamic(&json!({
+                "account_id": address.clone(),
                 "outpoint": outpoint,
                 "address": if address.is_empty() { Value::Null } else { json!(address) },
                 "confirmed": confirmed
             }));
-            rgb_post_dynamic(&payload, "/v1/assets/by-utxo")
+            rgb_public_post_dynamic(&payload, "/v1/assets/by-utxo")
         })
-    })
-}
-extern "C" fn rgb_scan_utxos(address: *const Dynamic) -> *const Dynamic {
-    let address = unsafe { &*address };
-    native_result(|| {
-        ensure!(address.is_str(), "address must be string");
-        let address = address.as_str().trim().to_string();
-        ensure!(!address.is_empty(), "address must not be empty");
-        let esplora = btc_esplora_url();
-        let utxos = scan_utxos_json(&address, &esplora)?;
-        let recorded = record_daemon_account_utxos(&address, &utxos)?;
-        let count = utxos.as_array().map(Vec::len).unwrap_or_default();
-        Ok(ok(json!({
-            "module": "rgb",
-            "operation": "scan_utxos",
-            "account_id": address,
-            "address": address,
-            "count": count,
-            "recorded": recorded,
-            "utxos": utxos
-        })))
     })
 }
 extern "C" fn rgb_token_list() -> *const Dynamic {
@@ -4636,10 +4676,6 @@ extern "C" fn ln_rgb_stop() -> *const Dynamic {
     })
 }
 
-extern "C" fn ln_rgb_events() -> *const Dynamic {
-    native_result(|| ln_events_with_limit(100))
-}
-
 extern "C" fn ln_rgb_retry_sweeps() -> *const Dynamic {
     native_result(|| {
         let node =
@@ -4652,22 +4688,6 @@ extern "C" fn ln_rgb_retry_sweeps() -> *const Dynamic {
             "note": "processed pending LDK events and asked output sweeper to rebroadcast pending spends"
         })))
     })
-}
-
-fn ln_events_with_limit(limit: usize) -> Result<Dynamic> {
-    let node = running_ln_node()?;
-    let mut out = Vec::new();
-    for _ in 0..limit {
-        let Some(event) = node.next_event_debug() else {
-            break;
-        };
-        out.push(json!(event));
-        node.event_handled()?;
-    }
-    Ok(ok(json!({
-        "module": "ln_rgb",
-        "events": out
-    })))
 }
 
 extern "C" fn ln_rgb_assets() -> *const Dynamic {
@@ -4784,6 +4804,191 @@ extern "C" fn ln_rgb_transfer_batch_with_inputs(
             outputs.as_str(),
             fee_rate_sat_vb,
             input_outpoints.as_str(),
+        )?))
+    })
+}
+
+extern "C" fn ln_rgb_transfer_rgb_l1(
+    asset_id: *const Dynamic,
+    amount: u64,
+    recipient: *const Dynamic,
+    fee_rate_sat_vb: u64,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let recipient = unsafe { &*recipient };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(recipient.is_str(), "recipient must be string");
+        let node = running_ln_node()?;
+        let result = node.transfer_rgb_l1_json(
+            asset_id.as_str(),
+            amount,
+            recipient.as_str(),
+            fee_rate_sat_vb,
+        )?;
+        if result.get("ok").and_then(Value::as_bool) == Some(false) {
+            Ok(json_to_dynamic(&result))
+        } else {
+            Ok(ok(result))
+        }
+    })
+}
+
+extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
+    asset_id: *const Dynamic,
+    amount: u64,
+    source_outpoint: *const Dynamic,
+    source_address: *const Dynamic,
+    fee_rate_sat_vb: u64,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let source_outpoint = unsafe { &*source_outpoint };
+    let source_address = unsafe { &*source_address };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(source_outpoint.is_str(), "source_outpoint must be string");
+        ensure!(source_address.is_str(), "source_address must be string");
+        let source_outpoint_text = source_outpoint.as_str().trim();
+        let source_address_text = source_address.as_str().trim();
+        let source_outpoint = OutPoint::from_str(source_outpoint_text)
+            .with_context(|| format!("invalid external RGB source outpoint: {source_outpoint_text}"))?;
+        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let xpub_config = btc_address_xpub_config()?
+            .context("BTC address xpub is required to describe the external RGB source input")?;
+        let (public_key, fingerprint, derivation_path) = btc_xpub_input_key_source(
+            &store,
+            &xpub_config,
+            source_address_text,
+        )?
+        .with_context(|| {
+            format!(
+                "external RGB source address is not in the configured xpub: {source_address_text}"
+            )
+        })?;
+        let node = running_ln_node()?;
+        let mut result = node.prepare_external_rgb_l1_sweep_json(
+            asset_id.as_str(),
+            amount,
+            source_outpoint_text,
+            source_address_text,
+            fee_rate_sat_vb,
+        )?;
+        let psbt_text = result
+            .get("partially_signed_psbt")
+            .and_then(Value::as_str)
+            .context("external RGB sweep prepare result missing PSBT")?;
+        let mut psbt = Psbt::from_str(psbt_text)
+            .context("decode partially signed external RGB sweep PSBT")?;
+        let source_input_index = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == source_outpoint)
+            .context("external RGB source input is missing from partially signed PSBT")?;
+        psbt.inputs[source_input_index]
+            .bip32_derivation
+            .insert(public_key, (fingerprint, derivation_path.clone()));
+        let psbt_bytes = psbt.serialize();
+        let psbt_text = psbt.to_string();
+        let transfer_id = result
+            .get("transfer_id")
+            .and_then(Value::as_str)
+            .context("external RGB sweep prepare result missing transfer_id")?;
+        let safe_transfer_id = transfer_id
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+            .collect::<String>();
+        ensure!(
+            !safe_transfer_id.is_empty(),
+            "external RGB sweep transfer_id cannot be used as an artifact name"
+        );
+        let artifact_dir = PathBuf::from("artifacts");
+        fs::create_dir_all(&artifact_dir)?;
+        let psbt_path = artifact_dir.join(format!(
+            "rgb-custody-sweep-{safe_transfer_id}-partially-signed.psbt"
+        ));
+        fs::write(&psbt_path, &psbt_bytes)
+            .with_context(|| format!("write Sparrow PSBT artifact {}", psbt_path.display()))?;
+        restrict_private_file(&psbt_path)?;
+        let psbt_sha256 = sha256::Hash::hash(&psbt_bytes).to_string();
+        let object = result
+            .as_object_mut()
+            .context("external RGB sweep prepare result must be an object")?;
+        object.insert("partially_signed_psbt".to_string(), json!(psbt_text));
+        object.insert(
+            "prepared_anchor_psbt".to_string(),
+            json!(bytes_to_hex(&psbt_bytes)),
+        );
+        object.insert("source_public_key".to_string(), json!(public_key.to_string()));
+        object.insert("source_fingerprint".to_string(), json!(fingerprint.to_string()));
+        object.insert(
+            "source_derivation_path".to_string(),
+            json!(derivation_path.to_string()),
+        );
+        object.insert(
+            "sparrow_action".to_string(),
+            json!("sign_external_rgb_input_and_return_psbt_without_broadcasting"),
+        );
+        object.insert("artifact_path".to_string(), json!(psbt_path.display().to_string()));
+        object.insert("artifact_sha256".to_string(), json!(psbt_sha256));
+        let metadata_path = artifact_dir.join(format!(
+            "rgb-custody-sweep-{safe_transfer_id}-metadata.json"
+        ));
+        object.insert(
+            "metadata_path".to_string(),
+            json!(metadata_path.display().to_string()),
+        );
+        write_private_json_file(&metadata_path, &result)?;
+        Ok(ok(result))
+    })
+}
+
+extern "C" fn ln_rgb_commit_rgb_l1_transfer(
+    asset_id: *const Dynamic,
+    amount: u64,
+    transfer_id: *const Dynamic,
+    txid: *const Dynamic,
+) -> *const Dynamic {
+    let asset_id = unsafe { &*asset_id };
+    let transfer_id = unsafe { &*transfer_id };
+    let txid = unsafe { &*txid };
+    native_result(|| {
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(transfer_id.is_str(), "transfer_id must be string");
+        ensure!(txid.is_str(), "txid must be string");
+        let node = running_ln_node()?;
+        Ok(ok(node.commit_rgb_l1_transfer_json(
+            asset_id.as_str(),
+            amount,
+            transfer_id.as_str(),
+            txid.as_str(),
+        )?))
+    })
+}
+
+extern "C" fn ln_rgb_commit_external_rgb_l1_sweep(
+    source_account_id: *const Dynamic,
+    asset_id: *const Dynamic,
+    amount: u64,
+    transfer_id: *const Dynamic,
+    txid: *const Dynamic,
+) -> *const Dynamic {
+    let source_account_id = unsafe { &*source_account_id };
+    let asset_id = unsafe { &*asset_id };
+    let transfer_id = unsafe { &*transfer_id };
+    let txid = unsafe { &*txid };
+    native_result(|| {
+        ensure!(source_account_id.is_str(), "source_account_id must be string");
+        ensure!(asset_id.is_str(), "asset_id must be string");
+        ensure!(transfer_id.is_str(), "transfer_id must be string");
+        ensure!(txid.is_str(), "txid must be string");
+        let node = running_ln_node()?;
+        Ok(ok(node.commit_external_rgb_l1_sweep_json(
+            source_account_id.as_str(),
+            asset_id.as_str(),
+            amount,
+            transfer_id.as_str(),
+            txid.as_str(),
         )?))
     })
 }
@@ -5635,6 +5840,12 @@ fn rgb_post_dynamic(input: &Dynamic, route: &str) -> Result<Dynamic> {
     Ok(json_to_dynamic(&response))
 }
 
+fn rgb_public_post_dynamic(input: &Dynamic, route: &str) -> Result<Dynamic> {
+    let url = daemon_route_url(route)?;
+    let response = http_post_json(&url, &dynamic_to_json(input))?;
+    Ok(json_to_dynamic(&response))
+}
+
 fn request_options(input: &Dynamic, route: &str) -> Result<Dynamic> {
     let url = daemon_route_url(route)?;
     let request = Dynamic::map(Default::default());
@@ -6029,59 +6240,6 @@ fn scan_utxos_json(address: &str, esplora: &str) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(Value::Array(tracked))
-}
-
-fn record_daemon_account_utxos(account_id: &str, utxos: &Value) -> Result<usize> {
-    let data_dir = rgb_service_data_dir()?;
-    let db_dir = data_dir.join("kv");
-    ensure!(
-        db_dir.is_dir(),
-        "RGB service database not found at {}; set `local/rgb-service-data` to daemon service.data_dir on the SSH host",
-        db_dir.display()
-    );
-    let db = SingleWriterTxDatabase::builder(&db_dir)
-        .open()
-        .with_context(|| format!("open RGB service database {}", db_dir.display()))?;
-    let keyspace = db
-        .keyspace("account_utxos", KeyspaceCreateOptions::default)
-        .context("open RGB service account_utxos keyspace")?;
-    let mut tx = db.write_tx();
-    let mut recorded = 0usize;
-    for utxo in utxos.as_array().cloned().unwrap_or_default() {
-        let outpoint = utxo
-            .get("outpoint")
-            .and_then(Value::as_str)
-            .context("scanned UTXO missing outpoint")?;
-        OutPoint::from_str(outpoint).with_context(|| format!("invalid outpoint {outpoint}"))?;
-        let key = format!("{account_id}:{outpoint}");
-        let bytes = serde_json::to_vec(&utxo).context("encode account UTXO")?;
-        tx.insert(&keyspace, key.as_bytes(), bytes);
-        recorded += 1;
-    }
-    tx.commit().context("record RGB account UTXOs")?;
-    db.persist(PersistMode::SyncAll)
-        .context("persist RGB account UTXOs")?;
-    Ok(recorded)
-}
-
-fn rgb_service_data_dir() -> Result<PathBuf> {
-    local_string("rgb-service-data")
-        .or_else(|| {
-            local_dynamic("rgb-service-config")
-                .map(|value| dynamic_to_json(&value))
-                .and_then(|value| {
-                    value
-                        .get("service")
-                        .and_then(|service| service.get("data_dir"))
-                        .and_then(Value::as_str)
-                        .or_else(|| value.get("data_dir").and_then(Value::as_str))
-                        .map(str::to_string)
-                })
-        })
-        .map(PathBuf::from)
-        .context(
-            "missing root value `local/rgb-service-data`; set it to daemon service.data_dir on the SSH host",
-        )
 }
 
 fn esplora_http_client() -> Result<&'static reqwest::blocking::Client> {

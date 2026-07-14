@@ -225,8 +225,8 @@ POST /v1/transfers/cancel
 
 daemon 启动后会按配置 `recovery_scan_interval_secs` 定时扫描：
 
-- `accounts/<account_id>/rgb-stock_pending`
-- 已满足条件的 staged stock
+- 统一 Fjall 数据库中的 `rgb_pending_ops` / `rgb_pending_status`
+- 已满足条件的账户级 pending operation
 - 可 promote 的 confirmed RGB 状态
 
 scanner 日志示例：
@@ -236,13 +236,14 @@ rgb pending recovery scanner enabled interval_secs=60
 rgb pending recovery scan accounts=2 scanned=2 promoted=2 pending=0 skipped=0 failed=0
 ```
 
-如果需要历史 backfill 或运维修复，使用 SSH 到 daemon 所在机器上运行 console 运维函数，例如：
+如果需要历史 backfill 或运维修复，先停止 daemon，再使用 daemon 自己的离线修复命令：
 
-```zust
-rgb::scan_utxos("bc1...")
+```bash
+target/release/rgb-service repair-daemon-account-utxos \
+  ./rgb-service.toml <account_id> <txid:vout>...
 ```
 
-这个函数直接维护 daemon 本地 `account_utxos`，不是公开 HTTP 权限入口。
+`zust-console` 不再直接打开或修改 daemon 的 Fjall 数据库；该命令也不是公开 HTTP 权限入口。
 
 ## RGB-aware LN 路由
 

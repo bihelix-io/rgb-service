@@ -148,9 +148,7 @@ pub trait BtcLnNode {
     fn status_summary(&self) -> String;
     fn listening_addresses(&self) -> Option<Vec<SocketAddress>>;
     fn announcement_addresses(&self) -> Option<Vec<SocketAddress>>;
-    fn next_event_debug(&self) -> Option<String>;
     fn next_btc_ln_event(&self) -> Option<BtcLnEvent>;
-    fn event_handled(&self) -> Result<()>;
 
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot;
     fn peer_snapshots(&self) -> Vec<BtcLnPeerSnapshot>;
@@ -193,16 +191,8 @@ where
         (**self).announcement_addresses()
     }
 
-    fn next_event_debug(&self) -> Option<String> {
-        (**self).next_event_debug()
-    }
-
     fn next_btc_ln_event(&self) -> Option<BtcLnEvent> {
         (**self).next_btc_ln_event()
-    }
-
-    fn event_handled(&self) -> Result<()> {
-        (**self).event_handled()
     }
 
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot {
@@ -274,16 +264,8 @@ where
         (**self).announcement_addresses()
     }
 
-    fn next_event_debug(&self) -> Option<String> {
-        (**self).next_event_debug()
-    }
-
     fn next_btc_ln_event(&self) -> Option<BtcLnEvent> {
         (**self).next_btc_ln_event()
-    }
-
-    fn event_handled(&self) -> Result<()> {
-        (**self).event_handled()
     }
 
     fn balance_snapshot(&self) -> BtcLnBalanceSnapshot {

@@ -18,8 +18,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
-    serve,
-    Json, Router,
+    serve, Json, Router,
 };
 use bdk_electrum::electrum_client::{self, ElectrumApi};
 use bdk_esplora::esplora_client;
@@ -49,9 +48,9 @@ use rgb_service_api::{
 };
 use rgb_service_local::{
     build_rgb20_transfer_consignment, chain_source_from_url, encode_fascia_bytes,
-    import_rgb20_stock_and_allocations,
-    issue_rgb20_fixed_with_chain_source, list_legacy_rgb20_assets_for_utxos,
-    list_rgb20_assets_for_utxos, list_rgb20_contracts, normalize_electrum_url, prepare_rgb20_psbt,
+    import_rgb20_stock_and_allocations, issue_rgb20_fixed_with_chain_source,
+    list_legacy_rgb20_assets_for_utxos, list_rgb20_assets_for_utxos, list_rgb20_contracts,
+    migrate_rgb_account_store, normalize_electrum_url, prepare_rgb20_psbt,
     rgbstd::{
         contract::FilterIncludeAll,
         persistence::{fs::FsBinStore, StashReadProvider, Stock},
@@ -59,8 +58,10 @@ use rgb_service_local::{
         vm::WitnessOrd,
         ContractId as RgbContractId,
     },
-    scan_and_promote_confirmed_staged_rgb_stocks, stage_receiver_transfer, stage_sender_fascia,
-    ChainSource, Rgb20IssueRequest, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    scan_and_promote_confirmed_staged_rgb_stocks, shared_rgb_pending_account_ids,
+    shared_rgb_stock_account_ids, shared_rgb_store_account_id, shared_rgb_store_locator,
+    stage_receiver_transfer, stage_sender_fascia, ChainSource, LocalRgbStore, Rgb20IssueRequest,
+    Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -841,10 +842,7 @@ fn read_wallet_v2_account(
         .arg(reveal_count.to_string())
         .output()
         .map_err(|err| {
-            RgbServiceError::Backend(format!(
-                "spawn wallet-v2-reader {}: {err}",
-                bin.display()
-            ))
+            RgbServiceError::Backend(format!("spawn wallet-v2-reader {}: {err}", bin.display()))
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1020,7 +1018,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .is_some_and(|arg| arg == "list-wallet-v2-contracts")
     {
-        let data_dir = args.get(2).ok_or("usage: rgb-service list-wallet-v2-contracts <wallet-v2-local-data-dir>")?;
+        let data_dir = args
+            .get(2)
+            .ok_or("usage: rgb-service list-wallet-v2-contracts <wallet-v2-local-data-dir>")?;
         list_wallet_v2_contracts(Path::new(data_dir))?;
         return Ok(());
     }
@@ -1028,7 +1028,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .is_some_and(|arg| arg == "audit-wallet-v2-allocations")
     {
-        let data_dir = args.get(2).ok_or("usage: rgb-service audit-wallet-v2-allocations <wallet-v2-local-data-dir>")?;
+        let data_dir = args
+            .get(2)
+            .ok_or("usage: rgb-service audit-wallet-v2-allocations <wallet-v2-local-data-dir>")?;
         audit_wallet_v2_allocations(Path::new(data_dir))?;
         return Ok(());
     }
@@ -1076,8 +1078,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = load_config(config_path)?;
         fs::create_dir_all(&config.service.data_dir)?;
         let service = LocalDaemonService::new(config).await?;
-        let summary =
-            service.import_wallet_v2_data_dir(Path::new(data_dir), options)?;
+        let summary = service.import_wallet_v2_data_dir(Path::new(data_dir), options)?;
         println!(
             "imported wallet-v2 data-dir: accounts={} addresses={} utxos={} stocks_imported={} skipped_empty={} errors={} mode={}",
             summary.accounts,
@@ -1318,7 +1319,9 @@ async fn access_log_middleware(
     // failed (the access log alone only shows the status code).
     let body_note = if status >= 400 {
         let body = std::mem::replace(response.body_mut(), Body::empty());
-        let bytes = axum::body::to_bytes(body, 8 * 1024).await.unwrap_or_default();
+        let bytes = axum::body::to_bytes(body, 8 * 1024)
+            .await
+            .unwrap_or_default();
         let note = String::from_utf8_lossy(&bytes).to_string();
         *response.body_mut() = Body::from(bytes);
         note
@@ -1887,25 +1890,98 @@ impl LocalDaemonService {
         let kv_dir = config.service.data_dir.join("kv");
         fs::create_dir_all(&kv_dir)?;
         let db = SingleWriterTxDatabase::builder(&kv_dir).open()?;
+        LocalRgbStore::register_database(&kv_dir, db.clone())?;
         logger.info(format!(
             "DAEMON_RNA issue_fee={} transfer_fee={} query_fee={}",
             config.daemon_rna.issue_fee,
             config.daemon_rna.transfer_fee,
             config.daemon_rna.query_fee
         ));
-        let pending_stock_dirs = Self::discover_pending_stock_dirs(&config.service.data_dir)?;
+        let migrated = Self::migrate_account_stock_directories(
+            &config.service.data_dir,
+            &kv_dir,
+            &db,
+            &logger,
+        )?;
+        if migrated > 0 {
+            logger.info(format!(
+                "migrated {migrated} account RGB stores into shared database"
+            ));
+        }
+        let pending_stock_dirs = Self::discover_pending_stock_dirs(&db, &kv_dir)?;
         logger.info(format!(
             "rgb pending scanner registered {} stock dirs at startup",
             pending_stock_dirs.len()
         ));
-        Ok(Self {
+        let service = Self {
             config: config.service,
             daemon_rna: config.daemon_rna,
             db,
             logger,
             pending_stock_dirs: Arc::new(Mutex::new(pending_stock_dirs)),
             daemon_rna_mutation: Mutex::new(()),
-        })
+        };
+        let legacy_migrated = legacy::migrate_legacy_wallets_to_database(&service)?;
+        if legacy_migrated > 0 {
+            service.logger.info(format!(
+                "migrated {legacy_migrated} legacy BDK wallets into shared database"
+            ));
+        }
+        Ok(service)
+    }
+
+    fn migrate_account_stock_directories(
+        data_dir: &Path,
+        kv_dir: &Path,
+        db: &SingleWriterTxDatabase,
+        logger: &DaemonLogger,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        const MIGRATION: &[u8] = b"accounts_to_shared_rgb_v1";
+        let migrations = db.keyspace("schema_migrations", KeyspaceCreateOptions::default)?;
+        if migrations.get(MIGRATION)?.is_some() {
+            return Ok(0);
+        }
+
+        let accounts_dir = data_dir.join("accounts");
+        let mut migrated = 0usize;
+        if accounts_dir.is_dir() {
+            let mut entries = fs::read_dir(&accounts_dir)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let account_id = entry.file_name().to_string_lossy().to_string();
+                let source = entry.path().join("rgb-stock");
+                if !source.is_dir() {
+                    continue;
+                }
+                let target = shared_rgb_store_locator(kv_dir, &account_id);
+                let report = migrate_rgb_account_store(&source, &target).map_err(|err| {
+                    format!(
+                        "migrate account RGB store account_id={account_id} source={}: {err:#}",
+                        source.display()
+                    )
+                })?;
+                if report.stock_migrated || report.pending_migrated > 0 {
+                    migrated += 1;
+                    logger.info(format!(
+                        "account RGB store migrated account_id={account_id} stock={} pending={}",
+                        report.stock_migrated, report.pending_migrated
+                    ));
+                }
+            }
+        }
+
+        let value = serde_json::to_vec(&json!({
+            "completed_at_ms": now_ms(),
+            "accounts_migrated": migrated,
+        }))?;
+        let mut tx = db.write_tx();
+        tx.insert(&migrations, MIGRATION, value);
+        tx.commit()?;
+        db.persist(PersistMode::SyncAll)?;
+        Ok(migrated)
     }
 
     /// Logger accessor for modules that need to write warnings (e.g. legacy).
@@ -1914,91 +1990,47 @@ impl LocalDaemonService {
     }
 
     fn account_stock_dir(&self, account_id: &str) -> PathBuf {
-        self.config
-            .data_dir
-            .join("accounts")
-            .join(account_id)
-            .join("rgb-stock")
+        shared_rgb_store_locator(&self.config.data_dir.join("kv"), account_id)
+    }
+
+    pub(crate) fn account_stock_has_data(&self, account_id: &str) -> bool {
+        LocalRgbStore::open(&self.account_stock_dir(account_id))
+            .and_then(|store| store.rgb_stock_has_data())
+            .unwrap_or(false)
     }
 
     fn account_stock_dirs(&self) -> rgb_service_api::Result<Vec<PathBuf>> {
-        let accounts_dir = self.config.data_dir.join("accounts");
-        if !accounts_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let entries = fs::read_dir(&accounts_dir)
-            .map_err(|err| RgbServiceError::Backend(format!("read accounts dir: {err}")))?;
-        let mut dirs = Vec::new();
-        for entry in entries {
-            let entry = entry
-                .map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
-            let path = entry.path().join("rgb-stock");
-            if path.exists() {
-                dirs.push(path);
-            }
-        }
-        Ok(dirs)
-    }
-
-    fn pending_stock_root(stock_dir: &Path) -> PathBuf {
-        let stock_name = stock_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("stock");
-        stock_dir
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{stock_name}_pending"))
-    }
-
-    fn pending_status(status_path: &Path) -> Option<String> {
-        fs::read(status_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| {
-                value
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+        let kv_dir = self.config.data_dir.join("kv");
+        shared_rgb_stock_account_ids(&self.db)
+            .map(|accounts| {
+                accounts
+                    .into_iter()
+                    .map(|account_id| shared_rgb_store_locator(&kv_dir, &account_id))
+                    .collect()
             })
-    }
-
-    fn pending_status_is_terminal(status_path: &Path) -> bool {
-        Self::pending_status(status_path)
-            .is_some_and(|status| matches!(status.as_str(), "confirmed" | "invalid"))
+            .map_err(|err| RgbServiceError::Backend(format!("list account RGB stocks: {err:#}")))
     }
 
     fn stock_has_active_pending(stock_dir: &Path) -> bool {
-        let pending_root = Self::pending_stock_root(stock_dir);
-        let Ok(entries) = fs::read_dir(pending_root) else {
-            return false;
-        };
-        entries.filter_map(|entry| entry.ok()).any(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .is_some_and(|file_type| file_type.is_dir())
-                && !Self::pending_status_is_terminal(&entry.path().join("pending-status.json"))
-        })
+        LocalRgbStore::open(stock_dir)
+            .and_then(|store| store.has_active_pending())
+            .unwrap_or(false)
     }
 
-    fn discover_pending_stock_dirs(data_dir: &Path) -> rgb_service_api::Result<BTreeSet<PathBuf>> {
-        let accounts_dir = data_dir.join("accounts");
-        if !accounts_dir.exists() {
-            return Ok(BTreeSet::new());
-        }
-        let entries = fs::read_dir(&accounts_dir)
-            .map_err(|err| RgbServiceError::Backend(format!("read accounts dir: {err}")))?;
-        let mut dirs = BTreeSet::new();
-        for entry in entries {
-            let entry = entry
-                .map_err(|err| RgbServiceError::Backend(format!("read account dir: {err}")))?;
-            let stock_dir = entry.path().join("rgb-stock");
-            if stock_dir.exists() && Self::stock_has_active_pending(&stock_dir) {
-                dirs.insert(stock_dir);
-            }
-        }
-        Ok(dirs)
+    fn discover_pending_stock_dirs(
+        db: &SingleWriterTxDatabase,
+        kv_dir: &Path,
+    ) -> rgb_service_api::Result<BTreeSet<PathBuf>> {
+        shared_rgb_pending_account_ids(db)
+            .map(|accounts| {
+                accounts
+                    .into_iter()
+                    .map(|account_id| shared_rgb_store_locator(kv_dir, &account_id))
+                    .collect()
+            })
+            .map_err(|err| {
+                RgbServiceError::Backend(format!("list pending account RGB stocks: {err:#}"))
+            })
     }
 
     fn pending_stock_dirs_snapshot(&self) -> rgb_service_api::Result<Vec<PathBuf>> {
@@ -2063,13 +2095,9 @@ impl LocalDaemonService {
                                 stock_dir.display()
                             )),
                         }
-                        if let Some(account_id) = stock_dir
-                            .parent()
-                            .and_then(Path::file_name)
-                            .and_then(|name| name.to_str())
-                        {
+                        if let Some(account_id) = shared_rgb_store_account_id(&stock_dir) {
                             let updated = self.mark_account_utxos_confirmed_for_txids(
-                                account_id,
+                                &account_id,
                                 report.promoted_txids.iter().copied().collect(),
                             )?;
                             if updated > 0 {
@@ -2201,24 +2229,13 @@ impl LocalDaemonService {
         &self,
         account_id: &str,
     ) -> rgb_service_api::Result<usize> {
-        let pending_root = Self::pending_stock_root(&self.account_stock_dir(account_id));
-        if !pending_root.exists() {
-            return Ok(0);
-        }
-        let entries = fs::read_dir(&pending_root).map_err(|err| {
-            RgbServiceError::Backend(format!(
-                "read RGB pending stock dir {}: {err}",
-                pending_root.display()
-            ))
-        })?;
-        let confirmed_txids = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                Self::pending_status(&entry.path().join("pending-status.json")).as_deref()
-                    == Some("confirmed")
-            })
-            .filter_map(|entry| entry.file_name().to_str()?.parse::<Txid>().ok())
-            .collect::<BTreeSet<_>>();
+        let confirmed_txids = LocalRgbStore::open(&self.account_stock_dir(account_id))
+            .and_then(|store| store.confirmed_pending_txids())
+            .map_err(|err| {
+                RgbServiceError::Backend(format!(
+                    "read confirmed RGB pending operations for {account_id}: {err:#}"
+                ))
+            })?;
         self.mark_account_utxos_confirmed_for_txids(account_id, confirmed_txids)
     }
 
@@ -2389,10 +2406,7 @@ impl LocalDaemonService {
         Ok(entries)
     }
 
-    fn put_token_catalog_entry(
-        &self,
-        entry: &TokenCatalogEntry,
-    ) -> rgb_service_api::Result<()> {
+    fn put_token_catalog_entry(&self, entry: &TokenCatalogEntry) -> rgb_service_api::Result<()> {
         let keyspace = self
             .db
             .keyspace("token_catalog", KeyspaceCreateOptions::default)
@@ -2532,8 +2546,9 @@ impl LocalDaemonService {
         let limit = options.limit.unwrap_or(usize::MAX);
         let mut considered = 0usize;
         for entry in entries {
-            let entry = entry
-                .map_err(|err| RgbServiceError::Backend(format!("read wallet-v2 dir entry: {err}")))?;
+            let entry = entry.map_err(|err| {
+                RgbServiceError::Backend(format!("read wallet-v2 dir entry: {err}"))
+            })?;
             let path = entry.path();
             // skip files and the legacy fee wallet (`priv/`)
             if !path.is_dir() {
@@ -2641,14 +2656,16 @@ impl LocalDaemonService {
         // RGB assets and may include change outputs that BDK no longer tracks as
         // unspent; seed them as tracked UTXOs so the daemon resolves the full
         // balance. Chain-sync filtering later removes genuinely spent ones.
-        let allocation_outpoints =
-            import_rgb20_stock_and_allocations(source_stock_dir, &self.account_stock_dir(&account_id))
-                .map_err(|err| {
-                    RgbServiceError::Backend(format!(
-                        "import wallet-v2 RGB stock {}: {err:#}",
-                        source_stock_dir.display()
-                    ))
-                })?;
+        let allocation_outpoints = import_rgb20_stock_and_allocations(
+            source_stock_dir,
+            &self.account_stock_dir(&account_id),
+        )
+        .map_err(|err| {
+            RgbServiceError::Backend(format!(
+                "import wallet-v2 RGB stock {}: {err:#}",
+                source_stock_dir.display()
+            ))
+        })?;
         for allocation_outpoint in allocation_outpoints {
             let outpoint_str = allocation_outpoint.to_string();
             if !seeded.insert(outpoint_str.clone()) {
@@ -4541,10 +4558,7 @@ query_fee = 1
     #[tokio::test]
     async fn cors_allows_legacy_account_create_preflight() {
         let app = Router::new()
-            .route(
-                "/account/create",
-                put(|| async { StatusCode::OK }),
-            )
+            .route("/account/create", put(|| async { StatusCode::OK }))
             .layer(CorsLayer::very_permissive());
         let response = app
             .oneshot(
@@ -4704,22 +4718,23 @@ query_fee = 1
             )
             .unwrap();
 
-        let pending_root =
-            LocalDaemonService::pending_stock_root(&service.account_stock_dir(account_id));
-        let confirmed_dir = pending_root.join(confirmed_txid.to_string());
-        let invalid_dir = pending_root.join(invalid_txid.to_string());
-        fs::create_dir_all(&confirmed_dir).unwrap();
-        fs::create_dir_all(&invalid_dir).unwrap();
-        fs::write(
-            confirmed_dir.join("pending-status.json"),
-            serde_json::to_vec(&json!({"status": "confirmed"})).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            invalid_dir.join("pending-status.json"),
-            serde_json::to_vec(&json!({"status": "invalid"})).unwrap(),
-        )
-        .unwrap();
+        let store = LocalRgbStore::open(&service.account_stock_dir(account_id)).unwrap();
+        for (txid, status) in [(confirmed_txid, "confirmed"), (invalid_txid, "invalid")] {
+            store
+                .put_pending_status(
+                    txid,
+                    &rgb_service_local::RgbPendingStockStatus {
+                        txid: txid.to_string(),
+                        status: status.to_string(),
+                        main_stock_dir: account_id.to_string(),
+                        staged_stock_dir: format!("{account_id}:pending:{txid}"),
+                        updated_at: now_ms(),
+                        confirmed_at: (status == "confirmed").then_some(now_ms()),
+                        promoted_at: (status == "confirmed").then_some(now_ms()),
+                    },
+                )
+                .unwrap();
+        }
 
         assert_eq!(
             service

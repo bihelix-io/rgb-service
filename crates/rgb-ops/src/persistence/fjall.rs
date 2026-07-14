@@ -32,6 +32,7 @@ pub struct FjallBinStore {
     pub path: PathBuf,
     db: SingleWriterTxDatabase,
     blobs: SingleWriterTxKeyspace,
+    key_prefix: Vec<u8>,
 }
 
 impl fmt::Debug for FjallBinStore {
@@ -39,6 +40,7 @@ impl fmt::Debug for FjallBinStore {
         f.debug_struct("FjallBinStore")
             .field("path", &self.path)
             .field("keyspace", &KEYSPACE_RGB_BLOBS)
+            .field("key_prefix_len", &self.key_prefix.len())
             .finish_non_exhaustive()
     }
 }
@@ -54,18 +56,38 @@ impl FjallBinStore {
         db: SingleWriterTxDatabase,
         keyspace_name: &str,
     ) -> fjall::Result<Self> {
+        Self::with_database_prefix(path, db, keyspace_name, [])
+    }
+
+    /// Opens an RGB stock inside an existing Fjall database, prefixing all
+    /// stock blobs with a logical namespace. This lets many account stocks
+    /// share one physical database and one keyspace without key collisions.
+    pub fn with_database_prefix(
+        path: PathBuf,
+        db: SingleWriterTxDatabase,
+        keyspace_name: &str,
+        key_prefix: impl AsRef<[u8]>,
+    ) -> fjall::Result<Self> {
         let blobs = db.keyspace(keyspace_name, KeyspaceCreateOptions::default)?;
         Ok(Self {
             path,
             db,
             blobs,
+            key_prefix: key_prefix.as_ref().to_vec(),
         })
+    }
+
+    fn key(&self, key: &[u8]) -> Vec<u8> {
+        let mut namespaced = Vec::with_capacity(self.key_prefix.len() + key.len());
+        namespaced.extend_from_slice(&self.key_prefix);
+        namespaced.extend_from_slice(key);
+        namespaced
     }
 
     fn load_blob<T: StrictDeserialize>(&self, key: &'static [u8]) -> Result<T, PersistenceError> {
         let bytes = self
             .blobs
-            .get(key)
+            .get(self.key(key))
             .map_err(PersistenceError::with)?
             .ok_or_else(|| {
                 PersistenceError::with(io::Error::new(
@@ -73,7 +95,8 @@ impl FjallBinStore {
                     format!("RGB Fjall blob is missing: {}", String::from_utf8_lossy(key)),
                 ))
             })?;
-        let confined = Confined::try_from(bytes.as_ref().to_vec()).map_err(PersistenceError::with)?;
+        let confined =
+            Confined::try_from(bytes.as_ref().to_vec()).map_err(PersistenceError::with)?;
         T::from_strict_serialized::<U32MAX>(confined).map_err(PersistenceError::with)
     }
 
@@ -87,7 +110,7 @@ impl FjallBinStore {
             .map_err(PersistenceError::with)?
             .release();
         let mut tx = self.db.write_tx();
-        tx.insert(&self.blobs, key, bytes);
+        tx.insert(&self.blobs, self.key(key), bytes);
         tx.commit().map_err(PersistenceError::with)?;
         self.db
             .persist(PersistMode::SyncAll)
@@ -97,19 +120,21 @@ impl FjallBinStore {
     pub fn has_data(&self) -> Result<bool, PersistenceError> {
         let stash = self
             .blobs
-            .get(KEY_STASH)
+            .get(self.key(KEY_STASH))
             .map_err(PersistenceError::with)?;
         let state = self
             .blobs
-            .get(KEY_STATE)
+            .get(self.key(KEY_STATE))
             .map_err(PersistenceError::with)?;
-        Ok(stash.as_ref().is_some_and(|bytes| bytes.len() > 128)
-            && state.as_ref().is_some_and(|bytes| bytes.len() > 128))
+        Ok(stash.as_ref().is_some_and(|bytes| !bytes.is_empty())
+            && state.as_ref().is_some_and(|bytes| !bytes.is_empty()))
     }
 }
 
 impl PersistenceProvider<MemStash> for FjallBinStore {
-    fn load(&self) -> Result<MemStash, PersistenceError> { self.load_blob(KEY_STASH) }
+    fn load(&self) -> Result<MemStash, PersistenceError> {
+        self.load_blob(KEY_STASH)
+    }
 
     fn store(&self, object: &MemStash) -> Result<(), PersistenceError> {
         self.store_blob(KEY_STASH, object)
@@ -117,7 +142,9 @@ impl PersistenceProvider<MemStash> for FjallBinStore {
 }
 
 impl PersistenceProvider<MemState> for FjallBinStore {
-    fn load(&self) -> Result<MemState, PersistenceError> { self.load_blob(KEY_STATE) }
+    fn load(&self) -> Result<MemState, PersistenceError> {
+        self.load_blob(KEY_STATE)
+    }
 
     fn store(&self, object: &MemState) -> Result<(), PersistenceError> {
         self.store_blob(KEY_STATE, object)
@@ -125,7 +152,9 @@ impl PersistenceProvider<MemState> for FjallBinStore {
 }
 
 impl PersistenceProvider<MemIndex> for FjallBinStore {
-    fn load(&self) -> Result<MemIndex, PersistenceError> { self.load_blob(KEY_INDEX) }
+    fn load(&self) -> Result<MemIndex, PersistenceError> {
+        self.load_blob(KEY_INDEX)
+    }
 
     fn store(&self, object: &MemIndex) -> Result<(), PersistenceError> {
         self.store_blob(KEY_INDEX, object)

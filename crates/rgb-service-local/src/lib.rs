@@ -37,6 +37,8 @@ pub use rgbstd;
 
 const RGB_STOCK_PARTITION: &str = "rgb_stock";
 const RGB_PENDING_OPS_PARTITION: &str = "rgb_pending_ops";
+const RGB_PENDING_STATUS_PARTITION: &str = "rgb_pending_status";
+const SHARED_RGB_ACCOUNT_MARKER: &str = ".rgb-accounts";
 
 static LOCAL_STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<LocalRgbStoreInner>>>> = OnceLock::new();
 static TX_CONFIRMATION_CACHE: OnceLock<Mutex<HashMap<(Network, Txid), TxConfirmationCacheEntry>>> =
@@ -81,16 +83,21 @@ impl ElectrumConfig {
 #[derive(Clone)]
 pub struct LocalRgbStore {
     inner: Arc<LocalRgbStoreInner>,
+    key_prefix: Vec<u8>,
+    logical_name: String,
 }
 
 struct LocalRgbStoreInner {
     path: PathBuf,
     db: SingleWriterTxDatabase,
-    rgb_stock_lock: RwLock<()>,
+    rgb_stock_locks: Mutex<HashMap<Vec<u8>, Arc<RwLock<()>>>>,
 }
 
 impl LocalRgbStore {
-    pub fn open(store_dir: &Path) -> Result<Self> {
+    /// Registers an already-open database so account stock handles share the
+    /// daemon's single Fjall engine instead of opening the same directory a
+    /// second time.
+    pub fn register_database(store_dir: &Path, db: SingleWriterTxDatabase) -> Result<()> {
         fs::create_dir_all(store_dir)
             .with_context(|| format!("create local RGB store {}", store_dir.display()))?;
         let path = fs::canonicalize(store_dir)
@@ -99,21 +106,68 @@ impl LocalRgbStore {
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .map_err(|err| anyhow!("local RGB store registry lock poisoned: {err}"))?;
-        if let Some(existing) = stores.get(&path) {
-            return Ok(Self {
-                inner: Arc::clone(existing),
-            });
-        }
-        let db = SingleWriterTxDatabase::builder(&path)
-            .open()
-            .with_context(|| format!("open local RGB store {}", path.display()))?;
-        let inner = Arc::new(LocalRgbStoreInner {
-            path: path.clone(),
-            db,
-            rgb_stock_lock: RwLock::new(()),
+        stores.entry(path.clone()).or_insert_with(|| {
+            Arc::new(LocalRgbStoreInner {
+                path,
+                db,
+                rgb_stock_locks: Mutex::new(HashMap::new()),
+            })
         });
-        stores.insert(path, Arc::clone(&inner));
-        Ok(Self { inner })
+        Ok(())
+    }
+
+    pub fn open(store_locator: &Path) -> Result<Self> {
+        let (store_dir, namespace, logical_name) =
+            if let Some(account_id) = shared_rgb_store_account_id(store_locator) {
+                let marker_dir = store_locator
+                    .parent()
+                    .context("shared RGB account locator has no marker directory")?;
+                let store_dir = marker_dir
+                    .parent()
+                    .context("shared RGB account locator has no database directory")?;
+                (
+                    store_dir.to_path_buf(),
+                    account_id.as_bytes().to_vec(),
+                    account_id,
+                )
+            } else {
+                (
+                    store_locator.to_path_buf(),
+                    Vec::new(),
+                    store_locator.display().to_string(),
+                )
+            };
+        fs::create_dir_all(&store_dir)
+            .with_context(|| format!("create local RGB store {}", store_dir.display()))?;
+        let path = fs::canonicalize(&store_dir)
+            .with_context(|| format!("canonicalize local RGB store {}", store_dir.display()))?;
+        let mut stores = LOCAL_STORES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|err| anyhow!("local RGB store registry lock poisoned: {err}"))?;
+        let inner = if let Some(existing) = stores.get(&path) {
+            Arc::clone(existing)
+        } else {
+            let db = SingleWriterTxDatabase::builder(&path)
+                .open()
+                .with_context(|| format!("open local RGB store {}", path.display()))?;
+            let inner = Arc::new(LocalRgbStoreInner {
+                path: path.clone(),
+                db,
+                rgb_stock_locks: Mutex::new(HashMap::new()),
+            });
+            stores.insert(path, Arc::clone(&inner));
+            inner
+        };
+        let mut key_prefix = namespace;
+        if !key_prefix.is_empty() {
+            key_prefix.push(0);
+        }
+        Ok(Self {
+            inner,
+            key_prefix,
+            logical_name,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -121,10 +175,11 @@ impl LocalRgbStore {
     }
 
     pub fn rgb_stock_store(&self) -> Result<FjallBinStore> {
-        Ok(FjallBinStore::with_database(
+        Ok(FjallBinStore::with_database_prefix(
             self.inner.path.clone(),
             self.inner.db.clone(),
             RGB_STOCK_PARTITION,
+            &self.key_prefix,
         )
         .context("open RGB stock partition")?)
     }
@@ -136,47 +191,208 @@ impl LocalRgbStore {
     }
 
     pub fn with_rgb_stock_write_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _guard = self
+        let mut locks = self
             .inner
-            .rgb_stock_lock
+            .rgb_stock_locks
+            .lock()
+            .map_err(|err| anyhow!("local RGB stock lock registry poisoned: {err}"))?;
+        let lock = Arc::clone(
+            locks
+                .entry(self.key_prefix.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
+        );
+        drop(locks);
+        let _guard = lock
             .write()
             .map_err(|err| anyhow!("local RGB stock write lock poisoned: {err}"))?;
         f()
     }
 
-    pub fn get_pending_op(&self, txid: impl std::fmt::Display) -> Result<Option<Vec<u8>>> {
-        let keyspace = self
-            .inner
+    pub fn logical_name(&self) -> &str {
+        &self.logical_name
+    }
+
+    fn namespaced_key(&self, suffix: impl AsRef<[u8]>) -> Vec<u8> {
+        let suffix = suffix.as_ref();
+        let mut key = Vec::with_capacity(self.key_prefix.len() + suffix.len());
+        key.extend_from_slice(&self.key_prefix);
+        key.extend_from_slice(suffix);
+        key
+    }
+
+    fn pending_ops_keyspace(&self) -> Result<fjall::SingleWriterTxKeyspace> {
+        self.inner
             .db
             .keyspace(RGB_PENDING_OPS_PARTITION, KeyspaceCreateOptions::default)
-            .context("open RGB pending ops partition")?;
+            .context("open RGB pending ops partition")
+    }
+
+    fn pending_status_keyspace(&self) -> Result<fjall::SingleWriterTxKeyspace> {
+        self.inner
+            .db
+            .keyspace(RGB_PENDING_STATUS_PARTITION, KeyspaceCreateOptions::default)
+            .context("open RGB pending status partition")
+    }
+
+    pub fn put_pending_operation(
+        &self,
+        txid: impl std::fmt::Display,
+        op: &[u8],
+        status: &RgbPendingStockStatus,
+    ) -> Result<()> {
+        let txid = txid.to_string();
+        let key = self.namespaced_key(txid.as_bytes());
+        let ops = self.pending_ops_keyspace()?;
+        let statuses = self.pending_status_keyspace()?;
+        let status = serde_json::to_vec(status).context("encode RGB pending status")?;
+        let mut tx = self.inner.db.write_tx();
+        tx.insert(&ops, &key, op);
+        tx.insert(&statuses, key, status);
+        tx.commit()
+            .with_context(|| format!("commit RGB pending operation {txid}"))?;
+        self.persist()
+    }
+
+    pub fn put_pending_status(
+        &self,
+        txid: impl std::fmt::Display,
+        status: &RgbPendingStockStatus,
+    ) -> Result<()> {
+        let txid = txid.to_string();
+        let keyspace = self.pending_status_keyspace()?;
+        let bytes = serde_json::to_vec(status).context("encode RGB pending status")?;
+        let mut tx = self.inner.db.write_tx();
+        tx.insert(&keyspace, self.namespaced_key(txid.as_bytes()), bytes);
+        tx.commit()
+            .with_context(|| format!("commit RGB pending status {txid}"))?;
+        self.persist()
+    }
+
+    pub fn pending_status(
+        &self,
+        txid: impl std::fmt::Display,
+    ) -> Result<Option<RgbPendingStockStatus>> {
+        let txid = txid.to_string();
+        let keyspace = self.pending_status_keyspace()?;
+        keyspace
+            .get(self.namespaced_key(txid.as_bytes()))
+            .with_context(|| format!("read RGB pending status {txid}"))?
+            .map(|bytes| {
+                serde_json::from_slice(bytes.as_ref())
+                    .with_context(|| format!("decode RGB pending status {txid}"))
+            })
+            .transpose()
+    }
+
+    pub fn pending_statuses(&self) -> Result<Vec<RgbPendingStockStatus>> {
+        let keyspace = self.pending_status_keyspace()?;
+        let mut statuses = Vec::new();
+        for item in keyspace.as_ref().prefix(&self.key_prefix) {
+            let bytes = item.value().context("read RGB pending status value")?;
+            statuses
+                .push(serde_json::from_slice(bytes.as_ref()).context("decode RGB pending status")?);
+        }
+        Ok(statuses)
+    }
+
+    pub fn pending_txids(&self) -> Result<Vec<Txid>> {
+        let keyspace = self.pending_ops_keyspace()?;
+        let mut txids = Vec::new();
+        for item in keyspace.as_ref().prefix(&self.key_prefix) {
+            let key = item.key().context("read RGB pending op key")?;
+            let suffix = key
+                .as_ref()
+                .strip_prefix(self.key_prefix.as_slice())
+                .context("RGB pending op key has wrong namespace")?;
+            txids.push(
+                std::str::from_utf8(suffix)
+                    .context("RGB pending op key is not UTF-8")?
+                    .parse()
+                    .context("RGB pending op key is not a txid")?,
+            );
+        }
+        txids.sort();
+        Ok(txids)
+    }
+
+    pub fn has_active_pending(&self) -> Result<bool> {
+        for txid in self.pending_txids()? {
+            if self
+                .pending_status(txid)?
+                .is_none_or(|status| !is_terminal_pending_stock_status(&status.status))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn confirmed_pending_txids(&self) -> Result<BTreeSet<Txid>> {
+        Ok(self
+            .pending_statuses()?
+            .into_iter()
+            .filter(|status| status.status == "confirmed")
+            .filter_map(|status| status.txid.parse().ok())
+            .collect())
+    }
+
+    pub fn copy_pending_from(&self, source: &LocalRgbStore) -> Result<usize> {
+        let mut copied = 0;
+        for txid in source.pending_txids()? {
+            if self.get_pending_op(txid)?.is_some() {
+                continue;
+            }
+            let Some(op) = source.get_pending_op(txid)? else {
+                continue;
+            };
+            let source_status = source.pending_status(txid)?;
+            let status_name = source_status
+                .as_ref()
+                .map(|status| status.status.as_str())
+                .unwrap_or("pending");
+            let status = pending_stock_status(
+                txid,
+                status_name,
+                self.logical_name(),
+                source_status
+                    .as_ref()
+                    .and_then(|status| status.confirmed_at),
+                source_status.as_ref().and_then(|status| status.promoted_at),
+            );
+            self.put_pending_operation(txid, &op, &status)?;
+            copied += 1;
+        }
+        Ok(copied)
+    }
+
+    pub fn get_pending_op(&self, txid: impl std::fmt::Display) -> Result<Option<Vec<u8>>> {
+        let keyspace = self.pending_ops_keyspace()?;
         Ok(keyspace
-            .get(txid.to_string().as_bytes())
+            .get(self.namespaced_key(txid.to_string().as_bytes()))
             .with_context(|| format!("read RGB pending op {txid}"))?
             .map(|bytes| bytes.as_ref().to_vec()))
     }
 
     pub fn put_pending_op(&self, txid: impl std::fmt::Display, op: &[u8]) -> Result<()> {
-        let keyspace = self
-            .inner
-            .db
-            .keyspace(RGB_PENDING_OPS_PARTITION, KeyspaceCreateOptions::default)
-            .context("open RGB pending ops partition")?;
+        let keyspace = self.pending_ops_keyspace()?;
         let mut tx = self.inner.db.write_tx();
-        tx.insert(&keyspace, txid.to_string().as_bytes(), op);
+        tx.insert(
+            &keyspace,
+            self.namespaced_key(txid.to_string().as_bytes()),
+            op,
+        );
         tx.commit()
             .with_context(|| format!("commit RGB pending op {txid}"))?;
         self.persist()
     }
 
     pub fn remove_pending_op(&self, txid: impl std::fmt::Display) -> Result<()> {
-        let keyspace = self
-            .inner
-            .db
-            .keyspace(RGB_PENDING_OPS_PARTITION, KeyspaceCreateOptions::default)
-            .context("open RGB pending ops partition")?;
+        let keyspace = self.pending_ops_keyspace()?;
+        let statuses = self.pending_status_keyspace()?;
         let mut tx = self.inner.db.write_tx();
-        tx.remove(&keyspace, txid.to_string().as_bytes());
+        let key = self.namespaced_key(txid.to_string().as_bytes());
+        tx.remove(&keyspace, &key);
+        tx.remove(&statuses, key);
         tx.commit()
             .with_context(|| format!("remove RGB pending op {txid}"))?;
         self.persist()
@@ -188,6 +404,148 @@ impl LocalRgbStore {
             .persist(PersistMode::SyncAll)
             .context("persist local RGB store")
     }
+}
+
+/// Returns a logical account-stock locator backed by the shared Fjall database
+/// at `database_dir`. The marker path is never created on disk; it only carries
+/// the account namespace through the existing local RGB APIs.
+pub fn shared_rgb_store_locator(database_dir: &Path, account_id: &str) -> PathBuf {
+    database_dir
+        .join(SHARED_RGB_ACCOUNT_MARKER)
+        .join(hex_encode(account_id.as_bytes()))
+}
+
+/// Extracts the account id from a shared database stock locator.
+pub fn shared_rgb_store_account_id(locator: &Path) -> Option<String> {
+    let encoded = locator.file_name()?.to_str()?;
+    let marker = locator.parent()?.file_name()?.to_str()?;
+    if marker != SHARED_RGB_ACCOUNT_MARKER {
+        return None;
+    }
+    String::from_utf8(hex_decode(encoded)?).ok()
+}
+
+/// Lists accounts with a persisted RGB stock in the shared database.
+pub fn shared_rgb_stock_account_ids(db: &SingleWriterTxDatabase) -> Result<BTreeSet<String>> {
+    shared_rgb_account_ids(db, RGB_STOCK_PARTITION)
+}
+
+/// Lists accounts with an active persisted RGB operation in the shared
+/// database.
+pub fn shared_rgb_pending_account_ids(db: &SingleWriterTxDatabase) -> Result<BTreeSet<String>> {
+    shared_rgb_account_ids(db, RGB_PENDING_OPS_PARTITION)
+}
+
+fn shared_rgb_account_ids(
+    db: &SingleWriterTxDatabase,
+    keyspace_name: &str,
+) -> Result<BTreeSet<String>> {
+    let keyspace = db
+        .keyspace(keyspace_name, KeyspaceCreateOptions::default)
+        .with_context(|| format!("open {keyspace_name} partition"))?;
+    let mut accounts = BTreeSet::new();
+    for item in keyspace.as_ref().prefix(b"") {
+        let key = item
+            .key()
+            .with_context(|| format!("read {keyspace_name} key"))?;
+        let Some(delimiter) = key.as_ref().iter().position(|byte| *byte == 0) else {
+            // Unprefixed records belong to the old one-database-per-account
+            // layout and are not shared account records.
+            continue;
+        };
+        let account_id = std::str::from_utf8(&key.as_ref()[..delimiter])
+            .with_context(|| format!("decode {keyspace_name} account id"))?;
+        accounts.insert(account_id.to_string());
+    }
+    Ok(accounts)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RgbAccountStoreMigrationReport {
+    pub stock_migrated: bool,
+    pub pending_migrated: usize,
+}
+
+/// Copies an old per-account Fjall stock and its pending operations into the
+/// account namespace of the shared database. The operation is idempotent and
+/// does not delete the source directory.
+pub fn migrate_rgb_account_store(
+    source_store_dir: &Path,
+    target_store_locator: &Path,
+) -> Result<RgbAccountStoreMigrationReport> {
+    let source = LocalRgbStore::open(source_store_dir)?;
+    let target = LocalRgbStore::open(target_store_locator)?;
+    let mut report = RgbAccountStoreMigrationReport::default();
+
+    if source.rgb_stock_has_data()? && !target.rgb_stock_has_data()? {
+        target.with_rgb_stock_write_lock(|| {
+            let source_provider = source.rgb_stock_store()?;
+            let mut stock: Stock = Stock::load(source_provider, true)
+                .map_err(|err| anyhow!("load per-account RGB stock: {err:?}"))?;
+            stock
+                .make_persistent(target.rgb_stock_store()?, true)
+                .map_err(|err| anyhow!("attach shared RGB stock persistence: {err:?}"))?;
+            stock
+                .store()
+                .map_err(|err| anyhow!("store shared RGB stock: {err:?}"))
+        })?;
+        report.stock_migrated = true;
+    }
+
+    for txid in source.pending_txids()? {
+        if target.get_pending_op(txid)?.is_some() {
+            continue;
+        }
+        let Some(operation) = source.get_pending_op(txid)? else {
+            continue;
+        };
+        let source_status = source.pending_status(txid)?.or_else(|| {
+            legacy_pending_stock_status(source_store_dir, txid)
+                .ok()
+                .flatten()
+        });
+        let status_name = source_status
+            .as_ref()
+            .map(|status| status.status.as_str())
+            .unwrap_or("pending");
+        let status = pending_stock_status(
+            txid,
+            status_name,
+            target.logical_name(),
+            source_status
+                .as_ref()
+                .and_then(|status| status.confirmed_at),
+            source_status.as_ref().and_then(|status| status.promoted_at),
+        );
+        target.put_pending_operation(txid, &operation, &status)?;
+        report.pending_migrated += 1;
+    }
+    Ok(report)
 }
 
 pub struct Rgb20IssueRequest {
@@ -393,7 +751,7 @@ pub fn issue_rgb20_fixed_with_chain_source(
 }
 
 // wallet-service-v2 migration: read legacy fs-backed RGB stocks and persist
-// them into the daemon's fjall-backed per-account stock store.
+// them into the account namespace of the daemon's shared Fjall database.
 pub fn import_rgb20_stock_from_fs(source_stock_dir: &Path, target_stock_dir: &Path) -> Result<()> {
     let source_provider = FsBinStore::new(source_stock_dir.to_path_buf())
         .with_context(|| format!("open legacy RGB stock {}", source_stock_dir.display()))?;
@@ -601,9 +959,7 @@ pub fn list_legacy_rgb20_assets_for_contracts(
     source_stock_dir: &Path,
     contract_ids: impl IntoIterator<Item = ContractId>,
 ) -> Result<Vec<Rgb20AssetAllocation>> {
-    let selected = contract_ids
-        .into_iter()
-        .collect::<HashSet<ContractId>>();
+    let selected = contract_ids.into_iter().collect::<HashSet<ContractId>>();
     if selected.is_empty() {
         return Ok(Vec::new());
     }
@@ -643,11 +999,13 @@ pub fn list_legacy_rgb20_assets_for_contracts(
             let amount_raw = allocation.state.value();
             let (ticker, name, precision) = spec
                 .as_ref()
-                .map(|spec| (
-                    spec.ticker.to_string(),
-                    spec.name.to_string(),
-                    spec.precision,
-                ))
+                .map(|spec| {
+                    (
+                        spec.ticker.to_string(),
+                        spec.name.to_string(),
+                        spec.precision,
+                    )
+                })
                 .unwrap_or_else(|| (String::new(), String::new(), rgbstd::Precision::Indivisible));
 
             assets.push(Rgb20AssetAllocation {
@@ -966,7 +1324,7 @@ fn list_rgb20_assets_from_stock(
     Ok(assets)
 }
 
-pub fn stage_sender_fascia(stock_dir: &Path, txid: Txid, fascia: &Fascia) -> Result<PathBuf> {
+pub fn stage_sender_fascia(stock_dir: &Path, txid: Txid, fascia: &Fascia) -> Result<()> {
     store_pending_rgb_operation(
         stock_dir,
         txid,
@@ -978,11 +1336,7 @@ pub fn stage_sender_fascia(stock_dir: &Path, txid: Txid, fascia: &Fascia) -> Res
     )
 }
 
-pub fn stage_receiver_transfer(
-    stock_dir: &Path,
-    txid: Txid,
-    consignment: &Transfer,
-) -> Result<PathBuf> {
+pub fn stage_receiver_transfer(stock_dir: &Path, txid: Txid, consignment: &Transfer) -> Result<()> {
     store_pending_rgb_operation(
         stock_dir,
         txid,
@@ -999,34 +1353,10 @@ pub fn scan_and_promote_confirmed_staged_rgb_stocks(
     network: Network,
     esplora_urls: &[String],
 ) -> Result<RgbPendingStockScanReport> {
-    let pending_root = pending_rgb_stock_root(stock_dir);
+    let store = LocalRgbStore::open(stock_dir)?;
     let mut report = RgbPendingStockScanReport::default();
-    let Ok(entries) = fs::read_dir(&pending_root) else {
-        return Ok(report);
-    };
-    let mut staged_dirs = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(|file_type| file_type.is_dir())
-                .map(|_| entry.path())
-        })
-        .collect::<Vec<_>>();
-    staged_dirs.sort();
-
-    for (index, staged_stock_dir) in staged_dirs.into_iter().enumerate() {
-        let Some(txid) = staged_stock_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.parse::<Txid>().ok())
-        else {
-            report.skipped += 1;
-            continue;
-        };
-        let status_path = pending_stock_status_path(&staged_stock_dir);
-        let existing_status = read_pending_stock_status(&status_path).ok();
+    for (index, txid) in store.pending_txids()?.into_iter().enumerate() {
+        let existing_status = store.pending_status(txid)?;
         if existing_status
             .as_ref()
             .is_some_and(|status| is_terminal_pending_stock_status(&status.status))
@@ -1034,19 +1364,6 @@ pub fn scan_and_promote_confirmed_staged_rgb_stocks(
             report.skipped += 1;
             continue;
         }
-        if LocalRgbStore::open(stock_dir)
-            .and_then(|store| Ok(store.get_pending_op(txid)?.is_some()))
-            .unwrap_or(false)
-            == false
-        {
-            write_pending_stock_status(
-                &status_path,
-                pending_stock_status(txid, "invalid", stock_dir, &staged_stock_dir, None, None),
-            )?;
-            report.skipped += 1;
-            continue;
-        }
-
         report.scanned += 1;
         let Some(tx_confirmed) =
             fetch_tx_confirmation_consensus(network, esplora_urls, txid, index)?
@@ -1055,27 +1372,22 @@ pub fn scan_and_promote_confirmed_staged_rgb_stocks(
             continue;
         };
         if !tx_confirmed {
-            write_pending_stock_status(
-                &status_path,
-                pending_stock_status(txid, "pending", stock_dir, &staged_stock_dir, None, None),
-            )?;
+            let status = pending_stock_status(txid, "pending", store.logical_name(), None, None);
+            store.put_pending_status(txid, &status)?;
             report.pending += 1;
             continue;
         }
         let chain_source = chain_source_from_esplora_urls(network, esplora_urls)?;
         replay_pending_rgb_operation(stock_dir, network, &chain_source, txid)?;
         let now = now();
-        write_pending_stock_status(
-            &status_path,
-            pending_stock_status(
-                txid,
-                "confirmed",
-                stock_dir,
-                &staged_stock_dir,
-                Some(now),
-                Some(now),
-            ),
-        )?;
+        let status = pending_stock_status(
+            txid,
+            "confirmed",
+            store.logical_name(),
+            Some(now),
+            Some(now),
+        );
+        store.put_pending_status(txid, &status)?;
         report.promoted += 1;
         report.promoted_txids.push(txid);
     }
@@ -1350,21 +1662,11 @@ fn store_pending_rgb_operation(
     txid: Txid,
     status: &str,
     op: RgbPendingOperation,
-) -> Result<PathBuf> {
-    let staged_stock_dir = staged_rgb_stock_dir(stock_dir, txid);
-    fs::create_dir_all(&staged_stock_dir).with_context(|| {
-        format!(
-            "create staged RGB operation marker {}",
-            staged_stock_dir.display()
-        )
-    })?;
+) -> Result<()> {
     let bytes = serde_json::to_vec(&op).context("encode RGB pending operation")?;
-    LocalRgbStore::open(stock_dir)?.put_pending_op(txid, &bytes)?;
-    write_pending_stock_status(
-        &pending_stock_status_path(&staged_stock_dir),
-        pending_stock_status(txid, status, stock_dir, &staged_stock_dir, None, None),
-    )?;
-    Ok(staged_stock_dir)
+    let store = LocalRgbStore::open(stock_dir)?;
+    let status = pending_stock_status(txid, status, store.logical_name(), None, None);
+    store.put_pending_operation(txid, &bytes, &status)
 }
 
 fn replay_pending_rgb_operation(
@@ -1600,10 +1902,6 @@ pub fn decode_fascia_bytes(bytes: &[u8]) -> Result<Fascia> {
     decode_fascia(bytes)
 }
 
-fn staged_rgb_stock_dir(stock_dir: &Path, txid: Txid) -> PathBuf {
-    pending_rgb_stock_root(stock_dir).join(txid.to_string())
-}
-
 fn pending_rgb_stock_root(stock_dir: &Path) -> PathBuf {
     let stock_name = stock_dir
         .file_name()
@@ -1615,10 +1913,6 @@ fn pending_rgb_stock_root(stock_dir: &Path) -> PathBuf {
         .join(format!("{stock_name}_pending"))
 }
 
-fn pending_stock_status_path(staged_stock_dir: &Path) -> PathBuf {
-    staged_stock_dir.join("pending-status.json")
-}
-
 fn is_terminal_pending_stock_status(status: &str) -> bool {
     matches!(status, "confirmed" | "invalid")
 }
@@ -1626,30 +1920,35 @@ fn is_terminal_pending_stock_status(status: &str) -> bool {
 fn pending_stock_status(
     txid: Txid,
     status: &str,
-    stock_dir: &Path,
-    staged_stock_dir: &Path,
+    logical_store: &str,
     confirmed_at: Option<u64>,
     promoted_at: Option<u64>,
 ) -> RgbPendingStockStatus {
     RgbPendingStockStatus {
         txid: txid.to_string(),
         status: status.to_string(),
-        main_stock_dir: stock_dir.display().to_string(),
-        staged_stock_dir: staged_stock_dir.display().to_string(),
+        main_stock_dir: logical_store.to_string(),
+        staged_stock_dir: format!("{logical_store}:pending:{txid}"),
         updated_at: now(),
         confirmed_at,
         promoted_at,
     }
 }
 
-fn read_pending_stock_status(path: &Path) -> Result<RgbPendingStockStatus> {
-    serde_json::from_slice(&fs::read(path)?)
-        .with_context(|| format!("read RGB pending stock status {}", path.display()))
-}
-
-fn write_pending_stock_status(path: &Path, status: RgbPendingStockStatus) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(&status)?)
-        .with_context(|| format!("write RGB pending stock status {}", path.display()))
+fn legacy_pending_stock_status(
+    stock_dir: &Path,
+    txid: Txid,
+) -> Result<Option<RgbPendingStockStatus>> {
+    let path = pending_rgb_stock_root(stock_dir)
+        .join(txid.to_string())
+        .join("pending-status.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("read legacy RGB pending status {}", path.display()))?,
+    ))
 }
 
 fn outpoint_to_rgb(outpoint: OutPoint) -> rgbstd::Outpoint {
@@ -1675,5 +1974,84 @@ fn network_to_rgb(network: Network) -> rgbstd::ChainNet {
         Network::Testnet4 => rgbstd::ChainNet::BitcoinTestnet4,
         Network::Signet => rgbstd::ChainNet::BitcoinSignet,
         Network::Regtest => rgbstd::ChainNet::BitcoinRegtest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+
+    fn temp_path(label: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rgb-service-local-{label}-{suffix}"))
+    }
+
+    fn initialize_empty_stock(store: &LocalRgbStore) {
+        let provider = store.rgb_stock_store().unwrap();
+        let mut stock = Stock::in_memory();
+        stock.make_persistent(provider, true).unwrap();
+        stock.store().unwrap();
+    }
+
+    #[test]
+    fn shared_database_isolates_account_stocks_and_pending_state() {
+        let database_dir = temp_path("shared");
+        let alice_locator = shared_rgb_store_locator(&database_dir, "alice");
+        let bob_locator = shared_rgb_store_locator(&database_dir, "bob");
+        let alice = LocalRgbStore::open(&alice_locator).unwrap();
+        let bob = LocalRgbStore::open(&bob_locator).unwrap();
+        initialize_empty_stock(&alice);
+        initialize_empty_stock(&bob);
+
+        let txid = Txid::from_byte_array([7; 32]);
+        let status = pending_stock_status(txid, "pending", alice.logical_name(), None, None);
+        alice
+            .put_pending_operation(txid, b"alice-pending", &status)
+            .unwrap();
+
+        assert!(alice.rgb_stock_has_data().unwrap());
+        assert!(bob.rgb_stock_has_data().unwrap());
+        assert_eq!(
+            alice.get_pending_op(txid).unwrap().unwrap(),
+            b"alice-pending"
+        );
+        assert!(bob.get_pending_op(txid).unwrap().is_none());
+        assert_eq!(
+            shared_rgb_stock_account_ids(&alice.inner.db).unwrap(),
+            BTreeSet::from(["alice".to_string(), "bob".to_string()])
+        );
+        assert_eq!(
+            shared_rgb_pending_account_ids(&alice.inner.db).unwrap(),
+            BTreeSet::from(["alice".to_string()])
+        );
+        assert!(!database_dir.join(SHARED_RGB_ACCOUNT_MARKER).exists());
+    }
+
+    #[test]
+    fn per_account_store_migration_is_idempotent() {
+        let source_dir = temp_path("source");
+        let source = LocalRgbStore::open(&source_dir).unwrap();
+        initialize_empty_stock(&source);
+        let txid = Txid::from_byte_array([9; 32]);
+        let status = pending_stock_status(txid, "pending", source.logical_name(), None, None);
+        source
+            .put_pending_operation(txid, b"pending", &status)
+            .unwrap();
+
+        let database_dir = temp_path("target");
+        let target_locator = shared_rgb_store_locator(&database_dir, "account-1");
+        let first = migrate_rgb_account_store(&source_dir, &target_locator).unwrap();
+        assert!(first.stock_migrated);
+        assert_eq!(first.pending_migrated, 1);
+        let target = LocalRgbStore::open(&target_locator).unwrap();
+        assert!(target.rgb_stock_has_data().unwrap());
+        assert_eq!(target.get_pending_op(txid).unwrap().unwrap(), b"pending");
+
+        let second = migrate_rgb_account_store(&source_dir, &target_locator).unwrap();
+        assert_eq!(second, RgbAccountStoreMigrationReport::default());
     }
 }

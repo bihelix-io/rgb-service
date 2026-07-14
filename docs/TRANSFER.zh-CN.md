@@ -231,7 +231,7 @@ daemon 会：
 daemon 定时扫描：
 
 ```text
-accounts/<account_id>/rgb-stock_pending
+kv/rgb_pending_ops + kv/rgb_pending_status（按 account_id 前缀隔离）
 ```
 
 满足链上条件后自动 promote。客户端不要调用 `/v1/recover`，普通 L1 recover HTTP API 已经移除。

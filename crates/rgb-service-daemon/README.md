@@ -200,7 +200,7 @@ Current public daemon routes:
 POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
 POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
 POST /v1/assets/list            # Query account asset list, charges query_fee
-POST /v1/assets/by-utxo         # Query verified RGB allocations and asset metadata for one L1 outpoint, charges query_fee
+POST /v1/assets/by-utxo         # Public read-only query for verified RGB allocations at one L1 outpoint; no signature or RNA fee
 GET  /v1/tokens/list            # Public RGB20 contract/asset catalog, no signature required
 POST /v1/balance                # Query asset balance summary, charges query_fee
 POST /v1/balance/breakdown      # Query allocations and pending detail, charges query_fee
@@ -273,7 +273,8 @@ not expose `/v1/pending/list` or `/v1/recover` to clients.
 
 LN compose routes are service-owned state-transition APIs for `ln-rgb-lightning`. They require both the outer request signature and `asset_authorization`. Until the daemon RGB-LN state machine is wired to `rgb-service-local`, these routes fail loudly with HTTP 501 instead of falling back to local LN RGB state.
 
-All non-public requests use `SignedRequest<T>`.
+All non-public requests use `SignedRequest<T>`. `/v1/assets/by-utxo` is a read-only public
+query and accepts its payload directly without a signer request.
 
 `/v1/assets/by-utxo` payload:
 
@@ -302,8 +303,7 @@ Under `service.data_dir`:
 
 ```text
 rgb-service.log          # daemon log
-kv/                      # fjall database
-accounts/<btc_addr>/     # RGB stock/account state
+kv/                      # single fjall database for all daemon state
 ```
 
 Important fjall keyspaces:
@@ -313,7 +313,17 @@ profiles                 # btc_addr profile, stored as Zust Dynamic MsgPack
 usage_logs               # internal RNA debit logs
 prepared_transfers       # pending prepared transfer state
 account_utxos            # daemon-maintained account UTXOs used for RGB allocation lookup
+rgb_stock                # all account RGB stocks, keyed by account prefix
+rgb_pending_ops          # all pending RGB operations, keyed by account + txid
+rgb_pending_status       # pending/confirmed promotion state
+legacy_wallets           # wallet-service-v2-compatible BDK wallet state
+schema_migrations        # completed on-disk-to-database migrations
 ```
+
+On the first upgraded startup, legacy `accounts/<account_id>/rgb-stock` and
+`legacy-wallets/<descriptor_hash>/bdk_wallet` data are imported into `kv/`.
+The import is idempotent and records migration markers only after every source
+entry succeeds. Normal operation does not read or write those directories.
 
 ## RGB UTXO ownership
 
@@ -325,16 +335,16 @@ and asset/balance queries do not scan Esplora as a fallback. Issue and transfer
 commit requests add the involved UTXOs to daemon state; queries remove known
 UTXOs that no longer carry RGB allocations.
 
-For historical backfill or operational recovery, run the console over SSH and
-scan explicitly:
+For historical backfill or operational recovery, stop the daemon and use its
+offline repair command with explicit outpoints:
 
-```zust
-rgb::scan_utxos("bc1...")
+```bash
+target/release/rgb-service repair-daemon-account-utxos \
+  ./rgb-service.toml <account_id> <txid:vout>...
 ```
 
-That console function scans the address UTXOs and records them directly into the
-daemon local `account_utxos` state on the SSH host. It is not a public HTTP
-permission path.
+The command is daemon-owned and writes `account_utxos` through the daemon storage
+implementation. `zust-console` must not open or modify the daemon Fjall database.
 
 ## Deployment note
 

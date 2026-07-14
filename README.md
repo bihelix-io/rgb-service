@@ -84,15 +84,16 @@ The daemon owns RGB contract and asset state under `service.data_dir`.
 
 ```text
 <data_dir>/
-|-- kv/                         # service KV: accounts, prepared transfers
-`-- accounts/
-    `-- <account_id>/
-        |-- rgb-stock/          # RGB stock / contracts / asset state
-        `-- rgb-stock_pending/  # pending promotion markers
+|-- kv/                         # single Fjall DB: all account and wallet state
+`-- rgb-service.log             # runtime log; not migration state
 ```
 
 Accounts are API/KV concepts, not static config sections. Requests carry
-`account_id`, and the service uses it as the namespace for RGB state.
+`account_id`, and the service uses it as the key prefix for RGB stock and
+pending state inside the shared database. On the first upgraded startup the
+daemon imports old `accounts/` and `legacy-wallets/` data into `kv/`
+idempotently. After the migration markers are persisted, those old directories
+are no longer read during normal operation and may be archived or removed.
 
 ## Public HTTP API 中文说明
 
