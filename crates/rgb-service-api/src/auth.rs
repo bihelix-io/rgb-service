@@ -40,7 +40,6 @@ pub struct RequestSignature {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureScheme {
-    Bip322,
     Schnorr,
     Ecdsa,
     Ed25519,

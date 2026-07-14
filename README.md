@@ -38,7 +38,7 @@ Internal RGB workspace crates are kept where required:
 
 HTTP support is available behind the `axum` feature. Mutating endpoints accept
 signed requests. Operations that move or lock RGB value require an additional
-asset spend authorization, intended to be signed by the user wallet or signer.
+asset spend authorization, intended to be signed by the user wallet.
 The `/v1/test/rgb` endpoint is intended for privileged integration testing and
 requires a signed request with the test permission.
 
@@ -52,9 +52,6 @@ bind = "127.0.0.1:8787"
 network = "regtest"
 data_dir = "/tmp/bihelix-rgb-service"
 esplora_url = "http://127.0.0.1:3002"
-
-[iroh]
-secret_key_hex = ""
 ```
 
 
@@ -64,10 +61,6 @@ Daemon logs are written to:
 ```text
 <service.data_dir>/rgb-service.log
 ```
-
-When `[iroh]` is configured, the daemon derives the iroh `node_id` from
-`secret_key_hex` and writes both `node_id` and the current endpoint address to
-this log file at startup.
 
 Run the HTTP service:
 
@@ -141,7 +134,7 @@ RGB 转账采用 direct send：`/v1/transfers/commit` 会根据 prepare 阶段�
   "signature": {
     "signer_id": "alice-wallet",
     "public_key": "...",
-    "scheme": "bip322",
+    "scheme": "ecdsa",
     "nonce": "random-nonce",
     "timestamp_ms": 1760000000000,
     "signature": "..."
@@ -152,7 +145,6 @@ RGB 转账采用 direct send：`/v1/transfers/commit` 会根据 prepare 阶段�
 `signature.scheme` 可选值：
 
 ```text
-bip322
 schnorr
 ecdsa
 ed25519
@@ -181,7 +173,7 @@ ed25519
   "signature": {
     "signer_id": "alice-wallet",
     "public_key": "...",
-    "scheme": "bip322",
+    "scheme": "ecdsa",
     "nonce": "asset-spend-nonce",
     "timestamp_ms": 1760000000000,
     "signature": "..."
@@ -457,7 +449,7 @@ account
     "signature": {
       "signer_id": "alice-wallet",
       "public_key": "...",
-      "scheme": "bip322",
+      "scheme": "ecdsa",
       "nonce": "asset-spend-nonce",
       "timestamp_ms": 1760000000000,
       "signature": "..."
@@ -512,7 +504,7 @@ RGB Service 根据 `transfer_id` 找回内部保存的 RGB 状态，并把 opera
     "signature": {
       "signer_id": "alice-wallet",
       "public_key": "...",
-      "scheme": "bip322",
+      "scheme": "ecdsa",
       "nonce": "asset-spend-nonce",
       "timestamp_ms": 1760000000000,
       "signature": "..."

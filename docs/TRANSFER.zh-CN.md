@@ -31,7 +31,7 @@ RGB crate，不需要本地 RGB stock，也不需要跑 zust-console。
 
 - L1 转账业务需要外部 BTC 钱包能力，用来选 UTXO、构造/签名/广播 PSBT。
 - L2/LN 转账业务需要外部 LN node 能力，用来处理 peer、channel、HTLC、commitment 和 LN 签名协议。
-- signer 可以是 signer-app，也可以是能产出 daemon 接受的 ECDSA/legacy `bip322` envelope 的钱包组件。
+- 用户钱包负责产出 daemon 接受的 ECDSA 签名。
 
 `rgb-service-daemon` 负责：
 

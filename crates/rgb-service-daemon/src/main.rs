@@ -1517,7 +1517,6 @@ impl ConfiguredAuthVerifier {
     }
 
     fn verify_request_signature(
-        account_id: &str,
         permission: &Permission,
         payload: &[u8],
         signature: &RequestSignature,
@@ -1537,7 +1536,6 @@ impl ConfiguredAuthVerifier {
                     )
                 }))
             }
-            SignatureScheme::Bip322 => Self::verify_legacy_signer_app_bip322(account_id, signature),
             SignatureScheme::Schnorr | SignatureScheme::Ed25519 => {
                 Err(RgbServiceError::Unauthorized(format!(
                     "unsupported request signature scheme: {:?}",
@@ -1547,27 +1545,6 @@ impl ConfiguredAuthVerifier {
         }
     }
 
-    fn verify_legacy_signer_app_bip322(
-        account_id: &str,
-        signature: &RequestSignature,
-    ) -> rgb_service_api::Result<()> {
-        if signature.signer_id != account_id {
-            return Err(RgbServiceError::Unauthorized(
-                "BIP322 signer_id must match account_id".to_string(),
-            ));
-        }
-        if signature.signature.trim().is_empty() {
-            return Err(RgbServiceError::SignatureRequired(
-                "BIP322 request signature must not be empty".to_string(),
-            ));
-        }
-        if signature.nonce.trim().is_empty() {
-            return Err(RgbServiceError::Unauthorized(
-                "BIP322 request signature nonce must not be empty".to_string(),
-            ));
-        }
-        Self::verify_signature_timestamp(signature.timestamp_ms)
-    }
 }
 
 #[async_trait]
@@ -1584,7 +1561,7 @@ impl AuthVerifier for ConfiguredAuthVerifier {
                 "account_id must not be empty".to_string(),
             ));
         }
-        Self::verify_request_signature(account_id, &permission, payload, signature)?;
+        Self::verify_request_signature(&permission, payload, signature)?;
         Ok(AuthSubject {
             account_id: account_id.to_string(),
             signer_id: signature.signer_id.clone(),
@@ -1615,9 +1592,6 @@ impl AuthVerifier for ConfiguredAuthVerifier {
         match authorization.signature.scheme {
             SignatureScheme::Ecdsa => {
                 Self::verify_ecdsa_signature("asset_spend", &payload, &authorization.signature)
-            }
-            SignatureScheme::Bip322 => {
-                Self::verify_legacy_signer_app_bip322(_account_id, &authorization.signature)
             }
             SignatureScheme::Schnorr | SignatureScheme::Ed25519 => {
                 Err(RgbServiceError::AssetSpendAuthorizationRequired(format!(
@@ -4838,7 +4812,6 @@ query_fee = 1
         };
 
         ConfiguredAuthVerifier::verify_request_signature(
-            "account-1",
             &Permission::IssueAsset,
             &payload,
             &signature,
@@ -4850,35 +4823,8 @@ query_fee = 1
         }))
         .unwrap();
         assert!(ConfiguredAuthVerifier::verify_request_signature(
-            "account-1",
             &Permission::IssueAsset,
             &tampered,
-            &signature,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn accepts_legacy_signer_app_bip322_envelope() {
-        let signature = RequestSignature {
-            signer_id: "account-1".to_string(),
-            public_key: String::new(),
-            scheme: SignatureScheme::Bip322,
-            nonce: now_ms().to_string(),
-            timestamp_ms: now_ms(),
-            signature: "bitcoin-message-signature".to_string(),
-        };
-        ConfiguredAuthVerifier::verify_request_signature(
-            "account-1",
-            &Permission::ReadRnaBalance,
-            br#"{"account_id":"account-1"}"#,
-            &signature,
-        )
-        .unwrap();
-        assert!(ConfiguredAuthVerifier::verify_request_signature(
-            "other-account",
-            &Permission::ReadRnaBalance,
-            br#"{"account_id":"account-1"}"#,
             &signature,
         )
         .is_err());

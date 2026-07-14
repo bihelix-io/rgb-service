@@ -6525,7 +6525,7 @@ fn signed_request(input: &Dynamic, route: &str) -> Result<Dynamic> {
     let signature = input
         .get_dynamic("signature")
         .map(|signature| dynamic_to_json(&signature))
-        .context("missing caller-provided signature; signer-app/Iroh signing is removed")?;
+        .context("missing caller-provided signature")?;
     Ok(json_to_dynamic(&json!({
         "payload": payload,
         "signature": signature
@@ -6610,7 +6610,7 @@ fn btc_esplora_urls() -> Vec<String> {
 
 fn external_signature_unavailable<T>() -> Result<T> {
     bail!(
-        "external signer-app/Iroh signing has been removed; provide a caller-signed PSBT or request signature"
+        "external signing is unavailable; provide a caller-signed PSBT or request signature"
     )
 }
 

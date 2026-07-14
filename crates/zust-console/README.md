@@ -16,7 +16,7 @@ root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 ```
 
 `local/btc-addr` 是默认 L1 BTC/RGB 账户。`local/rgb-service` 是 RGB daemon
-的 HTTP 地址。console 不再连接 signer App，也不再启动 Iroh signer endpoint。
+的 HTTP 地址。console 不连接外部签名服务。
 
 常用 REPL 命令：
 
@@ -28,7 +28,7 @@ root::add("local/btc-addr", "bc1q5nqave6m673q4g704r4ppzwacur3d67amp3f8c");
 
 ## 签名边界
 
-地址池通过配置的 xpub 本地派生，不需要 signer App。console 不持有充值地址私钥，
+地址池通过配置的 xpub 本地派生，不需要外部签名服务。console 不持有充值地址私钥，
 因此不会自动签名 PSBT，也不会代替调用方生成 daemon 请求签名。需要认证的 daemon
 请求必须由调用方提供 `signature`；需要广播的交易必须先由对应钱包签名，再调用
 `btc::broadcast_psbt` 或 `btc::broadcast_psbt_checked`。
@@ -227,7 +227,7 @@ ln_rgb::send_rgb_payment("...", 1000, "", "...", 1)
 - `btc::scan_deposits(ident)` 适合小规模/admin 流程。大型托管钱包需要替换为
   基于 block/indexer 的 scanner。
 - console 不持有充值地址私钥，不提供自动 PSBT 签名；签名后的 PSBT 由调用方提交。
-- `rgb::*` 不使用外部 signer 或 Iroh consignment transport。
+- `rgb::*` 不使用外部 consignment transport。
   Consignment 管理属于 `rgb-service-daemon`。
 - LN 使用本地热钱包。它和 `local/btc-addr` 是分开的，channel 操作需要单独给
   LN 热钱包充值。

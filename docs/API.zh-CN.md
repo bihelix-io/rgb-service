@@ -40,7 +40,6 @@ RGB Service 负责托管服务端 RGB 状态：
 - BTC 私钥和 PSBT 签名
 - BTC 交易广播
 - 用户资产授权签名
-- signer App 生命周期
 
 普通 L1 RGB pending/recovery 不作为客户端能力暴露。daemon 后台 scanner 会自动扫描 staged stock 并推进状态，所以客户端不能调用 `/v1/pending/list` 或 `/v1/recover`。
 
@@ -90,20 +89,13 @@ BTC transaction broadcast
   "signature": {
     "signer_id": "bc1...",
     "public_key": "...",
-    "scheme": "bip322",
+    "scheme": "ecdsa",
     "nonce": "...",
     "timestamp_ms": 1760000000000,
     "signature": "..."
   }
 }
 ```
-
-当前 daemon 为了兼容 signer-app 的 legacy `bip322` envelope，会校验：
-
-- `signer_id == account_id`
-- `signature` 非空
-- `nonce` 非空
-- `timestamp_ms` 在允许窗口内
 
 ECDSA 请求会按 daemon 的域分隔消息做真实签名验证。Schnorr 和 Ed25519 当前不接受。
 
