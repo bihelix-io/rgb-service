@@ -65,6 +65,7 @@ const BTC_ADDRESS_XPUB_LOOKUP_MARGIN: u32 = 1_000;
 const RGB_CALLBACK_WORKER_COUNT: usize = 4;
 const RGB_CALLBACK_QUEUE_CAPACITY: usize = 64;
 static ESPLORA_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+static RGB_SERVICE_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 static LN_RGB_NODE: OnceLock<Mutex<Option<Arc<LnRgbBtcLnBackend>>>> = OnceLock::new();
 type RgbCallbackJob = Box<dyn FnOnce() + Send + 'static>;
 static RGB_CALLBACK_QUEUE: OnceLock<std::result::Result<SyncSender<RgbCallbackJob>, String>> =
@@ -76,8 +77,8 @@ pub(crate) fn daemon_url() -> Result<String> {
     let daemon_url =
         local_string("rgb-service").context("missing root value `local/rgb-service`")?;
     ensure!(
-        daemon_url.starts_with("http://"),
-        "local/rgb-service must start with http://"
+        daemon_url.starts_with("http://") || daemon_url.starts_with("https://"),
+        "local/rgb-service must start with http:// or https://"
     );
     Ok(daemon_url)
 }
@@ -5889,50 +5890,46 @@ fn http_request_options(options: &Dynamic) -> Result<Value> {
 }
 
 fn http_post_json(url: &str, body: &Value) -> Result<Value> {
-    let (host, port, path) = parse_http_url(url)?;
     let body = serde_json::to_vec(body)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connect RGB service daemon {host}:{port}"))?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let response = String::from_utf8(response).context("RGB service response is not UTF-8")?;
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .context("invalid HTTP response from RGB service")?;
-    let status = head.lines().next().unwrap_or_default();
-    let status_code = status
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .context("missing HTTP status code from RGB service")?;
+    let response = rgb_service_http_client()?
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status_code = response.status().as_u16();
+    let body = response
+        .text()
+        .context("RGB service response is not UTF-8")?;
     let json = if body.trim().is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(body)
+        serde_json::from_str(&body)
             .with_context(|| format!("decode RGB service JSON body: {body}"))?
     };
     if !(200..300).contains(&status_code) {
-        bail!("RGB service {path} failed with HTTP {status_code}: {json}");
+        bail!("RGB service {url} failed with HTTP {status_code}: {json}");
     }
     Ok(json)
 }
 
 fn http_get_json(url: &str) -> Result<Value> {
-    let (host, port, path) = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connect RGB service daemon {host}:{port}"))?;
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes())?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    parse_http_json_response(&path, response)
+    let response = rgb_service_http_client()?
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status_code = response.status().as_u16();
+    let body = response.bytes().context("read RGB service response body")?;
+    let json = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body)
+            .with_context(|| format!("decode RGB service JSON body from {url}"))?
+    };
+    if !(200..300).contains(&status_code) {
+        bail!("RGB service {url} failed with HTTP {status_code}: {json}");
+    }
+    Ok(json)
 }
 
 fn btc_account_for_ident(ident: &str) -> Result<Value> {
@@ -6321,6 +6318,22 @@ fn esplora_http_client() -> Result<&'static reqwest::blocking::Client> {
     ESPLORA_HTTP_CLIENT
         .get()
         .context("Esplora HTTP client was not initialized")
+}
+
+fn rgb_service_http_client() -> Result<&'static reqwest::blocking::Client> {
+    if let Some(client) = RGB_SERVICE_HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .user_agent("bihelix-zust-console/1.0")
+        .build()
+        .context("build RGB service HTTP client")?;
+    let _ = RGB_SERVICE_HTTP_CLIENT.set(client);
+    RGB_SERVICE_HTTP_CLIENT
+        .get()
+        .context("RGB service HTTP client was not initialized")
 }
 
 fn esplora_get_text(url: &str, accept: &str) -> Result<String> {

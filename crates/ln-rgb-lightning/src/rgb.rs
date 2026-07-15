@@ -15,10 +15,9 @@
 
 use alloc::sync::Arc;
 use std::collections::BTreeMap;
-use std::io::Read as IoRead;
-use std::net::TcpStream;
 use std::sync::OnceLock;
 
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::ln::msgs::DecodeError;
@@ -87,9 +86,9 @@ impl RgbServiceClient {
                 "rgb-service daemon_url must not be empty".to_string(),
             ));
         }
-        if !daemon_url.starts_with("http://") {
+        if !daemon_url.starts_with("http://") && !daemon_url.starts_with("https://") {
             return Err(RgbServiceClientError::InvalidRequest(
-                "rgb-service daemon_url must start with http://".to_string(),
+                "rgb-service daemon_url must start with http:// or https://".to_string(),
             ));
         }
         Ok(Self { daemon_url, signer })
@@ -224,33 +223,17 @@ impl RgbServiceClient {
     {
         let url = format!("{}{}", self.daemon_url.trim_end_matches('/'), route);
         let body = serde_json::to_vec(body)?;
-        let (host, port, path) = parse_http_url(&url)?;
-        let mut stream = TcpStream::connect((host.as_str(), port))?;
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        std::io::Write::write_all(&mut stream, request.as_bytes())?;
-        std::io::Write::write_all(&mut stream, &body)?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        let response = String::from_utf8(response)?;
-        let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
-            RgbServiceClientError::Http("invalid daemon HTTP response".to_string())
-        })?;
-        let status_code = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u16>().ok())
-            .ok_or_else(|| RgbServiceClientError::Http("missing daemon HTTP status".to_string()))?;
+        let response = http_client()
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()?;
+        let status_code = response.status().as_u16();
+        let body = response.text()?;
         if !(200..300).contains(&status_code) {
-            return Err(RgbServiceClientError::Daemon {
-                status_code,
-                body: body.to_string(),
-            });
+            return Err(RgbServiceClientError::Daemon { status_code, body });
         }
-        Ok(serde_json::from_str(body)?)
+        Ok(serde_json::from_str(&body)?)
     }
 
     fn get_json<R>(&self, route: &str) -> Result<R, RgbServiceClientError>
@@ -258,48 +241,19 @@ impl RgbServiceClient {
         R: for<'de> Deserialize<'de>,
     {
         let url = format!("{}{}", self.daemon_url.trim_end_matches('/'), route);
-        let (host, port, path) = parse_http_url(&url)?;
-        let mut stream = TcpStream::connect((host.as_str(), port))?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-        std::io::Write::write_all(&mut stream, request.as_bytes())?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        let response = String::from_utf8(response)?;
-        let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
-            RgbServiceClientError::Http("invalid daemon HTTP response".to_string())
-        })?;
-        let status_code = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u16>().ok())
-            .ok_or_else(|| RgbServiceClientError::Http("missing daemon HTTP status".to_string()))?;
+        let response = http_client().get(&url).send()?;
+        let status_code = response.status().as_u16();
+        let body = response.text()?;
         if !(200..300).contains(&status_code) {
-            return Err(RgbServiceClientError::Daemon {
-                status_code,
-                body: body.to_string(),
-            });
+            return Err(RgbServiceClientError::Daemon { status_code, body });
         }
-        Ok(serde_json::from_str(body)?)
+        Ok(serde_json::from_str(&body)?)
     }
 }
 
-fn parse_http_url(value: &str) -> Result<(String, u16, String), RgbServiceClientError> {
-    let value = value.strip_prefix("http://").ok_or_else(|| {
-        RgbServiceClientError::InvalidRequest("daemon_url must start with http://".to_string())
-    })?;
-    let (authority, path) = value.split_once('/').unwrap_or((value, ""));
-    let (host, port) = authority.split_once(':').unwrap_or((authority, "80"));
-    if host.trim().is_empty() {
-        return Err(RgbServiceClientError::InvalidRequest(
-            "daemon_url host must not be empty".to_string(),
-        ));
-    }
-    let port = port.parse::<u16>().map_err(|_| {
-        RgbServiceClientError::InvalidRequest("daemon_url port is invalid".to_string())
-    })?;
-    Ok((host.to_string(), port, format!("/{path}")))
+fn http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new)
 }
 
 /// Error returned by the blocking RGB service client.
@@ -307,6 +261,7 @@ fn parse_http_url(value: &str) -> Result<(String, u16, String), RgbServiceClient
 pub enum RgbServiceClientError {
     InvalidRequest(String),
     Http(String),
+    HttpClient(reqwest::Error),
     Io(std::io::Error),
     Utf8(std::string::FromUtf8Error),
     Json(serde_json::Error),
@@ -319,6 +274,7 @@ impl core::fmt::Display for RgbServiceClientError {
         match self {
             Self::InvalidRequest(err) => write!(f, "invalid RGB service request: {err}"),
             Self::Http(err) => write!(f, "RGB service HTTP error: {err}"),
+            Self::HttpClient(err) => write!(f, "RGB service HTTP client error: {err}"),
             Self::Io(err) => write!(f, "RGB service I/O error: {err}"),
             Self::Utf8(err) => write!(f, "RGB service UTF-8 error: {err}"),
             Self::Json(err) => write!(f, "RGB service JSON error: {err}"),
@@ -336,6 +292,12 @@ impl std::error::Error for RgbServiceClientError {}
 impl From<std::io::Error> for RgbServiceClientError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
+    }
+}
+
+impl From<reqwest::Error> for RgbServiceClientError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::HttpClient(err)
     }
 }
 
