@@ -6297,6 +6297,18 @@ where
             .cloned()
     }
 
+    /// Restore RGB payment metadata from persisted local state after restart.
+    pub fn restore_rgb_payment_metadata(
+        &self,
+        payment_id: PaymentId,
+        rgb_payment: crate::rgb::RgbPaymentMetadata,
+    ) {
+        self.rgb_payment_metadata
+            .lock()
+            .unwrap()
+            .insert(payment_id, rgb_payment);
+    }
+
     /// Returns the RGB amount associated with an inbound claimable or claiming payment.
     pub fn inbound_rgb_payment_amount(
         &self,

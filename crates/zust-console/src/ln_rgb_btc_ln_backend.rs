@@ -469,7 +469,10 @@ impl ElectrumTxSync {
             .expect("ln-rgb confirmed tx lock poisoned");
         match confirmed_txs.get(&txid) {
             Some((seen_height, seen_hash))
-                if *seen_height == height && *seen_hash == block_hash => false,
+                if *seen_height == height && *seen_hash == block_hash =>
+            {
+                false
+            }
             _ => {
                 confirmed_txs.insert(txid, (height, block_hash));
                 true
@@ -1492,7 +1495,9 @@ impl LnRgbBtcLnBackend {
         let recipient_address = bitcoin::Address::from_str(recipient)
             .with_context(|| format!("invalid RGB recipient BTC address: {recipient}"))?
             .require_network(self.config.network)
-            .with_context(|| format!("RGB recipient address is not for {:?}", self.config.network))?;
+            .with_context(|| {
+                format!("RGB recipient address is not for {:?}", self.config.network)
+            })?;
         let fee_rate_sat_vb = fee_rate_sat_vb.max(1);
         let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
             .context("invalid LN hot wallet RGB withdrawal fee rate")?;
@@ -1562,10 +1567,7 @@ impl LnRgbBtcLnBackend {
                 recipient_script.clone(),
                 Amount::from_sat(RGB_CONTAINER_SATS),
             )
-            .add_recipient(
-                change_script.clone(),
-                Amount::from_sat(RGB_CONTAINER_SATS),
-            )
+            .add_recipient(change_script.clone(), Amount::from_sat(RGB_CONTAINER_SATS))
             .add_data(&[0; 32])
             .drain_to(change_script.clone());
         for outpoint in &selected_rgb_outpoints {
@@ -1642,7 +1644,10 @@ impl LnRgbBtcLnBackend {
             .wallet
             .sign(&mut prepared_psbt, SignOptions::default())
             .context("sign LN hot wallet RGB withdrawal PSBT")?;
-        ensure!(finalized, "LN hot wallet RGB withdrawal PSBT was not finalized");
+        ensure!(
+            finalized,
+            "LN hot wallet RGB withdrawal PSBT was not finalized"
+        );
         local.persist()?;
         let signed_anchor_psbt = prepared_psbt.to_string();
         let tx = prepared_psbt
@@ -1736,12 +1741,7 @@ impl LnRgbBtcLnBackend {
         let source_address = bitcoin::Address::from_str(source_address)
             .with_context(|| format!("invalid RGB source address: {source_address}"))?
             .require_network(self.config.network)
-            .with_context(|| {
-                format!(
-                    "RGB source address is not for {:?}",
-                    self.config.network
-                )
-            })?;
+            .with_context(|| format!("RGB source address is not for {:?}", self.config.network))?;
         ensure!(
             source_address.script_pubkey().is_p2wpkh(),
             "external RGB sweep currently requires a P2WPKH source"
@@ -1806,13 +1806,14 @@ impl LnRgbBtcLnBackend {
             }),
             "source outpoint contains another or unavailable RGB allocation; batch custody sweep is required"
         );
-        let source_asset_amount = source_allocations
-            .iter()
-            .try_fold(0u64, |total, allocation| {
-                total
-                    .checked_add(allocation.amount)
-                    .context("source RGB allocation amount overflow")
-            })?;
+        let source_asset_amount =
+            source_allocations
+                .iter()
+                .try_fold(0u64, |total, allocation| {
+                    total
+                        .checked_add(allocation.amount)
+                        .context("source RGB allocation amount overflow")
+                })?;
         ensure!(
             source_asset_amount == amount,
             "external RGB sweep must move the complete allocation: requested={amount} available={source_asset_amount}"
@@ -1829,11 +1830,10 @@ impl LnRgbBtcLnBackend {
                 .with_context(|| {
                     format!("external RGB source transaction not found: {source_outpoint}")
                 })?,
-            ChainSource::Electrum(config) => {
-                electrum_get_transaction(config, source_outpoint.txid).with_context(|| {
+            ChainSource::Electrum(config) => electrum_get_transaction(config, source_outpoint.txid)
+                .with_context(|| {
                     format!("fetch external RGB source transaction {source_outpoint}")
-                })?
-            }
+                })?,
             ChainSource::BitcoinCore(config) => config
                 .client()?
                 .get_raw_transaction(&source_outpoint.txid, None)
@@ -2011,37 +2011,44 @@ impl LnRgbBtcLnBackend {
         );
         local.persist()?;
 
-        let input_sats = prepared_psbt
-            .unsigned_tx
-            .input
-            .iter()
-            .try_fold(0u64, |total, input| {
-                let value = if input.previous_output == source_outpoint {
-                    source_txout.value.to_sat()
-                } else {
-                    confirmed_wallet_utxos
-                        .get(&input.previous_output)
-                        .with_context(|| {
-                            format!(
-                                "prepared external RGB sweep selected unknown LN input {}",
-                                input.previous_output
-                            )
-                        })?
-                        .value
-                        .to_sat()
-                };
-                total.checked_add(value).context("sweep input value overflow")
-            })?;
-        let output_sats = prepared_psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .try_fold(0u64, |total, output| {
-                total
-                    .checked_add(output.value.to_sat())
-                    .context("sweep output value overflow")
-            })?;
-        ensure!(input_sats >= output_sats, "external RGB sweep fee underflow");
+        let input_sats =
+            prepared_psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .try_fold(0u64, |total, input| {
+                    let value = if input.previous_output == source_outpoint {
+                        source_txout.value.to_sat()
+                    } else {
+                        confirmed_wallet_utxos
+                            .get(&input.previous_output)
+                            .with_context(|| {
+                                format!(
+                                    "prepared external RGB sweep selected unknown LN input {}",
+                                    input.previous_output
+                                )
+                            })?
+                            .value
+                            .to_sat()
+                    };
+                    total
+                        .checked_add(value)
+                        .context("sweep input value overflow")
+                })?;
+        let output_sats =
+            prepared_psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .try_fold(0u64, |total, output| {
+                    total
+                        .checked_add(output.value.to_sat())
+                        .context("sweep output value overflow")
+                })?;
+        ensure!(
+            input_sats >= output_sats,
+            "external RGB sweep fee underflow"
+        );
         let fee_sats = input_sats - output_sats;
         let local_input_outpoints = prepared_psbt
             .unsigned_tx
@@ -2135,9 +2142,15 @@ impl LnRgbBtcLnBackend {
         txid: &str,
         operation: &str,
     ) -> Result<serde_json::Value> {
-        ensure!(!asset_id.trim().is_empty(), "RGB asset_id must not be empty");
+        ensure!(
+            !asset_id.trim().is_empty(),
+            "RGB asset_id must not be empty"
+        );
         ensure!(amount > 0, "RGB amount must be greater than zero");
-        ensure!(!transfer_id.trim().is_empty(), "RGB transfer_id must not be empty");
+        ensure!(
+            !transfer_id.trim().is_empty(),
+            "RGB transfer_id must not be empty"
+        );
         Txid::from_str(txid).with_context(|| format!("invalid RGB withdrawal txid: {txid}"))?;
         let client = self.rgb_service_client()?;
         let asset_authorization =
@@ -2438,6 +2451,26 @@ impl LnRgbBtcLnBackend {
             .lock()
             .expect("rgb payment asset lock poisoned") = loaded_assets;
         Ok(count)
+    }
+
+    fn restore_rgb_payment_metadata(&self, channel_manager: &LnRgbChannelManager) -> Result<usize> {
+        let mut restored = 0usize;
+        let payment_assets = self
+            .rgb_payment_assets
+            .lock()
+            .expect("rgb payment asset lock poisoned")
+            .clone();
+
+        for (payment_id_hex, asset) in payment_assets {
+            let payment_id = PaymentId(hex_to_32(&payment_id_hex)?);
+            channel_manager.restore_rgb_payment_metadata(
+                payment_id,
+                RgbPaymentMetadata::new(ldk_rgb_asset(&asset)),
+            );
+            restored += 1;
+        }
+
+        Ok(restored)
     }
 
     fn load_persisted_peers_from_disk(&self) -> Result<Vec<(PublicKey, SocketAddress)>> {
@@ -5317,6 +5350,9 @@ impl BtcLnNode for LnRgbBtcLnBackend {
         );
         init_rgb_ln_tx_composer(composer);
         let runtime = self.build_runtime()?;
+        let restored_payment_metadata = self
+            .restore_rgb_payment_metadata(&runtime.channel_manager)
+            .context("restore RGB payment metadata")?;
         let replayed_rgb_funding = self
             .retry_pending_rgb_funding_recovery(&runtime)
             .context("replay pending RGB funding")?;
@@ -5348,6 +5384,11 @@ impl BtcLnNode for LnRgbBtcLnBackend {
                     ));
                 }
             }
+        }
+        if restored_payment_metadata > 0 {
+            self.log_event(format!(
+                "ln-rgb RGB payment metadata restored from disk: count={restored_payment_metadata}"
+            ));
         }
         if loaded_bindings > 0 {
             self.log_event(format!(
