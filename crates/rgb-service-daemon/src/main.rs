@@ -3259,6 +3259,7 @@ impl LocalDaemonService {
         Ok(profile)
     }
 
+    #[allow(dead_code)] // Retained for restoring DAEMON_RNA metering.
     fn charge_daemon_rna(
         &self,
         account_id: &str,
@@ -3325,6 +3326,7 @@ impl LocalDaemonService {
         Ok(new_balance)
     }
 
+    #[allow(dead_code)] // Retained for restoring DAEMON_RNA metering.
     fn refund_daemon_rna(
         &self,
         account_id: &str,
@@ -3515,6 +3517,7 @@ impl LocalDaemonService {
         })
     }
 
+    #[allow(dead_code)] // Retained for restoring DAEMON_RNA metering.
     fn refund_daemon_rna_on_error<T>(
         &self,
         result: rgb_service_api::Result<T>,
@@ -3560,15 +3563,18 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<IssueAssetRequest>,
     ) -> rgb_service_api::Result<IssueAssetResponse> {
-        let route = "/v1/assets/issue";
-        let purpose = "issue_asset";
-        let amount = self.daemon_rna.issue_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         let ticker = payload.ticker.clone();
         let allocation_outpoint = payload.allocation_outpoint.clone();
         let issued_utxo = Self::issue_utxo(allocation_outpoint.clone(), payload.utxos.clone());
-        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
+        // DAEMON_RNA metering is temporarily disabled.
+        // self.charge_daemon_rna(
+        //     &account_id,
+        //     "/v1/assets/issue",
+        //     "issue_asset",
+        //     self.daemon_rna.issue_fee,
+        // )?;
         let result = (|| {
             let stock_dir = self.account_stock_dir(&account_id);
             let outpoint = OutPoint::from_str(&payload.allocation_outpoint)
@@ -3602,19 +3608,28 @@ impl RgbServiceApi for LocalDaemonService {
                 "rgb issue failed account_id={account_id} ticker={ticker} allocation_outpoint={allocation_outpoint} error={err}"
             )),
         }
-        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
+        // No refund is needed while the matching DAEMON_RNA debit is disabled.
+        // self.refund_daemon_rna_on_error(
+        //     result,
+        //     &account_id,
+        //     "/v1/assets/issue",
+        //     "issue_asset",
+        //     self.daemon_rna.issue_fee,
+        // )
+        result
     }
 
     async fn list_assets(
         &self,
         req: Authorized<ListAssetsRequest>,
     ) -> rgb_service_api::Result<ListAssetsResponse> {
-        self.charge_daemon_rna(
-            &req.payload.account_id,
-            "/v1/assets/list",
-            "list_assets",
-            self.daemon_rna.query_fee,
-        )?;
+        // DAEMON_RNA metering is temporarily disabled.
+        // self.charge_daemon_rna(
+        //     &req.payload.account_id,
+        //     "/v1/assets/list",
+        //     "list_assets",
+        //     self.daemon_rna.query_fee,
+        // )?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
         let known_outpoints = account_utxos
@@ -3851,9 +3866,6 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<PrepareTransferRequest>,
     ) -> rgb_service_api::Result<PrepareTransferResponse> {
-        let route = "/v1/transfers/prepare";
-        let purpose = "prepare_transfer";
-        let amount = self.daemon_rna.transfer_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.recipient.trim().is_empty() {
@@ -3861,7 +3873,13 @@ impl RgbServiceApi for LocalDaemonService {
                 "recipient account_id must not be empty".to_string(),
             ));
         }
-        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
+        // DAEMON_RNA metering is temporarily disabled.
+        // self.charge_daemon_rna(
+        //     &account_id,
+        //     "/v1/transfers/prepare",
+        //     "prepare_transfer",
+        //     self.daemon_rna.transfer_fee,
+        // )?;
         let result = (|| {
             let stock_dir = self.account_stock_dir(&account_id);
             let psbt = payload
@@ -3916,7 +3934,15 @@ impl RgbServiceApi for LocalDaemonService {
                 anchor_psbt: Some(hex_encode(&prepared.psbt.serialize())),
             })
         })();
-        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
+        // No refund is needed while the matching DAEMON_RNA debit is disabled.
+        // self.refund_daemon_rna_on_error(
+        //     result,
+        //     &account_id,
+        //     "/v1/transfers/prepare",
+        //     "prepare_transfer",
+        //     self.daemon_rna.transfer_fee,
+        // )
+        result
     }
 
     async fn commit_transfer(
@@ -4009,9 +4035,6 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnChannelOpenPrepareRequest>,
     ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
-        let route = "/v1/ln/channels/open/prepare";
-        let purpose = "ln_channel_open_prepare";
-        let amount = self.daemon_rna.transfer_fee;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.channel_id.trim().is_empty() {
@@ -4060,7 +4083,13 @@ impl RgbServiceApi for LocalDaemonService {
                 "RGB LN funding PSBT must include an OP_RETURN carrier output".to_string(),
             ));
         }
-        self.charge_daemon_rna(&account_id, route, purpose, amount)?;
+        // DAEMON_RNA metering is temporarily disabled.
+        // self.charge_daemon_rna(
+        //     &account_id,
+        //     "/v1/ln/channels/open/prepare",
+        //     "ln_channel_open_prepare",
+        //     self.daemon_rna.transfer_fee,
+        // )?;
         let result = (|| {
             let operation_id = Self::require_nonce(&payload.asset_authorization)?;
             let stock_dir = self.account_stock_dir(&account_id);
@@ -4109,7 +4138,15 @@ impl RgbServiceApi for LocalDaemonService {
                 anchor_psbt: hex_encode(&prepared.psbt.serialize()),
             })
         })();
-        self.refund_daemon_rna_on_error(result, &account_id, route, purpose, amount)
+        // No refund is needed while the matching DAEMON_RNA debit is disabled.
+        // self.refund_daemon_rna_on_error(
+        //     result,
+        //     &account_id,
+        //     "/v1/ln/channels/open/prepare",
+        //     "ln_channel_open_prepare",
+        //     self.daemon_rna.transfer_fee,
+        // )
+        result
     }
 
     async fn ln_channel_funding_ref(

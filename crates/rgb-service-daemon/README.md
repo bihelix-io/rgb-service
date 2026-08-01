@@ -74,6 +74,12 @@ query:                1 RNA
 
 The daemon writes internal usage logs, but does not expose per-user transaction history in the public API.
 
+DAEMON_RNA metering is temporarily disabled. The configured fee schedule and
+balance/credit APIs remain available, but issue, query, L1 transfer prepare and
+LN channel-open prepare do not debit or refund DAEMON_RNA while metering is
+paused. This does not disable the separately configured legacy RGB RNA transfer
+fee.
+
 ## Configuration
 
 Example regtest configuration:
@@ -198,13 +204,13 @@ Current public daemon routes:
 
 ```text
 POST /v1/rna/balance            # Query caller internal RNA balance and current fee policy
-POST /v1/assets/issue           # Issue RGB20 asset, charges issue_fee
-POST /v1/assets/list            # Query account asset list, charges query_fee
+POST /v1/assets/issue           # Issue RGB20 asset; DAEMON_RNA debit temporarily disabled
+POST /v1/assets/list            # Query account asset list; DAEMON_RNA debit temporarily disabled
 POST /v1/assets/by-utxo         # Public read-only query for verified RGB allocations at one L1 outpoint; no signature or RNA fee
 GET  /v1/tokens/list            # Public RGB20 contract/asset catalog, no signature required
-POST /v1/balance                # Query asset balance summary, charges query_fee
-POST /v1/balance/breakdown      # Query allocations and pending detail, charges query_fee
-POST /v1/transfers/prepare      # Prepare RGB transfer, charges transfer_fee
+POST /v1/balance                # Query asset balance summary; DAEMON_RNA debit temporarily disabled
+POST /v1/balance/breakdown      # Query allocations and pending detail; DAEMON_RNA debit temporarily disabled
+POST /v1/transfers/prepare      # Prepare RGB transfer; DAEMON_RNA debit temporarily disabled
 POST /v1/transfers/commit       # Commit txid and stage consignment for recipient
 POST /v1/transfers/cancel       # Cancel unfinished transfer
 POST /v1/ln/channels/open/prepare # Prepare RGB-aware LN channel open
