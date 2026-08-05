@@ -817,6 +817,13 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "btc",
+        "scan_deposits_batch",
+        &[Type::Str],
+        Type::Any,
+        btc_scan_deposits_batch as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
         "scan_ident_deposits",
         &[Type::Str],
         Type::Any,
@@ -1662,6 +1669,111 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
             "persisted": persisted,
             "deposits": deposits,
             "stored_deposits_count": store.count_btc_deposit_records()?
+        })))
+    })
+}
+
+extern "C" fn btc_scan_deposits_batch(input: *const Dynamic) -> *const Dynamic {
+    const MAX_CONCURRENCY: usize = 5;
+    const ADDRESS_TIMEOUT_SECS: u64 = 5;
+
+    native_string_dynamic_result(input, |batch| {
+        let mut requests = Vec::new();
+        for (index, line) in batch.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (ident, address) = line
+                .split_once('\t')
+                .with_context(|| format!("invalid BTC scan batch row {index}: expected ident\\taddress"))?;
+            let ident = ident.trim();
+            let address = address.trim();
+            ensure!(!ident.is_empty(), "BTC ident must not be empty at batch row {index}");
+            ensure!(!address.is_empty(), "BTC address must not be empty at batch row {index}");
+            requests.push((index, ident.to_string(), address.to_string()));
+        }
+        ensure!(!requests.is_empty(), "BTC scan batch must not be empty");
+
+        let request_count = requests.len();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            requests.into_iter().collect::<std::collections::VecDeque<_>>(),
+        ));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_count = MAX_CONCURRENCY.min(request_count);
+        for _ in 0..worker_count {
+            let queue = std::sync::Arc::clone(&queue);
+            let sender = sender.clone();
+            std::thread::spawn(move || loop {
+                let request = match queue.lock() {
+                    Ok(mut queue) => queue.pop_front(),
+                    Err(_) => None,
+                };
+                let Some((index, ident, address)) = request else {
+                    break;
+                };
+                let started = std::time::Instant::now();
+                let result = btc_scan_deposit_address_with_deadline(
+                    &ident,
+                    &address,
+                    started + std::time::Duration::from_secs(ADDRESS_TIMEOUT_SECS),
+                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let value = match result {
+                    Ok(scan) => json!({
+                        "ok": true,
+                        "ident": ident,
+                        "address": address,
+                        "elapsed_ms": elapsed_ms,
+                        "scan": scan
+                    }),
+                    Err(error) => json!({
+                        "ok": false,
+                        "ident": ident,
+                        "address": address,
+                        "elapsed_ms": elapsed_ms,
+                        "error": format!("{error:#}")
+                    }),
+                };
+                if sender.send((index, value)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+
+        let mut indexed_results = receiver.into_iter().collect::<Vec<_>>();
+        indexed_results.sort_by_key(|(index, _)| *index);
+        let mut deposits = Vec::new();
+        let mut failed_addresses = 0usize;
+        let results = indexed_results
+            .into_iter()
+            .map(|(_, result)| {
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    if let Some(items) = result
+                        .get("scan")
+                        .and_then(|scan| scan.get("deposits"))
+                        .and_then(Value::as_array)
+                    {
+                        deposits.extend(items.iter().cloned());
+                    }
+                } else {
+                    failed_addresses += 1;
+                }
+                result
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json_to_dynamic(&json!({
+            "module": "btc",
+            "ok": true,
+            "concurrency": worker_count,
+            "address_timeout_secs": ADDRESS_TIMEOUT_SECS,
+            "scanned_addresses": request_count,
+            "successful_addresses": request_count.saturating_sub(failed_addresses),
+            "failed_addresses": failed_addresses,
+            "deposits": deposits,
+            "results": results
         })))
     })
 }
@@ -6291,6 +6403,539 @@ fn btc_assets_json(ident: &str) -> Result<Value> {
         "account": account,
         "source": "rgb_assets_unavailable_without_ln_hot_wallet"
     }))
+}
+
+fn btc_scan_deposit_address_with_deadline(
+    ident: &str,
+    address: &str,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    const MAX_RETURNED_DEPOSITS: usize = 100;
+
+    let network = parse_ln_network(&ln_rgb_network_name())?;
+    Address::from_str(address)
+        .with_context(|| format!("invalid BTC deposit address: {address}"))?
+        .require_network(network)
+        .with_context(|| format!("deposit address is not for {network:?}: {address}"))?;
+
+    let mut errors = Vec::new();
+    for source in btc_esplora_urls() {
+        let base = source.trim_end_matches('/');
+        if is_electrum_chain_source(base) {
+            let attempt = (|| -> Result<Value> {
+                let txs = electrum_address_txs_json_with_deadline(address, base, deadline)?;
+                let utxos = electrum_address_utxos_json_with_deadline(address, base, deadline)?;
+                let header = electrum_rpc_with_deadline(
+                    base,
+                    "blockchain.headers.subscribe",
+                    json!([]),
+                    deadline,
+                )?;
+                let tip_height = header
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                btc_scan_deposit_records_from_chain_data(
+                    ident,
+                    address,
+                    base,
+                    tip_height,
+                    txs,
+                    utxos,
+                )
+            })();
+            match attempt {
+                Ok(result) => return Ok(result),
+                Err(error) => errors.push(format!("{base}: {error:#}")),
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            continue;
+        }
+        let attempt = (|| -> Result<Value> {
+            let txs = btc_timed_esplora_json(
+                &format!("{base}/address/{address}/txs"),
+                deadline,
+            )?;
+            let utxos = btc_timed_esplora_json(
+                &format!("{base}/address/{address}/utxo"),
+                deadline,
+            )?;
+            let tip_height = btc_timed_esplora_text(
+                &format!("{base}/blocks/tip/height"),
+                deadline,
+            )?
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid BTC tip height from {base}"))?;
+
+            let mut seen = std::collections::BTreeSet::new();
+            let mut deposits = Vec::new();
+            for tx in txs.as_array().cloned().unwrap_or_default() {
+                let txid = tx
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for (fallback_vout, output) in tx
+                    .get("vout")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                {
+                    if output
+                        .get("scriptpubkey_address")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        != address
+                    {
+                        continue;
+                    }
+                    let vout = output
+                        .get("n")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(fallback_vout as u64);
+                    let outpoint = format!("{txid}:{vout}");
+                    seen.insert(outpoint.clone());
+                    let status = tx.get("status").unwrap_or(&Value::Null);
+                    let confirmed = status
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let block_height = status.get("block_height").and_then(Value::as_u64);
+                    let confirmations = block_height
+                        .filter(|_| confirmed)
+                        .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                        .unwrap_or_default();
+                    if deposits.len() < MAX_RETURNED_DEPOSITS {
+                        deposits.push(json!({
+                            "owner_type": "ident",
+                            "owner_label": "",
+                            "ident": ident,
+                            "wallet_owner": false,
+                            "address": address,
+                            "txid": txid,
+                            "vout": vout,
+                            "outpoint": outpoint,
+                            "amount_sat": output.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                            "confirmed": confirmed,
+                            "confirmations": confirmations,
+                            "block_height": block_height,
+                            "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                            "updated_at_ms": now_ms()
+                        }));
+                    }
+                }
+            }
+
+            for utxo in utxos.as_array().cloned().unwrap_or_default() {
+                let txid = utxo
+                    .get("txid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let vout = utxo.get("vout").and_then(Value::as_u64).unwrap_or_default();
+                let outpoint = format!("{txid}:{vout}");
+                if seen.contains(&outpoint) {
+                    continue;
+                }
+                let status = utxo.get("status").unwrap_or(&Value::Null);
+                let confirmed = status
+                    .get("confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let block_height = status.get("block_height").and_then(Value::as_u64);
+                let confirmations = block_height
+                    .filter(|_| confirmed)
+                    .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                    .unwrap_or_default();
+                if deposits.len() < MAX_RETURNED_DEPOSITS {
+                    deposits.push(json!({
+                        "owner_type": "ident",
+                        "owner_label": "",
+                        "ident": ident,
+                        "wallet_owner": false,
+                        "address": address,
+                        "txid": txid,
+                        "vout": vout,
+                        "outpoint": outpoint,
+                        "amount_sat": utxo.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                        "confirmed": confirmed,
+                        "confirmations": confirmations,
+                        "block_height": block_height,
+                        "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                        "updated_at_ms": now_ms()
+                    }));
+                }
+            }
+
+            Ok(json!({
+                "deposits": deposits,
+                "persisted": 0,
+                "tip_height": tip_height,
+                "esplora": base,
+                "address": address,
+                "ident": ident
+            }))
+        })();
+        match attempt {
+            Ok(result) => return Ok(result),
+            Err(error) => errors.push(format!("{base}: {error:#}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    if std::time::Instant::now() >= deadline {
+        bail!("BTC address scan timed out after 5 seconds for {address}");
+    }
+    bail!(
+        "BTC address scan failed for {address}: {}",
+        if errors.is_empty() {
+            "no HTTP Esplora endpoint configured".to_string()
+        } else {
+            errors.join(" | ")
+        }
+    )
+}
+
+fn btc_scan_deposit_records_from_chain_data(
+    ident: &str,
+    address: &str,
+    source: &str,
+    tip_height: u64,
+    txs: Value,
+    utxos: Value,
+) -> Result<Value> {
+    const MAX_RETURNED_DEPOSITS: usize = 100;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut deposits = Vec::new();
+    for tx in txs.as_array().cloned().unwrap_or_default() {
+        let txid = tx
+            .get("txid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        for (fallback_vout, output) in tx
+            .get("vout")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            if output
+                .get("scriptpubkey_address")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                != address
+            {
+                continue;
+            }
+            let vout = output
+                .get("n")
+                .and_then(Value::as_u64)
+                .unwrap_or(fallback_vout as u64);
+            let outpoint = format!("{txid}:{vout}");
+            seen.insert(outpoint.clone());
+            let status = tx.get("status").unwrap_or(&Value::Null);
+            let confirmed = status
+                .get("confirmed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let block_height = status.get("block_height").and_then(Value::as_u64);
+            let confirmations = block_height
+                .filter(|_| confirmed)
+                .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+                .unwrap_or_default();
+            if deposits.len() < MAX_RETURNED_DEPOSITS {
+                deposits.push(json!({
+                    "owner_type": "ident",
+                    "owner_label": "",
+                    "ident": ident,
+                    "wallet_owner": false,
+                    "address": address,
+                    "txid": txid,
+                    "vout": vout,
+                    "outpoint": outpoint,
+                    "amount_sat": output.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                    "confirmed": confirmed,
+                    "confirmations": confirmations,
+                    "block_height": block_height,
+                    "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                    "updated_at_ms": now_ms()
+                }));
+            }
+        }
+    }
+
+    for utxo in utxos.as_array().cloned().unwrap_or_default() {
+        let txid = utxo
+            .get("txid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let vout = utxo.get("vout").and_then(Value::as_u64).unwrap_or_default();
+        let outpoint = format!("{txid}:{vout}");
+        if seen.contains(&outpoint) {
+            continue;
+        }
+        let status = utxo.get("status").unwrap_or(&Value::Null);
+        let confirmed = status
+            .get("confirmed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let block_height = status.get("block_height").and_then(Value::as_u64);
+        let confirmations = block_height
+            .filter(|_| confirmed)
+            .map(|height| tip_height.saturating_sub(height).saturating_add(1))
+            .unwrap_or_default();
+        if deposits.len() < MAX_RETURNED_DEPOSITS {
+            deposits.push(json!({
+                "owner_type": "ident",
+                "owner_label": "",
+                "ident": ident,
+                "wallet_owner": false,
+                "address": address,
+                "txid": txid,
+                "vout": vout,
+                "outpoint": outpoint,
+                "amount_sat": utxo.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                "confirmed": confirmed,
+                "confirmations": confirmations,
+                "block_height": block_height,
+                "status": if confirmed { "confirmed" } else { "unconfirmed" },
+                "updated_at_ms": now_ms()
+            }));
+        }
+    }
+
+    Ok(json!({
+        "deposits": deposits,
+        "persisted": 0,
+        "tip_height": tip_height,
+        "esplora": source,
+        "address": address,
+        "ident": ident
+    }))
+}
+
+fn electrum_address_txs_json_with_deadline(
+    address: &str,
+    source: &str,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    let network = Network::Bitcoin;
+    let address = Address::from_str(address)
+        .with_context(|| format!("invalid BTC address: {address}"))?
+        .require_network(network)
+        .with_context(|| format!("address is not for {network:?}"))?;
+    let script = address.script_pubkey();
+    let script_hash = electrum_script_hash_hex(&script);
+    let history = electrum_rpc_with_deadline(
+        source,
+        "blockchain.scripthash.get_history",
+        json!([script_hash]),
+        deadline,
+    )?;
+    let mut txs = Vec::new();
+    for item in history.as_array().cloned().unwrap_or_default() {
+        let txid = item
+            .get("tx_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if txid.is_empty() {
+            continue;
+        }
+        let raw = electrum_rpc_with_deadline(
+            source,
+            "blockchain.transaction.get",
+            json!([txid]),
+            deadline,
+        )?;
+        let raw_hex = raw
+            .as_str()
+            .with_context(|| format!("Electrum transaction.get returned non-string for {txid}"))?;
+        let raw_tx = hex_to_bytes(raw_hex)?;
+        let tx: Transaction = encode::deserialize(&raw_tx)
+            .with_context(|| format!("decode Electrum raw transaction {txid}"))?;
+        let block_height = item
+            .get("height")
+            .and_then(Value::as_i64)
+            .filter(|height| *height > 0)
+            .map(|height| height as u64);
+        let confirmed = block_height.is_some();
+        let vout = tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(n, output)| {
+                let output_address = if output.script_pubkey == script {
+                    address.to_string()
+                } else {
+                    Address::from_script(&output.script_pubkey, network)
+                        .map(|address| address.to_string())
+                        .unwrap_or_default()
+                };
+                json!({
+                    "n": n,
+                    "scriptpubkey": bytes_to_hex(output.script_pubkey.as_bytes()),
+                    "scriptpubkey_address": output_address,
+                    "value": output.value.to_sat()
+                })
+            })
+            .collect::<Vec<_>>();
+        txs.push(json!({
+            "txid": txid,
+            "vout": vout,
+            "status": {
+                "confirmed": confirmed,
+                "block_height": block_height
+            }
+        }));
+    }
+    Ok(Value::Array(txs))
+}
+
+fn electrum_address_utxos_json_with_deadline(
+    address: &str,
+    source: &str,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    let network = Network::Bitcoin;
+    let address = Address::from_str(address)
+        .with_context(|| format!("invalid BTC address: {address}"))?
+        .require_network(network)
+        .with_context(|| format!("address is not for {network:?}"))?;
+    let script_hash = electrum_script_hash_hex(&address.script_pubkey());
+    let unspent = electrum_rpc_with_deadline(
+        source,
+        "blockchain.scripthash.listunspent",
+        json!([script_hash]),
+        deadline,
+    )?;
+    let utxos = unspent
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|utxo| {
+            let txid = utxo.get("tx_hash")?.as_str()?.to_string();
+            let vout = utxo
+                .get("tx_pos")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let amount = utxo
+                .get("value")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let block_height = utxo
+                .get("height")
+                .and_then(Value::as_i64)
+                .filter(|height| *height > 0)
+                .map(|height| height as u64);
+            Some(json!({
+                "txid": txid,
+                "vout": vout,
+                "value": amount,
+                "status": {
+                    "confirmed": block_height.is_some(),
+                    "block_height": block_height
+                }
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(utxos))
+}
+
+fn electrum_rpc_with_deadline(
+    source: &str,
+    method: &str,
+    params: Value,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    let endpoint = electrum_endpoint(source)?;
+    let address = endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
+        .next()
+        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
+    let connect_timeout = remaining.min(Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS));
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
+        .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    stream
+        .set_read_timeout(Some(remaining))
+        .context("set Electrum read timeout")?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .context("set Electrum write timeout")?;
+    let request = json!({
+        "id": now_ms(),
+        "method": method,
+        "params": params
+    });
+    let request_line = format!("{}\n", serde_json::to_string(&request)?);
+    stream
+        .write_all(request_line.as_bytes())
+        .with_context(|| format!("write Electrum request {method} to {endpoint}"))?;
+    stream
+        .flush()
+        .with_context(|| format!("flush Electrum request {method} to {endpoint}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .with_context(|| format!("read Electrum response {method} from {endpoint}"))?;
+    ensure!(
+        !response_line.trim().is_empty(),
+        "empty Electrum response for {method} from {endpoint}"
+    );
+    let response: Value = serde_json::from_str(&response_line)
+        .with_context(|| format!("decode Electrum response for {method}: {response_line}"))?;
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        bail!("Electrum {method} failed: {error}");
+    }
+    response
+        .get("result")
+        .cloned()
+        .context("Electrum response missing result")
+}
+
+fn btc_timed_esplora_json(url: &str, deadline: std::time::Instant) -> Result<Value> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    let response = attohttpc::get(url)
+        .timeout(remaining)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    ensure!(response.is_success(), "GET {url} returned HTTP {}", response.status());
+    let body = response
+        .text()
+        .with_context(|| format!("decode text from {url}"))?;
+    serde_json::from_str(&body).with_context(|| format!("decode JSON from {url}"))
+}
+
+fn btc_timed_esplora_text(url: &str, deadline: std::time::Instant) -> Result<String> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    let response = attohttpc::get(url)
+        .timeout(remaining)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    ensure!(response.is_success(), "GET {url} returned HTTP {}", response.status());
+    response
+        .text()
+        .with_context(|| format!("decode text from {url}"))
 }
 
 fn btc_address_utxos_json(address: &str, esplora: &str) -> Result<Value> {
