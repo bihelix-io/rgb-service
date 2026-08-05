@@ -101,6 +101,7 @@ struct BtcAddressXpubConfig {
     xpub: Xpub,
     xpub_fingerprint: String,
     signing_fingerprint: Fingerprint,
+    signing_fingerprint_configured: bool,
     account_path: Vec<ChildNumber>,
     account_path_text: String,
     source_format: String,
@@ -186,6 +187,7 @@ fn btc_address_xpub_config() -> Result<Option<BtcAddressXpubConfig>> {
         })
         .or_else(|| local_string("btc-address-xpub-master-fingerprint"))
         .or_else(|| local_string("btc-addr-xpub-master-fingerprint"));
+    let signing_fingerprint_configured = signing_fingerprint_text.is_some();
     let signing_fingerprint = match signing_fingerprint_text {
         Some(text) => Fingerprint::from_str(text.trim()).with_context(|| {
             format!(
@@ -201,6 +203,7 @@ fn btc_address_xpub_config() -> Result<Option<BtcAddressXpubConfig>> {
         xpub,
         xpub_fingerprint: xpub.fingerprint().to_string(),
         signing_fingerprint,
+        signing_fingerprint_configured,
         account_path_text: xpub_derivation_path_text(&account_path),
         account_path,
         source_format,
@@ -632,6 +635,102 @@ fn btc_xpub_input_key_source(
     btc_xpub_key_source_for_index(config, address, index).map(Some)
 }
 
+fn validate_btc_consolidation_xpub_config(config: &BtcAddressXpubConfig) -> Result<()> {
+    ensure!(
+        matches!(
+            config.address_type.as_str(),
+            "p2wpkh" | "native_segwit" | "segwit"
+        ),
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=unsupported_deposit_script_type; address_type={}; expected=p2wpkh",
+        config.address_type
+    );
+    ensure!(
+        usize::from(config.xpub.depth) == config.account_path.len(),
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=xpub_account_path_depth_mismatch; xpub_depth={}; account_path={}; account_path_depth={}",
+        config.xpub.depth,
+        config.account_path_text,
+        config.account_path.len()
+    );
+    ensure!(
+        config.xpub.depth == 0 || config.signing_fingerprint_configured,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=missing_master_fingerprint; xpub_depth={}; account_path={}",
+        config.xpub.depth,
+        config.account_path_text
+    );
+    Ok(())
+}
+
+fn validate_btc_consolidation_psbt_input(
+    psbt: &Psbt,
+    input_index: usize,
+    deposit_address: &str,
+    expected_outpoint: &OutPoint,
+    expected_script: &ScriptBuf,
+    public_key: &PublicKey,
+    fingerprint: &Fingerprint,
+    derivation_path: &DerivationPath,
+    network: Network,
+) -> Result<()> {
+    let tx_input = psbt.unsigned_tx.input.get(input_index).with_context(|| {
+        format!(
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=missing_unsigned_tx_input"
+        )
+    })?;
+    ensure!(
+        tx_input.previous_output == *expected_outpoint,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=input_order_mismatch; expected_outpoint={expected_outpoint}; actual_outpoint={}",
+        tx_input.previous_output
+    );
+
+    let psbt_input = psbt.inputs.get(input_index).with_context(|| {
+        format!(
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=missing_psbt_input"
+        )
+    })?;
+    let witness_utxo = psbt_input.witness_utxo.as_ref().with_context(|| {
+        format!(
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=missing_witness_utxo"
+        )
+    })?;
+    ensure!(
+        witness_utxo.script_pubkey == *expected_script,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=witness_utxo_script_mismatch; expected_script={}; actual_script={}",
+        bytes_to_hex(expected_script.as_bytes()),
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes())
+    );
+
+    let derived_address = Address::p2wpkh(&CompressedPublicKey(*public_key), network);
+    let derived_script = derived_address.script_pubkey();
+    ensure!(
+        derived_script == witness_utxo.script_pubkey,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=pubkey_script_mismatch; expected_script={}; actual_script={}",
+        bytes_to_hex(derived_script.as_bytes()),
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes())
+    );
+    ensure!(
+        derived_address.to_string() == deposit_address,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=pubkey_address_mismatch; derived_address={derived_address}"
+    );
+    ensure!(
+        psbt_input.bip32_derivation.len() == 1,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_bip32_derivation_count; expected=1; actual={}",
+        psbt_input.bip32_derivation.len()
+    );
+    let (actual_fingerprint, actual_path) = psbt_input
+        .bip32_derivation
+        .get(public_key)
+        .with_context(|| {
+            format!(
+                "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=missing_bip32_derivation"
+            )
+        })?;
+    ensure!(
+        actual_fingerprint == fingerprint && actual_path == derivation_path,
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=bip32_origin_mismatch; expected_fingerprint={fingerprint}; actual_fingerprint={actual_fingerprint}; expected_path={derivation_path}; actual_path={actual_path}"
+    );
+    Ok(())
+}
+
 fn find_u64_field(value: &Value, names: &[&str]) -> Option<u64> {
     names.iter().find_map(|name| {
         value.get(*name).and_then(|value| {
@@ -729,6 +828,13 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
         &[],
         Type::Any,
         btc_address_pool_status as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "derive_xpub_address",
+        &[Type::U64],
+        Type::Any,
+        btc_derive_xpub_address as *const u8,
     )?;
     jit.add_native_module_ptr(
         "btc",
@@ -1021,6 +1127,13 @@ fn register_ln_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "ln_rgb",
+        "sign_message",
+        &[Type::Str],
+        Type::Any,
+        ln_rgb_sign_message as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "ln_rgb",
         "get_addr",
         &[],
         Type::Any,
@@ -1221,6 +1334,25 @@ extern "C" fn btc_get_wallet_address(input: *const Dynamic) -> *const Dynamic {
     })
 }
 
+extern "C" fn btc_derive_xpub_address(index: u64) -> *const Dynamic {
+    native_result(|| {
+        let index = u32::try_from(index).context("BTC xpub derivation index exceeds u32")?;
+        let config = btc_address_xpub_config()?
+            .context("BTC address xpub is not configured; cannot derive address")?;
+        let (address, derivation_path) = derive_btc_address_from_xpub(&config, index)?;
+        Ok(ok(json!({
+            "module": "btc",
+            "ok": true,
+            "operation": "derive_xpub_address",
+            "address": address,
+            "derivation_index": index,
+            "derivation_path": derivation_path,
+            "xpub_fingerprint": config.xpub_fingerprint,
+            "address_type": config.address_type
+        })))
+    })
+}
+
 extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |ident| {
         let ident = ident.to_string();
@@ -1235,7 +1367,7 @@ extern "C" fn btc_get_deposit_address(input: *const Dynamic) -> *const Dynamic {
             })));
         }
         ensure!(!ident.trim().is_empty(), "ident must not be empty");
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         if let Some(address) = store.get_ident_btc_address(&ident)? {
             return Ok(ok(json!({
                 "module": "btc",
@@ -1288,7 +1420,7 @@ extern "C" fn btc_lookup_address_ident(input: *const Dynamic) -> *const Dynamic 
     native_string_dynamic_result(input, |address| {
         let address = address.to_string();
         ensure!(!address.trim().is_empty(), "address must not be empty");
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         Ok(ok(json!({
             "module": "btc",
             "address": address,
@@ -1342,14 +1474,18 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
     const MAX_RETURNED_DEPOSITS: usize = 100;
 
     native_string_dynamic_result(input, |ident_filter| {
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         store.put_wallet_btc_address(&default_account_id()?)?;
         let (esplora, tip_height) = btc_tip_height_with_fallback();
         let mut scan_esplora = esplora.clone();
         let mut deposits = Vec::new();
         let mut persisted = 0usize;
         let mut address_mappings = Vec::new();
-        if ident_filter.trim().is_empty() {
+        let (requested_ident, explicit_address) = ident_filter
+            .split_once('\t')
+            .map(|(ident, address)| (ident.trim(), address.trim()))
+            .unwrap_or((ident_filter.trim(), ""));
+        if requested_ident.is_empty() && explicit_address.is_empty() {
             let address = store
                 .get_wallet_btc_address()?
                 .unwrap_or(default_account_id()?);
@@ -1359,15 +1495,30 @@ extern "C" fn btc_scan_deposits(input: *const Dynamic) -> *const Dynamic {
                 String::new(),
                 address,
             ));
-        } else if let Some(address) = store.get_ident_btc_address(ident_filter)? {
+        } else if !explicit_address.is_empty() {
+            ensure!(!requested_ident.is_empty(), "BTC ident must not be empty");
+            let network = parse_ln_network(&ln_rgb_network_name())?;
+            let address = Address::from_str(explicit_address)
+                .with_context(|| format!("invalid BTC deposit address: {explicit_address}"))?
+                .require_network(network)
+                .with_context(|| {
+                    format!("deposit address is not for {network:?}: {explicit_address}")
+                })?;
             address_mappings.push((
                 "ident".to_string(),
                 String::new(),
-                ident_filter.to_string(),
+                requested_ident.to_string(),
+                address.to_string(),
+            ));
+        } else if let Some(address) = store.get_ident_btc_address(requested_ident)? {
+            address_mappings.push((
+                "ident".to_string(),
+                String::new(),
+                requested_ident.to_string(),
                 address,
             ));
         } else {
-            bail!("unknown BTC ident `{ident_filter}`; call btc::get_deposit_address first");
+            bail!("unknown BTC ident `{requested_ident}`; call btc::get_deposit_address first");
         }
         for (owner_type, owner_label, ident, address) in address_mappings {
             let mut seen = std::collections::BTreeSet::new();
@@ -1521,7 +1672,7 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
     native_string_dynamic_result(input, |ident_filter| {
         let ident_filter = ident_filter.to_string();
         ensure!(!ident_filter.trim().is_empty(), "ident must not be empty");
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         store.put_wallet_btc_address(&default_account_id()?)?;
         let (esplora, tip_height) = btc_tip_height_with_fallback();
         let mut scan_esplora = esplora.clone();
@@ -1678,7 +1829,7 @@ extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
 
 extern "C" fn btc_address_pool_status() -> *const Dynamic {
     native_result(|| {
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
         let xpub_config = btc_address_xpub_config()?;
@@ -1716,7 +1867,7 @@ extern "C" fn btc_address_pool_status() -> *const Dynamic {
 extern "C" fn btc_refill_address_pool(count: u64) -> *const Dynamic {
     native_result(|| {
         let count = count as usize;
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let mut source = "none".to_string();
         let added = if count > 0 {
             source = "xpub".to_string();
@@ -1761,7 +1912,7 @@ extern "C" fn btc_refill_address_pool(count: u64) -> *const Dynamic {
 
 extern "C" fn btc_repair_address_pool_metadata() -> *const Dynamic {
     native_result(|| {
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let config = btc_address_xpub_config()?
             .context("BTC address xpub is not configured; cannot repair address pool metadata")?;
         let available = store.list_btc_address_pool_records()?;
@@ -2935,7 +3086,7 @@ extern "C" fn btc_prepare_sweep_with_inputs(
             .with_context(|| format!("sender address is not for {network:?}"))?;
         let recipient_script = recipient_address.script_pubkey();
         let sender_script = sender_address_checked.script_pubkey();
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let xpub_config = btc_address_xpub_config()?;
         let key_source = match xpub_config.as_ref() {
             Some(config) => btc_xpub_input_key_source(&store, config, &sender_address)?,
@@ -3107,12 +3258,18 @@ extern "C" fn btc_prepare_consolidation_psbt(
             .or_else(|| input_doc.get("utxos").and_then(Value::as_array).cloned())
             .context("inputs must be an array or object with inputs/utxos array")?;
 
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
-        let xpub_config = btc_address_xpub_config()?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
+        let xpub_config = btc_address_xpub_config()?.context(
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=deposit_xpub_not_configured",
+        )?;
+        validate_btc_consolidation_xpub_config(&xpub_config)?;
         let mut selected = Vec::new();
+        let mut xpub_rejected_inputs = Vec::new();
+        let mut chain_rejected_inputs = Vec::new();
+        let mut live_utxos_by_address = BTreeMap::<String, BTreeMap<String, u64>>::new();
         let mut selected_sats = 0u64;
         let mut seen = std::collections::BTreeSet::new();
-        for item in input_items {
+        for (input_index, item) in input_items.into_iter().enumerate() {
             let address = item
                 .get("address")
                 .or_else(|| item.get("deposit_address"))
@@ -3165,20 +3322,94 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 confirmed,
                 "consolidation input must be confirmed: {outpoint}"
             );
-            let key_source = match xpub_config.as_ref() {
-                Some(config) => btc_xpub_input_key_source(&store, config, &address)?,
-                None => None,
+            if !live_utxos_by_address.contains_key(&address) {
+                let chain_source = btc_esplora_url();
+                let live_utxos = btc_address_utxos_json(&address, &chain_source)
+                    .with_context(|| {
+                        format!(
+                            "fetch live consolidation UTXOs for input_index={input_index}; deposit_address={address}"
+                        )
+                    })?
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|utxo| {
+                        utxo.get("status")
+                            .and_then(|status| status.get("confirmed"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|utxo| {
+                        let txid = utxo.get("txid")?.as_str()?;
+                        let vout = utxo.get("vout")?.as_u64()?;
+                        let value = utxo.get("value")?.as_u64()?;
+                        Some((format!("{txid}:{vout}"), value))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                live_utxos_by_address.insert(address.clone(), live_utxos);
+            }
+            let live_value = live_utxos_by_address
+                .get(&address)
+                .and_then(|utxos| utxos.get(&outpoint.to_string()))
+                .copied();
+            let Some(live_value) = live_value else {
+                chain_rejected_inputs.push(json!({
+                    "input_index": input_index,
+                    "address": address,
+                    "outpoint": outpoint.to_string(),
+                    "value": value,
+                    "reason": "spent_or_missing_utxo"
+                }));
+                continue;
             };
+            if live_value != value {
+                chain_rejected_inputs.push(json!({
+                    "input_index": input_index,
+                    "address": address,
+                    "outpoint": outpoint.to_string(),
+                    "value": value,
+                    "live_value": live_value,
+                    "reason": "utxo_value_mismatch"
+                }));
+                continue;
+            }
+            let source_script = source_address.script_pubkey();
+            let Some(key_source) =
+                btc_xpub_input_key_source(&store, &xpub_config, &address)?
+            else {
+                xpub_rejected_inputs.push(json!({
+                    "input_index": input_index,
+                    "address": address,
+                    "outpoint": outpoint.to_string(),
+                    "value": value,
+                    "reason": "address_not_in_configured_deposit_xpub"
+                }));
+                continue;
+            };
+            let public_key_script =
+                Address::p2wpkh(&CompressedPublicKey(key_source.0), network).script_pubkey();
+            ensure!(
+                public_key_script == source_script,
+                "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={address}; pubkey={}; reason=pubkey_script_mismatch; expected_script={}; actual_script={}",
+                key_source.0,
+                bytes_to_hex(public_key_script.as_bytes()),
+                bytes_to_hex(source_script.as_bytes())
+            );
             selected_sats = selected_sats.saturating_add(value);
             selected.push((
                 address,
-                source_address.script_pubkey(),
+                source_script,
                 outpoint,
                 value,
                 key_source,
             ));
         }
-        ensure!(!selected.is_empty(), "no consolidation inputs provided");
+        ensure!(
+            !selected.is_empty(),
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=no_signable_inputs; rejected_input_count={}",
+            xpub_rejected_inputs.len()
+        );
 
         let fee_rate_sat_vb = if fee_rate_sat_vb > 0 {
             fee_rate_sat_vb
@@ -3223,12 +3454,27 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 value: Amount::from_sat(*value),
                 script_pubkey: script_pubkey.clone(),
             });
-            if let Some((public_key, fingerprint, derivation_path)) = key_source {
-                let mut derivations = BTreeMap::new();
-                derivations.insert(*public_key, (*fingerprint, derivation_path.clone()));
-                psbt.inputs[index].bip32_derivation = derivations;
-                derivation_count += 1;
-            }
+            let (public_key, fingerprint, derivation_path) = key_source;
+            let mut derivations = BTreeMap::new();
+            derivations.insert(*public_key, (*fingerprint, derivation_path.clone()));
+            psbt.inputs[index].bip32_derivation = derivations;
+            derivation_count += 1;
+        }
+        for (index, (address, script_pubkey, outpoint, _, key_source))
+            in selected.iter().enumerate()
+        {
+            let (public_key, fingerprint, derivation_path) = key_source;
+            validate_btc_consolidation_psbt_input(
+                &psbt,
+                index,
+                address,
+                outpoint,
+                script_pubkey,
+                public_key,
+                fingerprint,
+                derivation_path,
+                network,
+            )?;
         }
         let unsigned_tx_hex = encode::serialize_hex(&psbt.unsigned_tx);
         let unsigned_psbt = psbt.to_string();
@@ -3242,13 +3488,20 @@ extern "C" fn btc_prepare_consolidation_psbt(
             "fee_sats": fee_sats,
             "estimated_vbytes": estimated_vbytes,
             "input_count": selected.len(),
+            "xpub_rejected_input_count": xpub_rejected_inputs.len(),
+            "xpub_rejected_inputs": xpub_rejected_inputs,
+            "chain_rejected_input_count": chain_rejected_inputs.len(),
+            "chain_rejected_inputs": chain_rejected_inputs,
             "inputs": selected
                 .iter()
                 .map(|(address, _, outpoint, value, key_source)| json!({
                     "address": address,
                     "outpoint": outpoint.to_string(),
                     "value": value,
-                    "has_bip32_derivation": key_source.is_some()
+                    "has_bip32_derivation": true,
+                    "public_key": key_source.0.to_string(),
+                    "master_fingerprint": key_source.1.to_string(),
+                    "derivation_path": key_source.2.to_string()
                 }))
                 .collect::<Vec<_>>(),
             "outputs": [{
@@ -4579,7 +4832,7 @@ extern "C" fn ln_rgb_start() -> *const Dynamic {
         let path = find_string_field(&requested, &["path"])
             .map(PathBuf::from)
             .unwrap_or_else(|| ln_node_path(&lightning));
-        let mut stored = read_json_file(&path)
+        let stored = read_json_file(&path)
             .with_context(|| format!("read LN node state {}", path.display()))?;
         let address = find_string_field(&stored, &["address", "btc_address"]).unwrap_or_default();
         ensure!(
@@ -4588,9 +4841,8 @@ extern "C" fn ln_rgb_start() -> *const Dynamic {
         );
         let low_water_sats = value_u64(&stored, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
         let config = normalized_ln_config(ln_config_from_value(&stored), low_water_sats);
-        let mnemonic = ensure_ln_entropy_mnemonic(&mut stored)?;
-        write_private_json_file(&path, &stored)
-            .with_context(|| format!("write LN node state {}", path.display()))?;
+        log_ln_initialization_paths("ln_rgb::start", &path, &stored, &config);
+        let mnemonic = required_ln_entropy_mnemonic(&stored)?;
         let interval_ms = optional_u64(&lightning, "interval_ms")
             .or_else(|| value_u64(&stored, "interval_ms"))
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
@@ -4745,6 +4997,26 @@ extern "C" fn ln_rgb_get_node_id() -> *const Dynamic {
     })
 }
 
+extern "C" fn ln_rgb_sign_message(input: *const Dynamic) -> *const Dynamic {
+    native_string_dynamic_result(input, |message| {
+        ensure!(!message.is_empty(), "message must not be empty");
+        ensure!(
+            message.len() <= 65_536,
+            "message must not exceed 65536 bytes"
+        );
+        let node = running_ln_node()?;
+        let signature = node.sign_node_message(message.as_bytes())?;
+        Ok(ok(json!({
+            "module": "ln_rgb",
+            "node_id": node.node_id().to_string(),
+            "message": message,
+            "signature": signature,
+            "scheme": "ldk_lightning_signed_message",
+            "prefix": "Lightning Signed Message:"
+        })))
+    })
+}
+
 extern "C" fn ln_rgb_get_addr() -> *const Dynamic {
     native_result(|| {
         Ok(ok(json!({
@@ -4853,7 +5125,7 @@ extern "C" fn ln_rgb_prepare_external_rgb_l1_sweep(
         let source_outpoint = OutPoint::from_str(source_outpoint_text).with_context(|| {
             format!("invalid external RGB source outpoint: {source_outpoint_text}")
         })?;
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let xpub_config = btc_address_xpub_config()?
             .context("BTC address xpub is required to describe the external RGB source input")?;
         let (public_key, fingerprint, derivation_path) =
@@ -5435,7 +5707,7 @@ extern "C" fn ln_rgb_spawn_scanner(interval_ms: u64) -> *const Dynamic {
             .then_some(interval_ms)
             .unwrap_or_else(|| LN_SCAN_DEFAULT_INTERVAL.as_millis() as u64);
         let interval = Duration::from_millis(interval_ms.max(1000));
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
         let address_pool = json!({
@@ -5493,49 +5765,27 @@ extern "C" fn ln_rgb_node_address(input: *const Dynamic) -> *const Dynamic {
         let low_water_sats = optional_u64(input, "low_water_sats").unwrap_or(LN_LOW_WATER_SATS);
         let config = normalized_ln_config(dynamic_to_json(input), low_water_sats);
         if path.exists() {
-            let mut stored = read_json_file(&path)
+            let stored = read_json_file(&path)
                 .with_context(|| format!("read LN node state {}", path.display()))?;
-            update_ln_node_config(&mut stored, config, low_water_sats);
-            let mnemonic = ensure_ln_entropy_mnemonic(&mut stored)?;
-            let config = stored
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| normalized_ln_config(Value::Object(Map::new()), low_water_sats));
-            let network_name = config
-                .get("network")
-                .and_then(Value::as_str)
-                .unwrap_or("bitcoin");
-            let network = parse_ln_network(network_name)?;
-            let data_dir = PathBuf::from(
-                config
-                    .get("data_dir")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(LN_DATA_DIR_DEFAULT),
-            );
+            required_ln_entropy_mnemonic(&stored)?;
+            let config = normalized_ln_config(ln_config_from_value(&stored), low_water_sats);
+            log_ln_initialization_paths("ln_rgb::node_address", &path, &stored, &config);
             let address_source = stored
                 .get("address_source")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let address = find_string_field(&stored, &["address", "btc_address"]);
-            if address_source != "ln_hot_wallet" || address.is_none() {
-                let mnemonic = BdkMnemonic::parse_in_normalized(BdkLanguage::English, &mnemonic)
-                    .context("invalid LN hot wallet mnemonic")?;
-                let mut wallet = LocalWallet::open_with_mnemonic(&data_dir, network, &mnemonic)?;
-                let address = wallet.wallet.reveal_next_address(KeychainKind::External);
-                wallet.persist()?;
-                if let Value::Object(object) = &mut stored {
-                    object.insert("address".to_string(), json!(address.address.to_string()));
-                    object.remove("btc_address");
-                    object.remove("signer_response");
-                    object.remove("signer_node");
-                    object.insert("address_source".to_string(), json!("ln_hot_wallet"));
-                    object.insert("wallet_can_sign".to_string(), json!(true));
-                    object.insert("updated_at_ms".to_string(), json!(now_ms()));
-                }
-            }
-            write_private_json_file(&path, &stored)
-                .with_context(|| format!("write LN node state {}", path.display()))?;
+            ensure!(
+                address_source == "ln_hot_wallet",
+                "LN node state {} has invalid address_source `{}`; existing state is read-only",
+                path.display(),
+                address_source
+            );
+            ensure!(
+                find_string_field(&stored, &["address", "btc_address"])
+                    .is_some_and(|address| !address.trim().is_empty()),
+                "LN node state {} has no hot wallet address; existing state is read-only",
+                path.display()
+            );
             return Ok(ok(redacted_ln_node_response(stored, &path, false)));
         }
 
@@ -5552,6 +5802,7 @@ extern "C" fn ln_rgb_node_address(input: *const Dynamic) -> *const Dynamic {
             .get("config")
             .cloned()
             .unwrap_or_else(|| normalized_ln_config(Value::Object(Map::new()), low_water_sats));
+        log_ln_initialization_paths("ln_rgb::node_address", &path, &stored, &config);
         let network_name = config
             .get("network")
             .and_then(Value::as_str)
@@ -5720,6 +5971,12 @@ fn ensure_ln_entropy_mnemonic(stored: &mut Value) -> Result<String> {
     Ok(mnemonic)
 }
 
+fn required_ln_entropy_mnemonic(stored: &Value) -> Result<String> {
+    find_string_field(stored, &["entropy_mnemonic", "mnemonic"])
+        .filter(|value| value != "<persisted>" && !value.trim().is_empty())
+        .context("LN node state has no persisted entropy mnemonic; existing state is read-only")
+}
+
 fn value_string_list(value: &Value, key: &str) -> Result<Vec<String>> {
     match value.get(key) {
         Some(Value::Array(items)) => items
@@ -5738,7 +5995,7 @@ fn value_string_list(value: &Value, key: &str) -> Result<Vec<String>> {
 
 extern "C" fn ln_rgb_scanner_status() -> *const Dynamic {
     native_result(|| {
-        let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+        let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
         let available = store.list_btc_address_pool_records()?;
         let used = store.list_used_btc_address_pool_records()?;
         Ok(ok(json!({
@@ -5764,7 +6021,7 @@ extern "C" fn ln_rgb_scanner_status() -> *const Dynamic {
 fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) {
     while LN_SCANNER_STARTED.load(Ordering::SeqCst) {
         let _ = (|| -> Result<()> {
-            let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+            let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
             store.put_wallet_btc_address(&default_account_id()?)?;
             let esplora = btc_esplora_url();
             let mut addresses = Vec::new();
@@ -5827,7 +6084,7 @@ fn ln_scanner_loop(_btc_addr: String, _rgb_service: String, interval: Duration) 
 fn ln_inbound_loop(_node: Value, interval: Duration) {
     while LN_STARTED.load(Ordering::SeqCst) {
         let _ = (|| -> Result<()> {
-            let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+            let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
             let available = store.list_btc_address_pool_records()?.len();
             if available < BTC_ADDRESS_POOL_LOW_WATER {
                 match refill_btc_address_pool_to_target(&store, "low_water_refill") {
@@ -5945,7 +6202,7 @@ fn btc_account_for_ident(ident: &str) -> Result<Value> {
             "signer_response": Value::Null
         }));
     }
-    let store = LocalNodeStore::open(&PathBuf::from(".zust-console"))?;
+    let store = LocalNodeStore::open(&btc_wallet_data_dir())?;
     let address = store.get_ident_btc_address(ident)?.with_context(|| {
         format!("unknown BTC ident `{ident}`; call btc::get_deposit_address first")
     })?;
@@ -6777,7 +7034,11 @@ fn ln_rgb_storage_dir() -> PathBuf {
 }
 
 fn btc_wallet_data_dir() -> PathBuf {
-    local_dynamic("btc_wallet/node")
+    std::env::var("SUPER_BAZAAR_WALLET_DATA_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| local_dynamic("btc_wallet/node")
         .map(|value| dynamic_to_json(&value))
         .and_then(|value| {
             value
@@ -6785,8 +7046,13 @@ fn btc_wallet_data_dir() -> PathBuf {
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(PathBuf::from)
+        }))
+        .unwrap_or_else(|| {
+            let network = std::env::var("SUPER_BAZAAR_BTC_NETWORK")
+                .or_else(|_| std::env::var("SUPER_BAZAAR_NETWORK"))
+                .unwrap_or_else(|_| "mainnet".to_string());
+            PathBuf::from("./wallet-data").join(network).join("market")
         })
-        .unwrap_or_else(|| PathBuf::from(".zust-console"))
 }
 
 fn ln_rgb_network_name() -> String {
@@ -6828,6 +7094,65 @@ fn ln_node_path(input: &Dynamic) -> PathBuf {
         .or_else(|| local_string("ln-node-file"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(LN_NODE_DEFAULT_PATH))
+}
+
+fn absolute_runtime_path(path: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.clone())
+        }
+    })
+}
+
+fn log_ln_initialization_paths(
+    stage: &str,
+    config_path: &PathBuf,
+    stored: &Value,
+    config: &Value,
+) {
+    let data_dir = PathBuf::from(
+        config
+            .get("data_dir")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(LN_DATA_DIR_DEFAULT),
+    );
+    let ldk_data_dir = PathBuf::from(
+        config
+            .get("ldk_data_dir")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(LN_LDK_DATA_DIR_DEFAULT),
+    );
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let config_path = absolute_runtime_path(config_path);
+    let data_dir = absolute_runtime_path(&data_dir);
+    let ldk_data_dir = absolute_runtime_path(&ldk_data_dir);
+    let btc_owner_address = local_string("btc-addr").unwrap_or_default();
+    let ln_hot_wallet_address = find_string_field(stored, &["address", "btc_address"])
+        .unwrap_or_default();
+    let address_source = stored
+        .get("address_source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    eprintln!(
+        "{stage} initialization: cwd={} config_file={} data_dir={} bdk_wallet={} local_store={} ldk_data_dir={} ldk_store={} btc_owner_address={} ln_hot_wallet_address={} address_source={}",
+        cwd.display(),
+        config_path.display(),
+        data_dir.display(),
+        data_dir.join("bdk_wallet").display(),
+        data_dir.join("local-store").display(),
+        ldk_data_dir.display(),
+        ldk_data_dir.join("ln-rgb").join("ldk-store").display(),
+        btc_owner_address,
+        ln_hot_wallet_address,
+        address_source,
+    );
 }
 
 fn normalized_ln_config(input: Value, low_water_sats: u64) -> Value {
@@ -6898,14 +7223,6 @@ fn ln_config_from_value(value: &Value) -> Value {
                 .cloned()
         })
         .unwrap_or_else(|| Value::Object(Map::new()))
-}
-
-fn update_ln_node_config(stored: &mut Value, config: Value, low_water_sats: u64) {
-    let Value::Object(object) = stored else {
-        return;
-    };
-    object.insert("low_water_sats".to_string(), json!(low_water_sats));
-    object.insert("config".to_string(), config);
 }
 
 fn read_json_file(path: &PathBuf) -> Result<Value> {

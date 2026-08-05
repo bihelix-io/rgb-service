@@ -1605,6 +1605,7 @@ impl AuthVerifier for ConfiguredAuthVerifier {
 
 struct LocalDaemonService {
     config: ServiceConfig,
+    legacy_reveal_address_count: u32,
     daemon_rna: DaemonRnaConfig,
     db: SingleWriterTxDatabase,
     logger: DaemonLogger,
@@ -1889,6 +1890,7 @@ impl LocalDaemonService {
         ));
         let service = Self {
             config: config.service,
+            legacy_reveal_address_count: config.legacy.reveal_address_count,
             daemon_rna: config.daemon_rna,
             db,
             logger,
@@ -3689,38 +3691,55 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         payload: UtxoAssetsRequest,
     ) -> rgb_service_api::Result<UtxoAssetsResponse> {
-        let stock_dir = self.account_stock_dir(&payload.account_id);
         let outpoint = OutPoint::from_str(&payload.outpoint)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
-        let discovered = list_rgb20_assets_for_utxos(
-            &stock_dir,
-            [Rgb20TrackedUtxo {
-                outpoint,
-                address: payload.address.clone(),
-                confirmed: payload.confirmed,
-            }],
-        )
-        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        let account_ids = match payload.address.as_deref() {
+            Some(address) if address == payload.account_id => {
+                legacy::legacy_account_ids_for_address(
+                    self,
+                    self.legacy_reveal_address_count,
+                    address,
+                )?
+            }
+            _ => vec![payload.account_id.clone()],
+        };
         let mut seen_assets = BTreeSet::new();
         let mut assets = Vec::new();
         let mut amounts = BTreeMap::<String, u64>::new();
-        for allocation in discovered {
-            let asset_id = allocation.contract_id.to_string();
-            if seen_assets.insert(asset_id.clone()) {
-                assets.push(
-                    self.catalog_entry_for_contract(
-                        asset_id.clone(),
-                        allocation.ticker.clone(),
-                        allocation.name.clone(),
-                        allocation.precision,
-                    )?
-                    .into_asset_info(),
-                );
+        for account_id in account_ids {
+            let stock_dir = self.account_stock_dir(&account_id);
+            let discovered = list_rgb20_assets_for_utxos(
+                &stock_dir,
+                [Rgb20TrackedUtxo {
+                    outpoint,
+                    address: payload.address.clone(),
+                    confirmed: payload.confirmed,
+                }],
+            )
+            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+            let mut account_amounts = BTreeMap::<String, u64>::new();
+            for allocation in discovered {
+                let asset_id = allocation.contract_id.to_string();
+                if seen_assets.insert(asset_id.clone()) {
+                    assets.push(
+                        self.catalog_entry_for_contract(
+                            asset_id.clone(),
+                            allocation.ticker.clone(),
+                            allocation.name.clone(),
+                            allocation.precision,
+                        )?
+                        .into_asset_info(),
+                    );
+                }
+                let amount = account_amounts.entry(asset_id).or_default();
+                *amount = amount.checked_add(allocation.amount_raw).ok_or_else(|| {
+                    RgbServiceError::Backend("RGB allocation amount overflow".to_string())
+                })?;
             }
-            let amount = amounts.entry(asset_id).or_default();
-            *amount = amount.checked_add(allocation.amount_raw).ok_or_else(|| {
-                RgbServiceError::Backend("RGB allocation amount overflow".to_string())
-            })?;
+            for (asset_id, amount) in account_amounts {
+                let existing = amounts.entry(asset_id).or_default();
+                *existing = (*existing).max(amount);
+            }
         }
         let allocation_outpoint = payload.outpoint.clone();
         let allocation_status = if payload.confirmed {

@@ -1017,6 +1017,23 @@ impl LnRgbBtcLnBackend {
         &self.config.account_id
     }
 
+    pub fn sign_node_message(&self, message: &[u8]) -> Result<String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow!("LN RGB runtime lock poisoned"))?;
+        let keys_manager = Arc::clone(
+            &runtime
+                .as_ref()
+                .context("LN RGB node is not running")?
+                ._keys_manager,
+        );
+        drop(runtime);
+        keys_manager
+            .sign_message(message)
+            .map_err(|_| anyhow!("LDK node signer could not sign message"))
+    }
+
     pub fn list_rgb_assets(&self) -> Result<ListAssetsResponse> {
         let client = RgbServiceClient::new(
             self.config.rgb_service_url.clone(),

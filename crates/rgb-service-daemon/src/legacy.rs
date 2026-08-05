@@ -502,6 +502,19 @@ fn legacy_desc_account_ids(
     state: &LegacyState,
     desc: &str,
 ) -> Result<Vec<String>, LegacyHttpError> {
+    legacy_desc_account_ids_for_service(
+        &state.service,
+        state.config.reveal_address_count,
+        desc,
+    )
+    .map_err(Into::into)
+}
+
+fn legacy_desc_account_ids_for_service(
+    service: &LocalDaemonService,
+    reveal_address_count: u32,
+    desc: &str,
+) -> rgb_service_api::Result<Vec<String>> {
     let mut account_ids = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
     let desc_account_id = legacy_account_id(desc);
@@ -511,10 +524,10 @@ fn legacy_desc_account_ids(
     let descriptor = ExtendedDescriptor::from_str(desc)
         .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
     let wallet = Wallet::create_single(descriptor)
-        .network(state.service.network()?)
+        .network(service.network()?)
         .create_wallet_no_persist()
         .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
-    for index in 0..=state.config.reveal_address_count.max(1) {
+    for index in 0..=reveal_address_count.max(1) {
         let address = wallet
             .peek_address(KeychainKind::External, index)
             .address
@@ -523,19 +536,30 @@ fn legacy_desc_account_ids(
         // a legacy wallet registers its descriptor. Keep that address-owned
         // stock reachable after `/account/create` installs the address -> desc
         // mapping; otherwise registration makes an existing balance disappear.
-        if state.service.account_stock_has_data(&address) && seen.insert(address.clone()) {
+        if service.account_stock_has_data(&address) && seen.insert(address.clone()) {
             account_ids.push(address.clone());
         }
-        if let Some(account_id) = state
-            .service
-            .resolve_legacy_account_id_for_address(&address)?
-        {
+        if let Some(account_id) = service.resolve_legacy_account_id_for_address(&address)? {
             if seen.insert(account_id.clone()) {
                 account_ids.push(account_id);
             }
         }
     }
     Ok(account_ids)
+}
+
+pub(crate) fn legacy_account_ids_for_address(
+    service: &LocalDaemonService,
+    reveal_address_count: u32,
+    address: &str,
+) -> rgb_service_api::Result<Vec<String>> {
+    if let Some(account_id) = service.resolve_legacy_account_id_for_address(address)? {
+        if let Some(desc) = service.resolve_legacy_desc_for_account_id(&account_id)? {
+            return legacy_desc_account_ids_for_service(service, reveal_address_count, &desc);
+        }
+        return Ok(vec![account_id]);
+    }
+    Ok(vec![address.to_string()])
 }
 
 fn legacy_query_account_ids(
@@ -546,19 +570,12 @@ fn legacy_query_account_ids(
         return legacy_desc_account_ids(state, desc);
     }
     if let Some(address) = query.address.as_deref() {
-        if let Some(account_id) = state
-            .service
-            .resolve_legacy_account_id_for_address(address)?
-        {
-            if let Some(desc) = state
-                .service
-                .resolve_legacy_desc_for_account_id(&account_id)?
-            {
-                return legacy_desc_account_ids(state, &desc);
-            }
-            return Ok(vec![account_id]);
-        }
-        return Ok(vec![address.to_string()]);
+        return legacy_account_ids_for_address(
+            &state.service,
+            state.config.reveal_address_count,
+            address,
+        )
+        .map_err(Into::into);
     }
     Err(RgbServiceError::InvalidRequest("desc or address is required".to_string()).into())
 }
