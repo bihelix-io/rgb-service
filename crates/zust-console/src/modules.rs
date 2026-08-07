@@ -639,9 +639,9 @@ fn validate_btc_consolidation_xpub_config(config: &BtcAddressXpubConfig) -> Resu
     ensure!(
         matches!(
             config.address_type.as_str(),
-            "p2wpkh" | "native_segwit" | "segwit"
+            "p2wpkh" | "native_segwit" | "segwit" | "taproot" | "p2tr"
         ),
-        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=unsupported_deposit_script_type; address_type={}; expected=p2wpkh",
+        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=unsupported_deposit_script_type; address_type={}; expected=p2wpkh_or_p2tr",
         config.address_type
     );
     ensure!(
@@ -660,6 +660,29 @@ fn validate_btc_consolidation_xpub_config(config: &BtcAddressXpubConfig) -> Resu
     Ok(())
 }
 
+fn btc_consolidation_is_p2tr(address_type: &str) -> bool {
+    matches!(address_type, "taproot" | "p2tr")
+}
+
+fn btc_consolidation_address_for_public_key(
+    address_type: &str,
+    public_key: &PublicKey,
+    network: Network,
+) -> Result<Address> {
+    let compressed = CompressedPublicKey(*public_key);
+    match address_type {
+        "p2wpkh" | "native_segwit" | "segwit" => Ok(Address::p2wpkh(&compressed, network)),
+        "taproot" | "p2tr" => {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let (internal_key, _) = public_key.x_only_public_key();
+            Ok(Address::p2tr(&secp, internal_key, None, network))
+        }
+        other => bail!(
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: reason=unsupported_deposit_script_type; address_type={other}; expected=p2wpkh_or_p2tr"
+        ),
+    }
+}
+
 fn validate_btc_consolidation_psbt_input(
     psbt: &Psbt,
     input_index: usize,
@@ -669,6 +692,7 @@ fn validate_btc_consolidation_psbt_input(
     public_key: &PublicKey,
     fingerprint: &Fingerprint,
     derivation_path: &DerivationPath,
+    address_type: &str,
     network: Network,
 ) -> Result<()> {
     let tx_input = psbt.unsigned_tx.input.get(input_index).with_context(|| {
@@ -699,7 +723,8 @@ fn validate_btc_consolidation_psbt_input(
         bytes_to_hex(witness_utxo.script_pubkey.as_bytes())
     );
 
-    let derived_address = Address::p2wpkh(&CompressedPublicKey(*public_key), network);
+    let derived_address =
+        btc_consolidation_address_for_public_key(address_type, public_key, network)?;
     let derived_script = derived_address.script_pubkey();
     ensure!(
         derived_script == witness_utxo.script_pubkey,
@@ -711,23 +736,58 @@ fn validate_btc_consolidation_psbt_input(
         derived_address.to_string() == deposit_address,
         "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=pubkey_address_mismatch; derived_address={derived_address}"
     );
-    ensure!(
-        psbt_input.bip32_derivation.len() == 1,
-        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_bip32_derivation_count; expected=1; actual={}",
-        psbt_input.bip32_derivation.len()
-    );
-    let (actual_fingerprint, actual_path) = psbt_input
-        .bip32_derivation
-        .get(public_key)
-        .with_context(|| {
-            format!(
-                "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=missing_bip32_derivation"
-            )
-        })?;
-    ensure!(
-        actual_fingerprint == fingerprint && actual_path == derivation_path,
-        "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=bip32_origin_mismatch; expected_fingerprint={fingerprint}; actual_fingerprint={actual_fingerprint}; expected_path={derivation_path}; actual_path={actual_path}"
-    );
+    if btc_consolidation_is_p2tr(address_type) {
+        let (internal_key, _) = public_key.x_only_public_key();
+        ensure!(
+            psbt_input.bip32_derivation.is_empty(),
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_legacy_bip32_derivation_for_p2tr"
+        );
+        ensure!(
+            psbt_input.tap_internal_key == Some(internal_key),
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=tap_internal_key_mismatch; expected={internal_key}; actual={:?}",
+            psbt_input.tap_internal_key
+        );
+        ensure!(
+            psbt_input.tap_key_origins.len() == 1,
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_tap_key_origin_count; expected=1; actual={}",
+            psbt_input.tap_key_origins.len()
+        );
+        let (leaf_hashes, (actual_fingerprint, actual_path)) = psbt_input
+            .tap_key_origins
+            .get(&internal_key)
+            .with_context(|| {
+                format!(
+                    "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; internal_key={internal_key}; reason=missing_tap_key_origin"
+                )
+            })?;
+        ensure!(
+            leaf_hashes.is_empty(),
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_tap_leaf_hashes_for_bip86; actual={}",
+            leaf_hashes.len()
+        );
+        ensure!(
+            actual_fingerprint == fingerprint && actual_path == derivation_path,
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; internal_key={internal_key}; reason=tap_key_origin_mismatch; expected_fingerprint={fingerprint}; actual_fingerprint={actual_fingerprint}; expected_path={derivation_path}; actual_path={actual_path}"
+        );
+    } else {
+        ensure!(
+            psbt_input.bip32_derivation.len() == 1,
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; reason=unexpected_bip32_derivation_count; expected=1; actual={}",
+            psbt_input.bip32_derivation.len()
+        );
+        let (actual_fingerprint, actual_path) = psbt_input
+            .bip32_derivation
+            .get(public_key)
+            .with_context(|| {
+                format!(
+                    "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=missing_bip32_derivation"
+                )
+            })?;
+        ensure!(
+            actual_fingerprint == fingerprint && actual_path == derivation_path,
+            "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={deposit_address}; pubkey={public_key}; reason=bip32_origin_mismatch; expected_fingerprint={fingerprint}; actual_fingerprint={actual_fingerprint}; expected_path={derivation_path}; actual_path={actual_path}"
+        );
+    }
     Ok(())
 }
 
@@ -2440,6 +2500,55 @@ fn validate_finalized_p2wpkh_witness(vin: usize, input: &bitcoin::psbt::Input) -
     validate_p2wpkh_signing_pubkey(vin, input, &public_key)
 }
 
+fn validate_p2tr_signing_key(vin: usize, input: &bitcoin::psbt::Input) -> Result<()> {
+    let witness_utxo = input.witness_utxo.as_ref().with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_witness_utxo")
+    })?;
+    ensure!(
+        witness_utxo.script_pubkey.is_p2tr(),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=expected_p2tr_input; actual_script={}",
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes())
+    );
+    ensure!(
+        input.tap_merkle_root.is_none(),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=unexpected_tap_merkle_root_for_bip86"
+    );
+    let internal_key = input.tap_internal_key.with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_tap_internal_key")
+    })?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived_script = Address::p2tr(&secp, internal_key, None, Network::Bitcoin).script_pubkey();
+    ensure!(
+        derived_script == witness_utxo.script_pubkey,
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; internal_key={internal_key}; reason=tap_internal_key_script_mismatch; expected_script={}; actual_script={}",
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes()),
+        bytes_to_hex(derived_script.as_bytes())
+    );
+    Ok(())
+}
+
+fn validate_finalized_p2tr_witness(vin: usize, input: &bitcoin::psbt::Input) -> Result<()> {
+    let witness = input.final_script_witness.as_ref().with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_final_script_witness")
+    })?;
+    ensure!(
+        witness.len() == 1,
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=invalid_p2tr_key_path_witness_item_count; expected=1; actual={}",
+        witness.len()
+    );
+    ensure!(
+        input.final_script_sig.as_ref().map(|script| script.is_empty()).unwrap_or(true),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=non_empty_p2tr_final_script_sig"
+    );
+    let signature = witness.iter().next().with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_taproot_key_signature")
+    })?;
+    bitcoin::taproot::Signature::from_slice(signature).with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=invalid_taproot_key_signature")
+    })?;
+    Ok(())
+}
+
 fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
     let mut inputs = Vec::new();
     let mut auto_finalized = 0usize;
@@ -2466,6 +2575,8 @@ fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
         if has_final {
             if script_kind == "p2wpkh" {
                 validate_finalized_p2wpkh_witness(vin, input)?;
+            } else if script_kind == "p2tr" {
+                validate_finalized_p2tr_witness(vin, input)?;
             }
             inputs.push(json!({
                 "vin": vin,
@@ -2501,6 +2612,28 @@ fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
                 "status": "auto_finalized_p2wpkh",
                 "script_kind": script_kind,
                 "partial_sig_count": partial_sig_count
+            }));
+        } else if script_kind == "p2tr" && input.tap_key_sig.is_some() {
+            validate_p2tr_signing_key(vin, input)?;
+            let signature = input
+                .tap_key_sig
+                .take()
+                .context("P2TR key signature disappeared before finalization")?;
+            let mut witness = Witness::new();
+            witness.push(signature.to_vec());
+            input.final_script_witness = Some(witness);
+            input.final_script_sig = Some(ScriptBuf::new());
+            input.sighash_type = None;
+            input.tap_scripts = BTreeMap::new();
+            input.tap_key_origins = BTreeMap::new();
+            input.tap_internal_key = None;
+            input.tap_merkle_root = None;
+            auto_finalized += 1;
+            inputs.push(json!({
+                "vin": vin,
+                "status": "auto_finalized_p2tr_key_path",
+                "script_kind": script_kind,
+                "partial_sig_count": 0
             }));
         } else {
             let status = if partial_sig_count <= 0 {
@@ -3570,8 +3703,12 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 }));
                 continue;
             };
-            let public_key_script =
-                Address::p2wpkh(&CompressedPublicKey(key_source.0), network).script_pubkey();
+            let public_key_script = btc_consolidation_address_for_public_key(
+                &xpub_config.address_type,
+                &key_source.0,
+                network,
+            )?
+            .script_pubkey();
             ensure!(
                 public_key_script == source_script,
                 "BTC_CONSOLIDATION_PSBT_BIP32_MISMATCH: input_index={input_index}; deposit_address={address}; pubkey={}; reason=pubkey_script_mismatch; expected_script={}; actual_script={}",
@@ -3599,7 +3736,13 @@ extern "C" fn btc_prepare_consolidation_psbt(
         } else {
             2
         };
-        let estimated_vbytes = 10u64 + (selected.len() as u64).saturating_mul(68) + 31;
+        let input_vbytes = if btc_consolidation_is_p2tr(&xpub_config.address_type) {
+            58
+        } else {
+            68
+        };
+        let estimated_vbytes =
+            10u64 + (selected.len() as u64).saturating_mul(input_vbytes) + 31;
         let fee_sats = fee_rate_sat_vb.saturating_mul(estimated_vbytes);
         ensure!(
             selected_sats > fee_sats,
@@ -3638,9 +3781,18 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 script_pubkey: script_pubkey.clone(),
             });
             let (public_key, fingerprint, derivation_path) = key_source;
-            let mut derivations = BTreeMap::new();
-            derivations.insert(*public_key, (*fingerprint, derivation_path.clone()));
-            psbt.inputs[index].bip32_derivation = derivations;
+            if btc_consolidation_is_p2tr(&xpub_config.address_type) {
+                let (internal_key, _) = public_key.x_only_public_key();
+                psbt.inputs[index].tap_internal_key = Some(internal_key);
+                psbt.inputs[index].tap_key_origins.insert(
+                    internal_key,
+                    (Vec::new(), (*fingerprint, derivation_path.clone())),
+                );
+            } else {
+                psbt.inputs[index]
+                    .bip32_derivation
+                    .insert(*public_key, (*fingerprint, derivation_path.clone()));
+            }
             derivation_count += 1;
         }
         for (index, (address, script_pubkey, outpoint, _, key_source))
@@ -3656,6 +3808,7 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 public_key,
                 fingerprint,
                 derivation_path,
+                &xpub_config.address_type,
                 network,
             )?;
         }
