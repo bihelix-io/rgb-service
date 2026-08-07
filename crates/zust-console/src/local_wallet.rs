@@ -506,7 +506,17 @@ fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> R
     let mut checkpoint_blocks = Vec::new();
 
     while let Some(item) = request.next_spk_with_expected_txids() {
-        let history = electrum_script_history(electrum, &item.spk)?;
+        let history = match electrum_script_history(electrum, &item.spk) {
+            Ok(history) => history,
+            Err(err) if is_electrum_history_limit_error(&err) => {
+                electrum_script_unspent_history(electrum, &item.spk).with_context(|| {
+                    format!(
+                        "Electrum listunspent fallback failed after history limit: {err:#}"
+                    )
+                })?
+            }
+            Err(err) => return Err(err),
+        };
         let mut seen = std::collections::HashSet::new();
         for entry in history {
             seen.insert(entry.txid);
@@ -804,6 +814,39 @@ pub fn electrum_script_history(
         };
         let txid = Txid::from_str(txid_text)
             .with_context(|| format!("decode Electrum tx_hash {txid_text}"))?;
+        let height = item
+            .get("height")
+            .and_then(Value::as_i64)
+            .filter(|height| *height > 0)
+            .map(|height| height as u32);
+        entries.push(ElectrumHistoryEntry { txid, height });
+    }
+    Ok(entries)
+}
+
+fn is_electrum_history_limit_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_ascii_lowercase()
+        .contains("too many history entries")
+}
+
+fn electrum_script_unspent_history(
+    config: &ElectrumConfig,
+    script: &ScriptBuf,
+) -> Result<Vec<ElectrumHistoryEntry>> {
+    let script_hash = electrum_script_hash_hex(script);
+    let unspents = electrum_rpc(
+        config,
+        "blockchain.scripthash.listunspent",
+        json!([script_hash]),
+    )?;
+    let mut entries = Vec::new();
+    for item in unspents.as_array().cloned().unwrap_or_default() {
+        let Some(txid_text) = item.get("tx_hash").and_then(Value::as_str) else {
+            continue;
+        };
+        let txid = Txid::from_str(txid_text)
+            .with_context(|| format!("decode Electrum listunspent tx_hash {txid_text}"))?;
         let height = item
             .get("height")
             .and_then(Value::as_i64)
