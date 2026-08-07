@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-api"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "baid64",
@@ -4551,7 +4551,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-cmd"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "baid64",
@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-invoicing"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "baid64",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-ops"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "baid64",
@@ -4667,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-psbt-utils"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "baid64",
@@ -4699,7 +4699,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-service-api"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-service-daemon"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4736,7 +4736,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-service-local"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "anyhow",
@@ -7095,7 +7095,7 @@ dependencies = [
 
 [[package]]
 name = "zust-console"
-version = "0.11.1-rc.10"
+version = "0.11.1-rc.11"
 dependencies = [
  "amplify",
  "anyhow",
@@ -7167,9 +7167,9 @@ dependencies = [
 
 [[package]]
 name = "zust-root"
-version = "0.9.24"
+version = "0.9.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81af1fe62ababf7632fc62d606b157670b9f9b88a3a395e030dfbb8b9bea25ae"
+checksum = "ee9f87c0dbd64b9d0db3acdbd6851671530e7c9edd7b0d60208a6b5236f88e38"
 dependencies = [
  "anndists",
  "anyhow",
@@ -7194,9 +7194,9 @@ dependencies = [
 
 [[package]]
 name = "zust-vm"
-version = "0.9.104"
+version = "0.9.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e290aa9be7ee66076c13c49c43d40611f56086e9886392d488e91bbefaae85"
+checksum = "7a88d05e8f0eadfe80a0ccda59f533bdc11cfcf177d803cb0cd6efb8de48de18"
 dependencies = [
  "anyhow",
  "axum",

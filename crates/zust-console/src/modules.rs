@@ -2373,6 +2373,73 @@ fn btc_output_counts(
     counts
 }
 
+fn validate_p2wpkh_signing_pubkey(
+    vin: usize,
+    input: &bitcoin::psbt::Input,
+    public_key: &bitcoin::PublicKey,
+) -> Result<()> {
+    let witness_utxo = input.witness_utxo.as_ref().with_context(|| {
+        format!(
+            "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_witness_utxo"
+        )
+    })?;
+    ensure!(
+        witness_utxo.script_pubkey.is_p2wpkh(),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=expected_p2wpkh_input; actual_script={}",
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes())
+    );
+    let derived_script = Address::p2wpkh(
+        &CompressedPublicKey(public_key.inner),
+        Network::Bitcoin,
+    )
+    .script_pubkey();
+    ensure!(
+        derived_script == witness_utxo.script_pubkey,
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; pubkey={public_key}; reason=pubkey_script_mismatch; expected_script={}; actual_script={}",
+        bytes_to_hex(witness_utxo.script_pubkey.as_bytes()),
+        bytes_to_hex(derived_script.as_bytes())
+    );
+    Ok(())
+}
+
+fn validate_finalized_p2wpkh_witness(vin: usize, input: &bitcoin::psbt::Input) -> Result<()> {
+    let witness = input.final_script_witness.as_ref().with_context(|| {
+        format!(
+            "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_final_script_witness"
+        )
+    })?;
+    ensure!(
+        witness.len() == 2,
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=invalid_p2wpkh_witness_item_count; expected=2; actual={}",
+        witness.len()
+    );
+    ensure!(
+        input
+            .final_script_sig
+            .as_ref()
+            .map(|script| script.is_empty())
+            .unwrap_or(true),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=non_empty_p2wpkh_final_script_sig"
+    );
+    let signature = witness.iter().next().with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_witness_signature")
+    })?;
+    ensure!(
+        !signature.is_empty(),
+        "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=empty_witness_signature"
+    );
+    let public_key_bytes = witness.iter().nth(1).with_context(|| {
+        format!("BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=missing_witness_pubkey")
+    })?;
+    let public_key = bitcoin::PublicKey::from_slice(public_key_bytes).with_context(|| {
+        format!(
+            "BTC_SIGNED_PSBT_INPUT_MISMATCH: vin={vin}; reason=invalid_witness_pubkey; pubkey={}",
+            bytes_to_hex(public_key_bytes)
+        )
+    })?;
+    validate_p2wpkh_signing_pubkey(vin, input, &public_key)
+}
+
 fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
     let mut inputs = Vec::new();
     let mut auto_finalized = 0usize;
@@ -2397,6 +2464,9 @@ fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
             .unwrap_or("missing_witness_utxo");
         let partial_sig_count = input.partial_sigs.len();
         if has_final {
+            if script_kind == "p2wpkh" {
+                validate_finalized_p2wpkh_witness(vin, input)?;
+            }
             inputs.push(json!({
                 "vin": vin,
                 "status": "already_finalized",
@@ -2414,6 +2484,7 @@ fn finalize_psbt_for_broadcast(mut psbt: Psbt) -> Result<(Psbt, Value)> {
                 .next()
                 .map(|(pubkey, sig)| (*pubkey, *sig))
                 .context("P2WPKH partial signature disappeared before finalization")?;
+            validate_p2wpkh_signing_pubkey(vin, input, &pubkey)?;
             let mut witness = Witness::new();
             witness.push(sig.to_vec());
             witness.push(pubkey.to_bytes());
@@ -6737,20 +6808,25 @@ fn electrum_address_txs_json_with_deadline(
         .with_context(|| format!("address is not for {network:?}"))?;
     let script = address.script_pubkey();
     let script_hash = electrum_script_hash_hex(&script);
-    let history = electrum_rpc_with_deadline(
+    // Scheduled address scans and withdrawal preflight only need transactions
+    // containing currently spendable outputs. Fetching the complete history for
+    // a heavily reused custody address can exceed the Electrum server's history
+    // lookup limit and block every withdrawal from that address.
+    let unspents = electrum_rpc_with_deadline(
         source,
-        "blockchain.scripthash.get_history",
+        "blockchain.scripthash.listunspent",
         json!([script_hash]),
         deadline,
     )?;
     let mut txs = Vec::new();
-    for item in history.as_array().cloned().unwrap_or_default() {
+    let mut seen_txids = std::collections::HashSet::new();
+    for item in unspents.as_array().cloned().unwrap_or_default() {
         let txid = item
             .get("tx_hash")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if txid.is_empty() {
+        if txid.is_empty() || !seen_txids.insert(txid.clone()) {
             continue;
         }
         let raw = electrum_rpc_with_deadline(
