@@ -131,6 +131,61 @@ query_fee = 1
 cargo run -p rgb-service-daemon -- examples/rgb-service.toml
 ```
 
+## One-time wallet-v2 stake redeem import
+
+The importer accepts a Navicat PostgreSQL `.sql` dump or a `.sql.zip` archive.
+It projects the legacy `redeem`, `transfer`, and `rgb_assign` rows into the
+daemon's Fjall `stake_redeems` keyspace. It does not import the old full PSBT or
+fascia payloads. Stop any daemon already using the same `service.data_dir`
+before running the standalone import command.
+
+Run a non-writing precheck first:
+
+```bash
+cargo run -p rgb-service-daemon -- \
+  import-wallet-v2-stake-redeems \
+  examples/rgb-service.toml \
+  /secure-backup/wallet-v2.sql.zip \
+  --report /secure-backup/stake-import-dry-run.json \
+  --dry-run
+```
+
+The precheck validates every legacy relation and field used by redeem, then
+checks every `status=0` stake outpoint against the configured Bitcoin backend:
+confirmation, output index, amount, P2WSH stake script, confirmation height,
+and unspent state. Any mismatch aborts the import.
+
+After reviewing the report, import once:
+
+```bash
+cargo run -p rgb-service-daemon -- \
+  import-wallet-v2-stake-redeems \
+  examples/rgb-service.toml \
+  /secure-backup/wallet-v2.sql.zip \
+  --report /secure-backup/stake-import.json
+```
+
+The Fjall records, public-key secondary indexes, and migration marker are
+committed in one transaction and synchronously persisted. The daemon then reads
+all imported records and indexes back, verifies their immutable digest, and
+writes the final JSON report.
+
+The same import may instead run before the HTTP listener starts:
+
+```bash
+cargo run -p rgb-service-daemon -- \
+  examples/rgb-service.toml \
+  --import-wallet-v2-stake-redeems /secure-backup/wallet-v2.sql.zip \
+  --stake-import-report /secure-backup/stake-import.json
+```
+
+Idempotency is enforced by the `wallet_v2_stake_redeems_v1` marker in the
+`schema_migrations` keyspace. Re-running with the same source SHA-256 performs
+only a read-back verification and reports `already-applied`; it does not import
+again or repeat chain queries. Re-running with a different source SHA-256 is
+refused. Remove the one-time startup flags after the first successful start,
+and keep the successful JSON report with the database backup.
+
 Daemon logs are written to:
 
 ```text
@@ -234,7 +289,15 @@ to loopback or a trusted internal network during development.
 PUT  /account/create
 GET  /asset/list
 GET  /asset
+GET  /utxo
 POST /asset/internal/issue
+GET  /estimate/gas
+GET  /get_fee
+GET  /stake/address
+POST /stake/split
+GET  /redeem/list
+POST /redeem/psbt
+POST /redeem/callback
 POST /transfer/psbt
 POST /transfer/callback
 POST /transfer/cancel
@@ -257,19 +320,26 @@ Current gaps before exposing this beyond trusted local testing:
   restriction; once compatibility is verified, set exact caller IPs here.
 - `/transfer/psbt` supports multiple RGB assignments, including optional RNA
   RGB fee collection when `[legacy].rgb_fee_enabled = true`.
-- `/transfer/callback` requires `desc` and `transfer_id`; it does not yet infer
-  prepared state from a raw transaction alone.
-- `/transfer/callback` commits RGB state but does not broadcast the BTC
-  transaction.
+- `/transfer/callback` accepts a signed raw transaction. For RGB transfers it
+  infers the prepared transfer from the transaction id; for BTC-only transfers
+  no prepared RGB state is required. The callback broadcasts the transaction.
 - Pending UTXO reservation is minimal; production use needs stronger
   double-spend/pending-transfer guards.
 - Legacy `/asset/list` returns daemon catalog metadata but not historical total
   supply.
 - Legacy `/asset` maps `address` directly to daemon `account_id`; descriptor
   accounts use an internal `legacy-desc:<sha256(desc)>` id.
-- wallet-service-v2 routes for stock backup/upload, stake, redeem, split,
-  foreign transfer, retry/rescan and tx detail are not implemented in this
-  compatibility layer.
+- `GET /stake/address`, `POST /stake/split`, and the three `/redeem/*` routes
+  preserve the wallet-service-v2 request/response shapes. Redeem PSBTs are
+  rebuilt from the funding transaction fetched through the configured chain
+  backend; the old full PSBT row is not required.
+- Redeem state is stored in Fjall keyspaces `stake_redeems` (by stake outpoint)
+  and `stake_redeems_by_public_key`. A successful redeem broadcast updates the
+  record idempotently. Historical records still need to be imported before
+  these endpoints are enabled for production traffic.
+- Stateful `/stake/coloring` and `/stake/callback`, stock backup/upload,
+  foreign transfer, retry/rescan and tx detail routes are not implemented in
+  this compatibility layer.
 - Error bodies are compatibility-shaped enough for debugging, but not a full
   wallet-service-v2 error-code clone.
 

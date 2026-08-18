@@ -20,9 +20,13 @@ use bdk_electrum::BdkElectrumClient;
 use bdk_esplora::EsploraExt;
 use bdk_wallet::{
     bitcoin::{
+        absolute,
+        bip32::ChildNumber,
         consensus::deserialize,
         hashes::{sha256, Hash},
-        Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, TxOut, Txid,
+        secp256k1::Secp256k1,
+        transaction, Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, Transaction,
+        TxIn, TxOut, Txid, Witness,
     },
     chain::{ChainPosition, ConfirmationBlockTime, Merge},
     descriptor::ExtendedDescriptor,
@@ -58,6 +62,11 @@ pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> 
         .route("/asset/internal/issue", post(issue_asset))
         .route("/estimate/gas", get(estimate_gas))
         .route("/get_fee", get(get_mempool_info))
+        .route("/stake/address", get(generate_stake_address))
+        .route("/stake/split", post(stake_split))
+        .route("/redeem/list", get(redeem_list))
+        .route("/redeem/psbt", post(redeem_psbt))
+        .route("/redeem/callback", post(redeem_callback))
         .route("/transfer/psbt", post(transfer_psbt))
         .route("/transfer/callback", post(transfer_callback))
         .route("/transfer/cancel", post(transfer_cancel))
@@ -100,6 +109,400 @@ fn legacy_ip_allowed(config: &LegacyConfig, ip: IpAddr) -> bool {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Deserialize)]
+struct GenerateStakeAddressQuery {
+    height: std::num::NonZeroU16,
+    public_key: bdk_wallet::bitcoin::PublicKey,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerateStakeAddressResponse {
+    address: String,
+    script: String,
+}
+
+async fn generate_stake_address(
+    State(state): State<LegacyState>,
+    Query(query): Query<GenerateStakeAddressQuery>,
+) -> Result<Json<GenerateStakeAddressResponse>, LegacyHttpError> {
+    let script = make_stake_script(query.public_key, query.height.get());
+    let address = Address::p2wsh(&script, state.service.network()?);
+    Ok(Json(GenerateStakeAddressResponse {
+        address: address.to_string(),
+        script: crate::hex_encode(script.as_bytes()),
+    }))
+}
+
+/// Reproduce wallet-service-v2's CSV stake witness script exactly.
+pub(crate) fn make_stake_script(
+    public_key: bdk_wallet::bitcoin::PublicKey,
+    height: u16,
+) -> ScriptBuf {
+    use bdk_wallet::bitcoin::{opcodes::all, script::Builder};
+
+    Builder::new()
+        .push_int(height as i64)
+        .push_opcode(all::OP_CSV)
+        .push_opcode(all::OP_DROP)
+        .push_key(&public_key)
+        .push_opcode(all::OP_CHECKSIG)
+        .into_script()
+}
+
+#[derive(Deserialize)]
+struct StakeSplitReq {
+    desc: String,
+    split_to: Vec<StakeSplitAssign>,
+    fee_rate: u64,
+}
+
+#[derive(Deserialize)]
+struct StakeSplitAssign {
+    address: String,
+    sats: u64,
+    contract_id: String,
+    rgb_amount: u64,
+}
+
+async fn stake_split(
+    State(state): State<LegacyState>,
+    Json(req): Json<StakeSplitReq>,
+) -> Result<Json<TransferPsbtResp>, LegacyHttpError> {
+    let assign = req
+        .split_to
+        .into_iter()
+        .map(|split| TransferAssign {
+            address: split.address,
+            sats: Some(split.sats),
+            rgb_assign: HashMap::from([(split.contract_id, split.rgb_amount)]),
+        })
+        .collect();
+    transfer_psbt(
+        State(state),
+        Json(TransferReq {
+            desc: Some(req.desc),
+            assign,
+            fee_rate: req.fee_rate,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct RedeemListQuery {
+    public_key: bdk_wallet::bitcoin::PublicKey,
+    contract_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RedeemListResp {
+    spend_txid: Option<String>,
+    outpoint: String,
+    sats: u64,
+    height: u16,
+    public_key: String,
+    status: i16,
+    assign_map: Option<(String, u64)>,
+    create_time: String,
+    confirm_height: Option<u64>,
+}
+
+async fn redeem_list(
+    State(state): State<LegacyState>,
+    Query(query): Query<RedeemListQuery>,
+) -> Result<Json<Vec<RedeemListResp>>, LegacyHttpError> {
+    let public_key = query.public_key.to_string();
+    let records = state
+        .service
+        .list_stake_redeems_by_public_key(&public_key)?;
+    let response = records
+        .into_iter()
+        .filter_map(|record| {
+            let assignment = match query.contract_id.as_deref() {
+                Some(contract_id) => record
+                    .rgb_assignments
+                    .get(contract_id)
+                    .copied()
+                    .map(|amount| (contract_id.to_string(), amount)),
+                None => record
+                    .rgb_assignments
+                    .iter()
+                    .next()
+                    .map(|(contract_id, amount)| (contract_id.clone(), *amount)),
+            };
+            if query.contract_id.is_some() && assignment.is_none() {
+                return None;
+            }
+            Some(RedeemListResp {
+                spend_txid: record.redeem_spend_txid,
+                outpoint: record.stake_outpoint,
+                sats: record.sats,
+                height: record.csv_height,
+                public_key: record.public_key,
+                status: record.status,
+                assign_map: assignment,
+                create_time: record.created_at,
+                confirm_height: record.confirm_height,
+            })
+        })
+        .collect();
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct RedeemPsbtReq {
+    outpoint: OutPoint,
+    fee_rate: u64,
+    address: String,
+}
+
+#[derive(Serialize)]
+struct RedeemPsbtResp {
+    psbt: String,
+}
+
+async fn redeem_psbt(
+    State(state): State<LegacyState>,
+    Json(req): Json<RedeemPsbtReq>,
+) -> Result<Json<RedeemPsbtResp>, LegacyHttpError> {
+    run_legacy_blocking("legacy redeem/psbt", move || {
+        let outpoint = req.outpoint.to_string();
+        let record = state.service.get_stake_redeem(&outpoint)?.ok_or_else(|| {
+            RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
+        })?;
+        if record.status != 0 {
+            return Err(RgbServiceError::Conflict(format!(
+                "stake outpoint {outpoint} is already redeemed"
+            ))
+            .into());
+        }
+
+        let public_key = bdk_wallet::bitcoin::PublicKey::from_str(&record.public_key)
+            .map_err(|err| RgbServiceError::Backend(format!("invalid stored public key: {err}")))?;
+        let funding_tx = fetch_legacy_transaction(&state.service, &req.outpoint.txid)?;
+        let funding_output = funding_tx
+            .output
+            .get(req.outpoint.vout as usize)
+            .cloned()
+            .ok_or_else(|| {
+                RgbServiceError::NotFound(format!("stake output not found: {outpoint}"))
+            })?;
+        let witness_script = make_stake_script(public_key, record.csv_height);
+        if funding_output.script_pubkey != witness_script.to_p2wsh() {
+            return Err(RgbServiceError::Conflict(format!(
+                "stake output script does not match stored CSV terms: {outpoint}"
+            ))
+            .into());
+        }
+        if funding_output.value.to_sat() != record.sats {
+            return Err(RgbServiceError::Conflict(format!(
+                "stake output amount does not match stored sats: {outpoint}"
+            ))
+            .into());
+        }
+
+        let target = Address::from_str(&req.address)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?
+            .require_network(state.service.network()?)
+            .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        let target_script = target.script_pubkey();
+        let mut unsigned_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: req.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_height(record.csv_height),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_output.value,
+                script_pubkey: target_script.clone(),
+            }],
+        };
+        let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
+            .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
+        let fee = fee_rate
+            .checked_mul_by_weight(unsigned_tx.weight())
+            .ok_or_else(|| RgbServiceError::InvalidRequest("fee_rate is too high".to_string()))?;
+        unsigned_tx.output[0].value =
+            unsigned_tx.output[0]
+                .value
+                .checked_sub(fee)
+                .ok_or_else(|| {
+                    RgbServiceError::InvalidRequest("fee exceeds stake output".to_string())
+                })?;
+        if unsigned_tx.output[0].value < target_script.minimal_non_dust() {
+            return Err(
+                RgbServiceError::InvalidRequest("redeem output would be dust".to_string()).into(),
+            );
+        }
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        psbt.inputs[0].witness_script = Some(witness_script);
+        psbt.inputs[0].witness_utxo = Some(funding_output);
+        psbt.inputs[0].non_witness_utxo = Some(funding_tx);
+        if let Some(desc) = record.owner_desc.as_deref() {
+            add_redeem_bip32_derivation(&mut psbt, desc, public_key)?;
+        }
+        Ok(Json(RedeemPsbtResp {
+            psbt: psbt.to_string(),
+        }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RedeemCallbackReq {
+    psbt: String,
+}
+
+async fn redeem_callback(
+    State(state): State<LegacyState>,
+    Json(req): Json<RedeemCallbackReq>,
+) -> Result<StatusCode, LegacyHttpError> {
+    run_legacy_blocking("legacy redeem/callback", move || {
+        let mut psbt = Psbt::from_str(&req.psbt)
+            .map_err(|err| RgbServiceError::InvalidRequest(format!("invalid PSBT: {err}")))?;
+        if psbt.inputs.len() != 1
+            || psbt.unsigned_tx.input.len() != 1
+            || psbt.unsigned_tx.output.len() != 1
+        {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeem PSBT must contain exactly one input and one output".to_string(),
+            )
+            .into());
+        }
+        let outpoint = psbt.unsigned_tx.input[0].previous_output.to_string();
+        let record = state.service.get_stake_redeem(&outpoint)?.ok_or_else(|| {
+            RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
+        })?;
+        let public_key = bdk_wallet::bitcoin::PublicKey::from_str(&record.public_key)
+            .map_err(|err| RgbServiceError::Backend(format!("invalid stored public key: {err}")))?;
+        let expected_script = make_stake_script(public_key, record.csv_height);
+        let input = &psbt.inputs[0];
+        if input.final_script_witness.is_some() {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeem PSBT is already finalized".to_string(),
+            )
+            .into());
+        }
+        if input.witness_script.as_ref() != Some(&expected_script) {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeem PSBT witness_script does not match stake record".to_string(),
+            )
+            .into());
+        }
+        if psbt.unsigned_tx.input[0].sequence != Sequence::from_height(record.csv_height) {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeem PSBT sequence does not match stake CSV height".to_string(),
+            )
+            .into());
+        }
+        let signature = input
+            .partial_sigs
+            .get(&public_key)
+            .cloned()
+            .ok_or_else(|| {
+                RgbServiceError::InvalidRequest(
+                    "redeem PSBT is missing the stake public key signature".to_string(),
+                )
+            })?;
+        let spend_txid = psbt.unsigned_tx.compute_txid().to_string();
+        if record.status == 1 {
+            if record.redeem_spend_txid.as_deref() == Some(spend_txid.as_str()) {
+                return Ok(StatusCode::OK);
+            }
+            return Err(RgbServiceError::Conflict(format!(
+                "stake outpoint {outpoint} was already redeemed"
+            ))
+            .into());
+        }
+        psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[
+            signature.to_vec(),
+            expected_script.to_bytes(),
+        ]));
+        let tx = psbt.extract_tx().map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid signed PSBT: {err}"))
+        })?;
+        broadcast_legacy_tx(&state.service, &tx, &spend_txid)?;
+        state.service.mark_stake_redeemed(&outpoint, &spend_txid)?;
+        Ok(StatusCode::OK)
+    })
+    .await
+}
+
+fn fetch_legacy_transaction(
+    service: &LocalDaemonService,
+    txid: &Txid,
+) -> Result<Transaction, LegacyHttpError> {
+    if is_electrum_url(&service.config.esplora_url) {
+        let url = normalize_electrum_url(&service.config.esplora_url);
+        return service
+            .electrum_with_retry("electrum transaction_get", || {
+                let config = electrum_client::ConfigBuilder::new()
+                    .timeout(Some(crate::ELECTRUM_TIMEOUT_SECS))
+                    .build();
+                let client = electrum_client::Client::from_config(&url, config)?;
+                client.transaction_get(txid)
+            })
+            .map_err(Into::into);
+    }
+    let client = bdk_esplora::esplora_client::Builder::new(&service.config.esplora_url)
+        .timeout(30)
+        .build_blocking();
+    client
+        .get_tx(txid)
+        .map_err(|err| RgbServiceError::Backend(format!("fetch stake transaction: {err}")))?
+        .ok_or_else(|| RgbServiceError::NotFound(format!("transaction not found: {txid}")))
+        .map_err(Into::into)
+}
+
+fn add_redeem_bip32_derivation(
+    psbt: &mut Psbt,
+    desc: &str,
+    public_key: bdk_wallet::bitcoin::PublicKey,
+) -> Result<(), LegacyHttpError> {
+    use bdk_wallet::miniscript::{
+        descriptor::{DescriptorPublicKey, Wildcard},
+        Descriptor,
+    };
+
+    let descriptor = ExtendedDescriptor::from_str(desc).map_err(|err| {
+        RgbServiceError::Backend(format!("invalid stored owner descriptor: {err}"))
+    })?;
+    let Descriptor::Wpkh(wpkh) = &descriptor else {
+        return Ok(());
+    };
+    let DescriptorPublicKey::XPub(xpub) = wpkh.as_inner() else {
+        return Ok(());
+    };
+    let secp = Secp256k1::verification_only();
+    let derived = descriptor
+        .derived_descriptor(&secp, 0)
+        .map_err(|err| RgbServiceError::Backend(format!("derive owner descriptor: {err}")))?;
+    let Descriptor::Wpkh(derived_wpkh) = derived else {
+        return Ok(());
+    };
+    if derived_wpkh.as_inner() != &public_key {
+        return Ok(());
+    }
+    let Some((fingerprint, origin_path)) = xpub.origin.as_ref() else {
+        return Ok(());
+    };
+    let mut derivation_path = origin_path.extend(&xpub.derivation_path);
+    derivation_path = match xpub.wildcard {
+        Wildcard::None => derivation_path,
+        Wildcard::Unhardened => derivation_path.child(ChildNumber::Normal { index: 0 }),
+        Wildcard::Hardened => return Ok(()),
+    };
+    psbt.inputs[0]
+        .bip32_derivation
+        .insert(public_key.inner, (*fingerprint, derivation_path));
+    Ok(())
 }
 
 const LEGACY_BLOCKING_MAX_CONCURRENCY: usize = 4;
@@ -502,12 +905,8 @@ fn legacy_desc_account_ids(
     state: &LegacyState,
     desc: &str,
 ) -> Result<Vec<String>, LegacyHttpError> {
-    legacy_desc_account_ids_for_service(
-        &state.service,
-        state.config.reveal_address_count,
-        desc,
-    )
-    .map_err(Into::into)
+    legacy_desc_account_ids_for_service(&state.service, state.config.reveal_address_count, desc)
+        .map_err(Into::into)
 }
 
 fn legacy_desc_account_ids_for_service(
@@ -1674,9 +2073,91 @@ impl IntoResponse for LegacyHttpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bdk_wallet::bitcoin::Network;
+    use bdk_wallet::bitcoin::{Network, PublicKey};
 
     const LEGACY_DESCRIPTOR_KEY: &str = "[a49cd98b/84'/827166'/0']xpub6Bz49QXuN7g57fzNQJA8sbQKu8ihjcaPKCwYUq3HXXn5LXNn6ejuXEUSmcHgAFAdtyBgxFyumSNivxp5gtwbN7XkUTEMh4vuLTBfW3ff82T/0/*";
+
+    #[test]
+    fn stake_address_script_matches_wallet_service_v2_contract() {
+        let public_key = PublicKey::from_str(
+            "03b9175c5dbb731da31fec7b9b0d04d5c4a7d098e06d1e2cbaacaef58d687e963b",
+        )
+        .unwrap();
+        let script = make_stake_script(public_key, 10);
+
+        assert_eq!(
+            crate::hex_encode(script.as_bytes()),
+            "5ab2752103b9175c5dbb731da31fec7b9b0d04d5c4a7d098e06d1e2cbaacaef58d687e963bac"
+        );
+        assert!(Address::p2wsh(&script, Network::Bitcoin)
+            .to_string()
+            .starts_with("bc1q"));
+    }
+
+    #[test]
+    fn redeem_list_keeps_wallet_service_v2_assignment_tuple_shape() {
+        let response = RedeemListResp {
+            spend_txid: None,
+            outpoint: format!("{}:0", Txid::all_zeros()),
+            sats: 100_000,
+            height: 10,
+            public_key: "03b9175c5dbb731da31fec7b9b0d04d5c4a7d098e06d1e2cbaacaef58d687e963b"
+                .to_string(),
+            status: 0,
+            assign_map: Some(("rgb:test".to_string(), 42)),
+            create_time: "2026-08-16T12:00:00+08:00".to_string(),
+            confirm_height: Some(100),
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["assign_map"], serde_json::json!(["rgb:test", 42]));
+        assert_eq!(value["height"], 10);
+        assert_eq!(value["sats"], 100_000);
+    }
+
+    #[test]
+    fn redeem_psbt_restores_owner_bip32_derivation() {
+        use bdk_wallet::miniscript::Descriptor;
+
+        let descriptor =
+            ExtendedDescriptor::from_str(&format!("wpkh({LEGACY_DESCRIPTOR_KEY})")).unwrap();
+        let derived = descriptor
+            .derived_descriptor(&Secp256k1::verification_only(), 0)
+            .unwrap();
+        let Descriptor::Wpkh(wpkh) = derived else {
+            panic!("test descriptor must be wpkh");
+        };
+        let public_key = *wpkh.as_inner();
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+
+        let result = add_redeem_bip32_derivation(
+            &mut psbt,
+            &format!("wpkh({LEGACY_DESCRIPTOR_KEY})"),
+            public_key,
+        );
+        assert!(result.is_ok());
+
+        let (fingerprint, path) = psbt.inputs[0]
+            .bip32_derivation
+            .get(&public_key.inner)
+            .unwrap();
+        assert_eq!(fingerprint.to_string(), "a49cd98b");
+        assert_eq!(path.to_string(), "84'/827166'/0'/0/0");
+    }
 
     #[test]
     fn legacy_change_address_stays_at_index_zero_for_all_supported_script_types() {

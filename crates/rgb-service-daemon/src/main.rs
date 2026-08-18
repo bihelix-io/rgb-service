@@ -69,6 +69,7 @@ use tokio::{net::TcpListener, signal};
 use tower_http::cors::CorsLayer;
 
 mod legacy;
+mod stake_import;
 
 // wallet-service-v2 migration: legacy RGB stock directories are nested under
 // each descriptor-derived account id using this historical RGB runtime path.
@@ -974,6 +975,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args
         .get(1)
+        .is_some_and(|arg| arg == "import-wallet-v2-stake-redeems")
+    {
+        let config_path = args.get(2).ok_or(stake_import::usage())?;
+        let source = args.get(3).ok_or(stake_import::usage())?;
+        let options = stake_import::parse_command_options(source, &args[4..])?;
+        let config = load_config(config_path)?;
+        fs::create_dir_all(&config.service.data_dir)?;
+        let service = LocalDaemonService::new(config).await?;
+        let dry_run = options.dry_run;
+        let summary = service.import_wallet_v2_stake_redeems(options)?;
+        println!(
+            "wallet-v2 stake redeem import: records={} active={} spent={} mode={} result={} report={}",
+            summary.record_count,
+            summary.active_count,
+            summary.spent_count,
+            if dry_run { "dry-run" } else { "write" },
+            if summary.idempotent_replay {
+                "already-applied"
+            } else if summary.applied {
+                "applied"
+            } else {
+                "checked"
+            },
+            summary.report_path.display()
+        );
+        return Ok(());
+    }
+    if args
+        .get(1)
         .is_some_and(|arg| arg == "trace-wallet-v2-contract")
     {
         let data_dir = args.get(2).ok_or(trace_wallet_v2_contract_usage())?;
@@ -1091,7 +1121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    let config_path = args.get(1).ok_or("usage: rgb-service <config.toml>")?;
+    let config_path = args.get(1).ok_or(stake_import::startup_usage())?;
+    let startup_stake_import = stake_import::parse_startup_options(&args[2..])?;
     let config = load_config(config_path)?;
     fs::create_dir_all(&config.service.data_dir)?;
 
@@ -1105,6 +1136,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = config.service.bind;
     let legacy_config = config.legacy.clone();
     let service = Arc::new(LocalDaemonService::new(config).await?);
+    if let Some(options) = startup_stake_import {
+        let summary = service.import_wallet_v2_stake_redeems(options)?;
+        service.logger.info(format!(
+            "startup wallet-v2 stake redeem import records={} active={} spent={} result={} report={}",
+            summary.record_count,
+            summary.active_count,
+            summary.spent_count,
+            if summary.idempotent_replay {
+                "already-applied"
+            } else {
+                "applied"
+            },
+            summary.report_path.display()
+        ));
+    }
     spawn_recovery_scanner(Arc::clone(&service));
     let auth = Arc::new(ConfiguredAuthVerifier);
     let mut app = router(service.clone(), auth);
@@ -1544,7 +1590,6 @@ impl ConfiguredAuthVerifier {
             }
         }
     }
-
 }
 
 #[async_trait]
@@ -1668,6 +1713,30 @@ struct PreparedTransferRecord {
     fascia: Vec<u8>,
     #[serde(default)]
     recipients: Vec<PreparedTransferRecipient>,
+}
+
+const STAKE_REDEEM_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct StakeRedeemRecord {
+    #[serde(default = "stake_redeem_schema_version")]
+    pub(crate) schema_version: u8,
+    pub(crate) stake_outpoint: String,
+    pub(crate) sats: u64,
+    pub(crate) csv_height: u16,
+    pub(crate) public_key: String,
+    pub(crate) owner_desc: Option<String>,
+    pub(crate) reward_seal: Option<String>,
+    #[serde(default)]
+    pub(crate) rgb_assignments: BTreeMap<String, u64>,
+    pub(crate) confirm_height: Option<u64>,
+    pub(crate) redeem_spend_txid: Option<String>,
+    pub(crate) status: i16,
+    pub(crate) created_at: String,
+}
+
+fn stake_redeem_schema_version() -> u8 {
+    STAKE_REDEEM_SCHEMA_VERSION
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2503,6 +2572,183 @@ impl LocalDaemonService {
                     .map_err(|err| RgbServiceError::Backend(err.to_string()))
             })
             .transpose()
+    }
+
+    fn validate_stake_redeem(record: &StakeRedeemRecord) -> rgb_service_api::Result<()> {
+        if record.schema_version != STAKE_REDEEM_SCHEMA_VERSION {
+            return Err(RgbServiceError::InvalidRequest(format!(
+                "unsupported stake redeem schema version: {}",
+                record.schema_version
+            )));
+        }
+        OutPoint::from_str(&record.stake_outpoint).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid stake outpoint: {err}"))
+        })?;
+        let public_key = bitcoin::PublicKey::from_str(&record.public_key).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid stake public key: {err}"))
+        })?;
+        if public_key.to_string() != record.public_key {
+            return Err(RgbServiceError::InvalidRequest(
+                "stake public key is not canonically encoded".to_string(),
+            ));
+        }
+        if record.sats == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "stake sats must be greater than zero".to_string(),
+            ));
+        }
+        if record.csv_height == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "stake CSV height must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(txid) = record.redeem_spend_txid.as_deref() {
+            Txid::from_str(txid).map_err(|err| {
+                RgbServiceError::InvalidRequest(format!("invalid redeem spend txid: {err}"))
+            })?;
+        }
+        if !(0..=1).contains(&record.status) {
+            return Err(RgbServiceError::InvalidRequest(format!(
+                "unsupported stake redeem status: {}",
+                record.status
+            )));
+        }
+        if record.status == 1 && record.redeem_spend_txid.is_none() {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeemed stake record is missing redeem_spend_txid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stake_redeem_index_key(public_key: &str, outpoint: &str) -> String {
+        format!("{public_key}:{outpoint}")
+    }
+
+    pub(crate) fn put_stake_redeem(
+        &self,
+        record: &StakeRedeemRecord,
+    ) -> rgb_service_api::Result<()> {
+        Self::validate_stake_redeem(record)?;
+        let records = self
+            .db
+            .keyspace("stake_redeems", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let by_public_key = self
+            .db
+            .keyspace(
+                "stake_redeems_by_public_key",
+                KeyspaceCreateOptions::default,
+            )
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        if let Some(existing) = self.get_stake_redeem(&record.stake_outpoint)? {
+            if existing.public_key != record.public_key {
+                return Err(RgbServiceError::Conflict(format!(
+                    "stake outpoint {} is already indexed by another public key",
+                    record.stake_outpoint
+                )));
+            }
+        }
+        let bytes =
+            serde_json::to_vec(record).map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let index_key = Self::stake_redeem_index_key(&record.public_key, &record.stake_outpoint);
+        let mut tx = self.db.write_tx();
+        tx.insert(&records, record.stake_outpoint.as_bytes(), bytes);
+        tx.insert(
+            &by_public_key,
+            index_key.as_bytes(),
+            record.stake_outpoint.as_bytes(),
+        );
+        tx.commit()
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))
+    }
+
+    pub(crate) fn get_stake_redeem(
+        &self,
+        outpoint: &str,
+    ) -> rgb_service_api::Result<Option<StakeRedeemRecord>> {
+        let records = self
+            .db
+            .keyspace("stake_redeems", KeyspaceCreateOptions::default)
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        records
+            .get(outpoint.as_bytes())
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?
+            .map(|bytes| {
+                let record: StakeRedeemRecord = serde_json::from_slice(bytes.as_ref())
+                    .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+                Self::validate_stake_redeem(&record)?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn list_stake_redeems_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> rgb_service_api::Result<Vec<StakeRedeemRecord>> {
+        bitcoin::PublicKey::from_str(public_key).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid stake public key: {err}"))
+        })?;
+        let by_public_key = self
+            .db
+            .keyspace(
+                "stake_redeems_by_public_key",
+                KeyspaceCreateOptions::default,
+            )
+            .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+        let prefix = format!("{public_key}:");
+        let mut records = Vec::new();
+        for item in by_public_key.as_ref().prefix(prefix.as_bytes()) {
+            let outpoint = item
+                .value()
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let outpoint = String::from_utf8(outpoint.to_vec())
+                .map_err(|err| RgbServiceError::Backend(err.to_string()))?;
+            let record = self.get_stake_redeem(&outpoint)?.ok_or_else(|| {
+                RgbServiceError::Backend(format!(
+                    "stake redeem index points to missing record: {outpoint}"
+                ))
+            })?;
+            records.push(record);
+        }
+        records.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.stake_outpoint.cmp(&right.stake_outpoint))
+        });
+        Ok(records)
+    }
+
+    pub(crate) fn mark_stake_redeemed(
+        &self,
+        outpoint: &str,
+        spend_txid: &str,
+    ) -> rgb_service_api::Result<()> {
+        Txid::from_str(spend_txid).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid redeem spend txid: {err}"))
+        })?;
+        let mut record = self.get_stake_redeem(outpoint)?.ok_or_else(|| {
+            RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
+        })?;
+        if record.status == 1 {
+            if record.redeem_spend_txid.as_deref() == Some(spend_txid) {
+                return Ok(());
+            }
+            return Err(RgbServiceError::Conflict(format!(
+                "stake outpoint {outpoint} was already redeemed by {}",
+                record
+                    .redeem_spend_txid
+                    .as_deref()
+                    .unwrap_or("unknown txid")
+            )));
+        }
+        record.status = 1;
+        record.redeem_spend_txid = Some(spend_txid.to_string());
+        self.put_stake_redeem(&record)
     }
 
     // wallet-service-v2 migration: import accounts purely from the on-disk data
@@ -4691,6 +4937,77 @@ query_fee = 1
         assert_eq!(replay.balance_after, 100_007);
         assert_eq!(replay.current_balance, 100_007);
         assert!(replay.idempotent_replay);
+
+        drop(service);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stake_redeems_are_indexed_and_redeem_status_is_idempotent() {
+        let data_dir = env::temp_dir().join(format!(
+            "rgb-service-daemon-stake-redeem-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = LocalDaemonService::new(DaemonConfig {
+            service: ServiceConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: DaemonRnaConfig {
+                issue_fee: 1000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+        let secp = Secp256k1::new();
+        let public_key = bitcoin::PublicKey::new(PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&[7; 32]).unwrap(),
+        ))
+        .to_string();
+        let outpoint = "3af5f6efa45256793e3cb85ca837e70cef5b3a5b3880bc4d175a0fb0d493539c:1";
+        let record = StakeRedeemRecord {
+            schema_version: STAKE_REDEEM_SCHEMA_VERSION,
+            stake_outpoint: outpoint.to_string(),
+            sats: 100_000,
+            csv_height: 10,
+            public_key: public_key.clone(),
+            owner_desc: Some("wpkh(test-owner-desc)".to_string()),
+            reward_seal: Some("tapret1st:test-seal".to_string()),
+            rgb_assignments: BTreeMap::from([("rgb:test".to_string(), 42)]),
+            confirm_height: Some(100),
+            redeem_spend_txid: None,
+            status: 0,
+            created_at: "2026-08-16T12:00:00+08:00".to_string(),
+        };
+        service.put_stake_redeem(&record).unwrap();
+
+        assert_eq!(service.get_stake_redeem(outpoint).unwrap(), Some(record));
+        let indexed = service
+            .list_stake_redeems_by_public_key(&public_key)
+            .unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].stake_outpoint, outpoint);
+
+        let spend_txid = "755cf300000000000000000000000000000000000000000000000000000071f0";
+        service.mark_stake_redeemed(outpoint, spend_txid).unwrap();
+        service.mark_stake_redeemed(outpoint, spend_txid).unwrap();
+        let redeemed = service.get_stake_redeem(outpoint).unwrap().unwrap();
+        assert_eq!(redeemed.status, 1);
+        assert_eq!(redeemed.redeem_spend_txid.as_deref(), Some(spend_txid));
+        assert!(service
+            .mark_stake_redeemed(
+                outpoint,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_err());
 
         drop(service);
         fs::remove_dir_all(data_dir).unwrap();
