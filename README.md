@@ -7,10 +7,9 @@ This repository contains the RGB contract and asset libraries extracted from
 
 中文 API 说明见 [docs/API.zh-CN.md](docs/API.zh-CN.md)。
 L1/L2 转账流程手册见 [docs/TRANSFER.zh-CN.md](docs/TRANSFER.zh-CN.md)。
-`1.0.11-prod` 赎回修复升级手册见
-[docs/UPGRADE-1.0.11-prod.zh-CN.md](docs/UPGRADE-1.0.11-prod.zh-CN.md)；首次导入
-wallet-v2 质押数据时同时参照
-[docs/UPGRADE-1.0.10-prod.zh-CN.md](docs/UPGRADE-1.0.10-prod.zh-CN.md)。
+`1.0.11-prod` 的完整升级、wallet-v2 质押数据导入和赎回手册见
+[docs/UPGRADE-1.0.11-prod.zh-CN.md](docs/UPGRADE-1.0.11-prod.zh-CN.md)。该手册可直接用于
+首次部署，不要求先运行其他版本。
 
 ## Crates
 
