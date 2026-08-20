@@ -1,5 +1,8 @@
 # rgb-service 1.0.10-prod 升级与 wallet-v2 质押迁移手册
 
+> 生产赎回应直接部署 `1.0.11-prod` 或更高版本；一次性导入命令和数据格式不变，
+> 赎回路径修复见 [1.0.11-prod 升级手册](UPGRADE-1.0.11-prod.zh-CN.md)。
+
 本文档用于将 `rgb-service` 从 `1.0.9-prod` 升级到 `1.0.10-prod`，并将
 `wallet-service-v2` PostgreSQL 备份中的历史质押赎回数据一次性迁移到
 `rgb-service-daemon` 的 Fjall 数据库。
@@ -203,8 +206,8 @@ wallet_v2_stake_redeems_v1
 
 重复执行规则：
 
-- 同一源文件 SHA-256：不再解析、查链或写入，只回读 358 条记录及索引并验证，
-  返回 `already-applied`。
+- 同一源文件 SHA-256：不再解析、查链或重复写入 Fjall，只回读 358 条记录及索引并验证，
+  返回 `already-applied`。`1.0.11-prod` 还会在原子提交已完成但最终报告未完成时修复报告。
 - 不同源文件 SHA-256：立即拒绝，避免把两份历史状态混入同一数据目录。
 - 用户成功赎回后，记录的 `status` 和 `redeem_spend_txid` 可以更新；迁移摘要只绑定
   不可变的原始质押字段，因此正常赎回不会破坏重放校验。
