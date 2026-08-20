@@ -2751,6 +2751,25 @@ impl LocalDaemonService {
         self.put_stake_redeem(&record)
     }
 
+    pub(crate) fn reconcile_stake_chain_spend(
+        &self,
+        outpoint: &str,
+        spend_txid: &str,
+    ) -> rgb_service_api::Result<()> {
+        Txid::from_str(spend_txid).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("invalid chain spend txid: {err}"))
+        })?;
+        let mut record = self.get_stake_redeem(outpoint)?.ok_or_else(|| {
+            RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
+        })?;
+        if record.status == 1 && record.redeem_spend_txid.as_deref() == Some(spend_txid) {
+            return Ok(());
+        }
+        record.status = 1;
+        record.redeem_spend_txid = Some(spend_txid.to_string());
+        self.put_stake_redeem(&record)
+    }
+
     // wallet-service-v2 migration: import accounts purely from the on-disk data
     // directory (no SQL dump). Descriptors are recovered directly from each
     // account's `bdk_wallet` file, so this does not require a wallet-v2.sql.

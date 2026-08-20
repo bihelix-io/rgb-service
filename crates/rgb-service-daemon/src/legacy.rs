@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,7 +26,7 @@ use bdk_wallet::{
         hashes::{sha256, Hash},
         secp256k1::Secp256k1,
         transaction, Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, Transaction,
-        TxIn, TxOut, Txid, Witness,
+        TxIn, TxOut, Txid, Weight, Witness,
     },
     chain::{ChainPosition, ConfirmationBlockTime, Merge},
     descriptor::ExtendedDescriptor,
@@ -40,7 +40,7 @@ use rgb_service_local::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{LegacyConfig, LocalDaemonService, PreparedTransferRecipient};
+use crate::{LegacyConfig, LocalDaemonService, PreparedTransferRecipient, StakeRedeemRecord};
 
 const LEGACY_BDK_MAGIC: &[u8] = b"RgbDaemonLegacyBdk";
 const BDK_FILE: &str = "bdk_wallet";
@@ -149,6 +149,75 @@ pub(crate) fn make_stake_script(
         .push_key(&public_key)
         .push_opcode(all::OP_CHECKSIG)
         .into_script()
+}
+
+const MAX_REDEEM_ECDSA_SIGNATURE_BYTES: usize = 73;
+const REDEEM_BROADCAST_RECOVERY_ATTEMPTS: usize = 4;
+const REDEEM_BROADCAST_RECOVERY_DELAY_MS: u64 = 250;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StakeChainState {
+    tip_height: u64,
+    confirm_height: Option<u64>,
+    unspent: bool,
+    spend_txid: Option<Txid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StakeSpendObservation {
+    Unspent,
+    Candidate,
+    Other(Txid),
+    SpentUnknown,
+}
+
+impl StakeChainState {
+    fn spend_observation(&self, candidate: Option<Txid>) -> StakeSpendObservation {
+        if self.unspent {
+            return StakeSpendObservation::Unspent;
+        }
+        match (self.spend_txid, candidate) {
+            (Some(observed), Some(candidate)) if observed == candidate => {
+                StakeSpendObservation::Candidate
+            }
+            (Some(observed), _) => StakeSpendObservation::Other(observed),
+            (None, _) => StakeSpendObservation::SpentUnknown,
+        }
+    }
+
+    fn matures_at_height(&self, csv_height: u16) -> Option<u64> {
+        self.confirm_height
+            .map(|height| height.saturating_add(u64::from(csv_height)))
+    }
+
+    fn is_mature_for_next_block(&self, csv_height: u16) -> bool {
+        self.matures_at_height(csv_height)
+            .is_some_and(|height| self.tip_height.saturating_add(1) >= height)
+    }
+}
+
+fn redeem_outpoint_lock(outpoint: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(outpoint).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(outpoint.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+fn estimated_signed_redeem_weight(unsigned_tx: &Transaction, witness_script: &ScriptBuf) -> Weight {
+    let mut projected = unsigned_tx.clone();
+    projected.input[0].witness = Witness::from_slice(&[
+        vec![0_u8; MAX_REDEEM_ECDSA_SIGNATURE_BYTES],
+        witness_script.to_bytes(),
+    ]);
+    projected.weight()
 }
 
 #[derive(Deserialize)]
@@ -269,6 +338,10 @@ async fn redeem_psbt(
 ) -> Result<Json<RedeemPsbtResp>, LegacyHttpError> {
     run_legacy_blocking("legacy redeem/psbt", move || {
         let outpoint = req.outpoint.to_string();
+        let redeem_lock = redeem_outpoint_lock(&outpoint);
+        let _redeem_guard = redeem_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = state.service.get_stake_redeem(&outpoint)?.ok_or_else(|| {
             RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
         })?;
@@ -302,11 +375,21 @@ async fn redeem_psbt(
             ))
             .into());
         }
+        let chain_state =
+            fetch_stake_chain_state(&state.service, &record, &funding_output.script_pubkey)?;
+        let _ = reconcile_stake_spend(&state.service, &record, chain_state, None)?;
+        ensure_stake_mature(&record, chain_state)?;
 
         let target = Address::from_str(&req.address)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?
             .require_network(state.service.network()?)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
+        if req.fee_rate == 0 {
+            return Err(RgbServiceError::InvalidRequest(
+                "fee_rate must be greater than zero".to_string(),
+            )
+            .into());
+        }
         let target_script = target.script_pubkey();
         let mut unsigned_tx = Transaction {
             version: transaction::Version::TWO,
@@ -325,7 +408,10 @@ async fn redeem_psbt(
         let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
             .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
         let fee = fee_rate
-            .checked_mul_by_weight(unsigned_tx.weight())
+            .checked_mul_by_weight(estimated_signed_redeem_weight(
+                &unsigned_tx,
+                &witness_script,
+            ))
             .ok_or_else(|| RgbServiceError::InvalidRequest("fee_rate is too high".to_string()))?;
         unsigned_tx.output[0].value =
             unsigned_tx.output[0]
@@ -377,6 +463,10 @@ async fn redeem_callback(
             .into());
         }
         let outpoint = psbt.unsigned_tx.input[0].previous_output.to_string();
+        let redeem_lock = redeem_outpoint_lock(&outpoint);
+        let _redeem_guard = redeem_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = state.service.get_stake_redeem(&outpoint)?.ok_or_else(|| {
             RgbServiceError::NotFound(format!("stake redeem not found: {outpoint}"))
         })?;
@@ -387,6 +477,12 @@ async fn redeem_callback(
         if input.final_script_witness.is_some() {
             return Err(RgbServiceError::InvalidRequest(
                 "redeem PSBT is already finalized".to_string(),
+            )
+            .into());
+        }
+        if input.final_script_sig.is_some() {
+            return Err(RgbServiceError::InvalidRequest(
+                "redeem PSBT must not contain final_script_sig".to_string(),
             )
             .into());
         }
@@ -411,16 +507,6 @@ async fn redeem_callback(
                     "redeem PSBT is missing the stake public key signature".to_string(),
                 )
             })?;
-        let spend_txid = psbt.unsigned_tx.compute_txid().to_string();
-        if record.status == 1 {
-            if record.redeem_spend_txid.as_deref() == Some(spend_txid.as_str()) {
-                return Ok(StatusCode::OK);
-            }
-            return Err(RgbServiceError::Conflict(format!(
-                "stake outpoint {outpoint} was already redeemed"
-            ))
-            .into());
-        }
         psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[
             signature.to_vec(),
             expected_script.to_bytes(),
@@ -428,8 +514,58 @@ async fn redeem_callback(
         let tx = psbt.extract_tx().map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid signed PSBT: {err}"))
         })?;
-        broadcast_legacy_tx(&state.service, &tx, &spend_txid)?;
-        state.service.mark_stake_redeemed(&outpoint, &spend_txid)?;
+        let spend_txid = tx.compute_txid();
+        let spend_txid_text = spend_txid.to_string();
+        let expected_script_pubkey = expected_script.to_p2wsh();
+        let chain_state = match fetch_stake_chain_state(
+            &state.service,
+            &record,
+            &expected_script_pubkey,
+        ) {
+            Ok(chain_state) => chain_state,
+            Err(error)
+                if record.status == 1
+                    && record.redeem_spend_txid.as_deref() == Some(spend_txid_text.as_str()) =>
+            {
+                state.service.logger().warn(format!(
+                    "legacy redeem idempotence chain query failed outpoint={outpoint} txid={spend_txid}: {}",
+                    error.err
+                ));
+                return Ok(StatusCode::OK);
+            }
+            Err(error) => return Err(error),
+        };
+        if record.status == 1
+            && record.redeem_spend_txid.as_deref() != Some(spend_txid_text.as_str())
+            && chain_state.unspent
+        {
+            return Err(RgbServiceError::Conflict(format!(
+                "stake outpoint {outpoint} was already redeemed by {}",
+                record
+                    .redeem_spend_txid
+                    .as_deref()
+                    .unwrap_or("unknown txid")
+            ))
+            .into());
+        }
+        if reconcile_stake_spend(&state.service, &record, chain_state, Some(spend_txid))? {
+            return Ok(StatusCode::OK);
+        }
+        ensure_stake_mature(&record, chain_state)?;
+        if let Err(broadcast_error) = broadcast_legacy_tx(&state.service, &tx, &spend_txid_text) {
+            if reconcile_after_broadcast_error(
+                &state.service,
+                &record,
+                &expected_script_pubkey,
+                spend_txid,
+            )? {
+                return Ok(StatusCode::OK);
+            }
+            return Err(broadcast_error);
+        }
+        state
+            .service
+            .mark_stake_redeemed(&outpoint, &spend_txid_text)?;
         Ok(StatusCode::OK)
     })
     .await
@@ -459,6 +595,210 @@ fn fetch_legacy_transaction(
         .map_err(|err| RgbServiceError::Backend(format!("fetch stake transaction: {err}")))?
         .ok_or_else(|| RgbServiceError::NotFound(format!("transaction not found: {txid}")))
         .map_err(Into::into)
+}
+
+fn fetch_stake_chain_state(
+    service: &LocalDaemonService,
+    record: &StakeRedeemRecord,
+    expected_script_pubkey: &ScriptBuf,
+) -> Result<StakeChainState, LegacyHttpError> {
+    let outpoint = OutPoint::from_str(&record.stake_outpoint)
+        .map_err(|err| RgbServiceError::Backend(format!("invalid stored outpoint: {err}")))?;
+    if is_electrum_url(&service.config.esplora_url) {
+        let url = normalize_electrum_url(&service.config.esplora_url);
+        let client = service.electrum_with_retry("stake chain electrum client", || {
+            let config = electrum_client::ConfigBuilder::new()
+                .timeout(Some(crate::ELECTRUM_TIMEOUT_SECS))
+                .build();
+            electrum_client::Client::from_config(&url, config)
+        })?;
+        let tip_height = u64::try_from(
+            service
+                .electrum_with_retry("stake chain electrum tip", || {
+                    client.block_headers_subscribe()
+                })?
+                .height,
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("invalid Electrum tip height: {err}")))?;
+        let history = service.electrum_with_retry("stake chain electrum history", || {
+            client.script_get_history(expected_script_pubkey.as_script())
+        })?;
+        let history_confirm_height = history
+            .iter()
+            .find(|entry| entry.tx_hash == outpoint.txid && entry.height > 0)
+            .map(|entry| entry.height as u64);
+        let confirm_height = match (history_confirm_height, record.confirm_height) {
+            (Some(height), _) => Some(height),
+            (None, Some(expected_height)) => {
+                let expected_height_usize = usize::try_from(expected_height).map_err(|err| {
+                    RgbServiceError::Backend(format!("invalid stored confirm height: {err}"))
+                })?;
+                let merkle = service.electrum_with_retry("stake chain electrum merkle", || {
+                    client.transaction_get_merkle(&outpoint.txid, expected_height_usize)
+                })?;
+                Some(u64::try_from(merkle.block_height).map_err(|err| {
+                    RgbServiceError::Backend(format!("invalid Electrum merkle height: {err}"))
+                })?)
+            }
+            (None, None) => None,
+        };
+        let unspent_outputs = service
+            .electrum_with_retry("stake chain electrum unspent", || {
+                client.script_list_unspent(expected_script_pubkey.as_script())
+            })?;
+        let unspent = unspent_outputs
+            .iter()
+            .any(|entry| entry.tx_hash == outpoint.txid && entry.tx_pos == outpoint.vout as usize);
+        let spend_txid = if unspent {
+            None
+        } else {
+            let mut candidates = Vec::new();
+            for entry in history
+                .iter()
+                .filter(|entry| entry.tx_hash != outpoint.txid)
+            {
+                let txid = entry.tx_hash;
+                let tx = service.electrum_with_retry("stake chain electrum spender", || {
+                    client.transaction_get(&txid)
+                })?;
+                if tx
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == outpoint)
+                {
+                    candidates.push((entry.height > 0, entry.height, txid));
+                }
+            }
+            candidates
+                .into_iter()
+                .max_by_key(|(confirmed, height, _)| (*confirmed, *height))
+                .map(|(_, _, txid)| txid)
+        };
+        return Ok(StakeChainState {
+            tip_height,
+            confirm_height,
+            unspent,
+            spend_txid,
+        });
+    }
+
+    let client = bdk_esplora::esplora_client::Builder::new(&service.config.esplora_url)
+        .timeout(30)
+        .build_blocking();
+    let tip_height = u64::from(
+        client
+            .get_height()
+            .map_err(|err| RgbServiceError::Backend(format!("fetch Bitcoin tip height: {err}")))?,
+    );
+    let funding_status = client.get_tx_status(&outpoint.txid).map_err(|err| {
+        RgbServiceError::Backend(format!("fetch stake transaction status: {err}"))
+    })?;
+    let output_status = client
+        .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+        .map_err(|err| RgbServiceError::Backend(format!("fetch stake output status: {err}")))?
+        .ok_or_else(|| {
+            RgbServiceError::NotFound(format!(
+                "stake output status not found: {}",
+                record.stake_outpoint
+            ))
+        })?;
+    Ok(StakeChainState {
+        tip_height,
+        confirm_height: funding_status.block_height.map(u64::from),
+        unspent: !output_status.spent,
+        spend_txid: output_status.txid,
+    })
+}
+
+fn ensure_stake_mature(
+    record: &StakeRedeemRecord,
+    state: StakeChainState,
+) -> Result<(), LegacyHttpError> {
+    let matures_at = state.matures_at_height(record.csv_height).ok_or_else(|| {
+        RgbServiceError::Conflict(format!(
+            "stake transaction is not confirmed: {}",
+            record.stake_outpoint
+        ))
+    })?;
+    if !state.is_mature_for_next_block(record.csv_height) {
+        return Err(RgbServiceError::Conflict(format!(
+            "stake outpoint {} is CSV locked until block {}; current tip is {}",
+            record.stake_outpoint, matures_at, state.tip_height
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn reconcile_stake_spend(
+    service: &LocalDaemonService,
+    record: &StakeRedeemRecord,
+    state: StakeChainState,
+    candidate: Option<Txid>,
+) -> Result<bool, LegacyHttpError> {
+    match state.spend_observation(candidate) {
+        StakeSpendObservation::Unspent => Ok(false),
+        StakeSpendObservation::Candidate => {
+            let spend_txid = state.spend_txid.ok_or_else(|| {
+                RgbServiceError::Backend(
+                    "chain backend reported the candidate spend without its txid".to_string(),
+                )
+            })?;
+            service.reconcile_stake_chain_spend(
+                &record.stake_outpoint,
+                &spend_txid.to_string(),
+            )?;
+            Ok(true)
+        }
+        StakeSpendObservation::Other(spend_txid) => {
+            service.reconcile_stake_chain_spend(
+                &record.stake_outpoint,
+                &spend_txid.to_string(),
+            )?;
+            Err(RgbServiceError::Conflict(format!(
+                "stake outpoint {} was already spent by {}",
+                record.stake_outpoint, spend_txid
+            ))
+            .into())
+        }
+        StakeSpendObservation::SpentUnknown => Err(RgbServiceError::Conflict(format!(
+            "stake outpoint {} is already spent but the chain backend did not return its spend txid",
+            record.stake_outpoint
+        ))
+        .into()),
+    }
+}
+
+fn reconcile_after_broadcast_error(
+    service: &LocalDaemonService,
+    record: &StakeRedeemRecord,
+    expected_script_pubkey: &ScriptBuf,
+    candidate: Txid,
+) -> Result<bool, LegacyHttpError> {
+    let mut last_observe_error = None;
+    for attempt in 1..=REDEEM_BROADCAST_RECOVERY_ATTEMPTS {
+        if attempt > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(
+                REDEEM_BROADCAST_RECOVERY_DELAY_MS,
+            ));
+        }
+        match fetch_stake_chain_state(service, record, expected_script_pubkey) {
+            Ok(state) => {
+                last_observe_error = None;
+                if reconcile_stake_spend(service, record, state, Some(candidate))? {
+                    return Ok(true);
+                }
+            }
+            Err(err) => last_observe_error = Some(err),
+        }
+    }
+    if let Some(observe_error) = last_observe_error {
+        service.logger().warn(format!(
+            "legacy redeem broadcast recovery query failed outpoint={} txid={candidate}: {}",
+            record.stake_outpoint, observe_error.err
+        ));
+    }
+    Ok(false)
 }
 
 fn add_redeem_bip32_derivation(
@@ -2157,6 +2497,455 @@ mod tests {
             .unwrap();
         assert_eq!(fingerprint.to_string(), "a49cd98b");
         assert_eq!(path.to_string(), "84'/827166'/0'/0/0");
+    }
+
+    #[test]
+    fn redeem_fee_estimate_covers_the_final_witness() {
+        let public_key = PublicKey::from_str(
+            "03b9175c5dbb731da31fec7b9b0d04d5c4a7d098e06d1e2cbaacaef58d687e963b",
+        )
+        .unwrap();
+        let witness_script = make_stake_script(public_key, 10);
+        let unsigned_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_height(10),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0_u8; 22]),
+            }],
+        };
+        let estimated_weight = estimated_signed_redeem_weight(&unsigned_tx, &witness_script);
+        let mut signed_tx = unsigned_tx.clone();
+        signed_tx.input[0].witness = Witness::from_slice(&[
+            vec![0_u8; MAX_REDEEM_ECDSA_SIGNATURE_BYTES - 1],
+            witness_script.to_bytes(),
+        ]);
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+        let estimated_fee = fee_rate.checked_mul_by_weight(estimated_weight).unwrap();
+        let actual_required_fee = fee_rate.checked_mul_by_weight(signed_tx.weight()).unwrap();
+        let old_unsigned_fee = fee_rate
+            .checked_mul_by_weight(unsigned_tx.weight())
+            .unwrap();
+
+        assert!(estimated_weight >= signed_tx.weight());
+        assert!(estimated_fee >= actual_required_fee);
+        assert!(old_unsigned_fee < actual_required_fee);
+    }
+
+    #[test]
+    fn stake_csv_maturity_uses_the_next_candidate_block() {
+        let locked = StakeChainState {
+            tip_height: 108,
+            confirm_height: Some(100),
+            unspent: true,
+            spend_txid: None,
+        };
+        let mature = StakeChainState {
+            tip_height: 109,
+            ..locked
+        };
+
+        assert_eq!(locked.matures_at_height(10), Some(110));
+        assert!(!locked.is_mature_for_next_block(10));
+        assert!(mature.is_mature_for_next_block(10));
+    }
+
+    #[test]
+    fn stake_spend_observation_distinguishes_replay_and_conflict() {
+        let candidate =
+            Txid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let other =
+            Txid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let unspent = StakeChainState {
+            tip_height: 100,
+            confirm_height: Some(90),
+            unspent: true,
+            spend_txid: None,
+        };
+        let spent_by_candidate = StakeChainState {
+            unspent: false,
+            spend_txid: Some(candidate),
+            ..unspent
+        };
+        let spent_by_other = StakeChainState {
+            spend_txid: Some(other),
+            ..spent_by_candidate
+        };
+        let spent_unknown = StakeChainState {
+            spend_txid: None,
+            ..spent_by_candidate
+        };
+
+        assert_eq!(
+            unspent.spend_observation(Some(candidate)),
+            StakeSpendObservation::Unspent
+        );
+        assert_eq!(
+            spent_by_candidate.spend_observation(Some(candidate)),
+            StakeSpendObservation::Candidate
+        );
+        assert_eq!(
+            spent_by_other.spend_observation(Some(candidate)),
+            StakeSpendObservation::Other(other)
+        );
+        assert_eq!(
+            spent_unknown.spend_observation(Some(candidate)),
+            StakeSpendObservation::SpentUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_reconciliation_repairs_fjall_and_remains_idempotent() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "rgb-service-redeem-reconcile-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let service = LocalDaemonService::new(crate::DaemonConfig {
+            service: crate::ServiceConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: crate::DaemonRnaConfig {
+                issue_fee: 1_000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+        let candidate =
+            Txid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let record = StakeRedeemRecord {
+            schema_version: crate::STAKE_REDEEM_SCHEMA_VERSION,
+            stake_outpoint: "3af5f6efa45256793e3cb85ca837e70cef5b3a5b3880bc4d175a0fb0d493539c:1"
+                .to_string(),
+            sats: 100_000,
+            csv_height: 10,
+            public_key: "03b9175c5dbb731da31fec7b9b0d04d5c4a7d098e06d1e2cbaacaef58d687e963b"
+                .to_string(),
+            owner_desc: None,
+            reward_seal: None,
+            rgb_assignments: BTreeMap::new(),
+            confirm_height: Some(100),
+            redeem_spend_txid: None,
+            status: 0,
+            created_at: "2026-08-16T12:00:00+08:00".to_string(),
+        };
+        service.put_stake_redeem(&record).unwrap();
+        let observed = StakeChainState {
+            tip_height: 200,
+            confirm_height: Some(100),
+            unspent: false,
+            spend_txid: Some(candidate),
+        };
+
+        assert!(matches!(
+            reconcile_stake_spend(&service, &record, observed, Some(candidate)),
+            Ok(true)
+        ));
+        assert!(matches!(
+            reconcile_stake_spend(&service, &record, observed, Some(candidate)),
+            Ok(true)
+        ));
+        let repaired = service
+            .get_stake_redeem(&record.stake_outpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.status, 1);
+        assert_eq!(
+            repaired.redeem_spend_txid.as_deref(),
+            Some(candidate.to_string().as_str())
+        );
+
+        let other =
+            Txid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        assert!(matches!(
+            reconcile_stake_spend(
+                &service,
+                &record,
+                StakeChainState {
+                    spend_txid: Some(other),
+                    ..observed
+                },
+                Some(other)
+            ),
+            Ok(true)
+        ));
+        let replaced = service
+            .get_stake_redeem(&record.stake_outpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replaced.redeem_spend_txid.as_deref(),
+            Some(other.to_string().as_str())
+        );
+
+        let mut conflict_record = record.clone();
+        conflict_record.stake_outpoint =
+            "3af5f6efa45256793e3cb85ca837e70cef5b3a5b3880bc4d175a0fb0d493539c:2".to_string();
+        service.put_stake_redeem(&conflict_record).unwrap();
+        let conflict = reconcile_stake_spend(
+            &service,
+            &conflict_record,
+            StakeChainState {
+                spend_txid: Some(other),
+                ..observed
+            },
+            Some(candidate),
+        )
+        .expect_err("a different chain spend must conflict");
+        assert!(matches!(conflict.err, RgbServiceError::Conflict(_)));
+        let conflict_repaired = service
+            .get_stake_redeem(&conflict_record.stake_outpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conflict_repaired.status, 1);
+        assert_eq!(
+            conflict_repaired.redeem_spend_txid.as_deref(),
+            Some(other.to_string().as_str())
+        );
+
+        drop(service);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_recovers_an_already_broadcast_tx_without_rebroadcasting() {
+        #[derive(Default)]
+        struct MockEsploraState {
+            spent: bool,
+            broadcasts: usize,
+        }
+
+        #[derive(Clone)]
+        struct MockEsplora {
+            candidate: Txid,
+            state: Arc<Mutex<MockEsploraState>>,
+        }
+
+        let secret_key =
+            bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let public_key = PublicKey::new(
+            bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key),
+        );
+        let witness_script = make_stake_script(public_key, 10);
+        let funding_txid =
+            Txid::from_str("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+                .unwrap();
+        let unsigned_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_txid, 1),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_height(10),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_800),
+                script_pubkey: witness_script.to_p2wsh(),
+            }],
+        };
+        let candidate = unsigned_tx.compute_txid();
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_script = Some(witness_script.clone());
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: witness_script.to_p2wsh(),
+        });
+        let signature = secp.sign_ecdsa(
+            &bdk_wallet::bitcoin::secp256k1::Message::from_digest([42_u8; 32]),
+            &secret_key,
+        );
+        psbt.inputs[0].partial_sigs.insert(
+            public_key,
+            bdk_wallet::bitcoin::ecdsa::Signature::sighash_all(signature),
+        );
+        let request_psbt = psbt.to_string();
+
+        let mock = MockEsplora {
+            candidate,
+            state: Arc::new(Mutex::new(MockEsploraState::default())),
+        };
+        let mock_app = axum::Router::new()
+            .route("/blocks/tip/height", axum::routing::get(|| async { "200" }))
+            .route(
+                "/tx/{txid}/status",
+                axum::routing::get(|| async {
+                    Json(serde_json::json!({
+                        "confirmed": true,
+                        "block_height": 100,
+                        "block_hash": null,
+                        "block_time": 1
+                    }))
+                }),
+            )
+            .route(
+                "/tx/{txid}/outspend/{vout}",
+                axum::routing::get(|State(mock): State<MockEsplora>| async move {
+                    let state = mock
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Json(if state.spent {
+                        serde_json::json!({
+                            "spent": true,
+                            "txid": mock.candidate,
+                            "vin": 0,
+                            "status": {
+                                "confirmed": false,
+                                "block_height": null,
+                                "block_hash": null,
+                                "block_time": null
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "spent": false,
+                            "txid": null,
+                            "vin": null,
+                            "status": null
+                        })
+                    })
+                }),
+            )
+            .route(
+                "/tx",
+                axum::routing::post(|State(mock): State<MockEsplora>| async move {
+                    let mut state = mock
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.broadcasts += 1;
+                    state.spent = true;
+                    (StatusCode::BAD_REQUEST, "txn-already-known")
+                }),
+            )
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "rgb-service-redeem-callback-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let service = Arc::new(
+            LocalDaemonService::new(crate::DaemonConfig {
+                service: crate::ServiceConfig {
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    network: "mainnet".to_string(),
+                    data_dir: data_dir.clone(),
+                    esplora_url: backend_url,
+                    recovery_scan_interval_secs: None,
+                },
+                daemon_rna: crate::DaemonRnaConfig {
+                    issue_fee: 1_000,
+                    transfer_fee: 100,
+                    query_fee: 1,
+                },
+                legacy: LegacyConfig::default(),
+            })
+            .await
+            .unwrap(),
+        );
+        let outpoint = OutPoint::new(funding_txid, 1).to_string();
+        service
+            .put_stake_redeem(&StakeRedeemRecord {
+                schema_version: crate::STAKE_REDEEM_SCHEMA_VERSION,
+                stake_outpoint: outpoint.clone(),
+                sats: 100_000,
+                csv_height: 10,
+                public_key: public_key.to_string(),
+                owner_desc: None,
+                reward_seal: None,
+                rgb_assignments: BTreeMap::new(),
+                confirm_height: Some(100),
+                redeem_spend_txid: None,
+                status: 0,
+                created_at: "2026-08-16T12:00:00+08:00".to_string(),
+            })
+            .unwrap();
+        let callback_state = LegacyState {
+            service: Arc::clone(&service),
+            config: LegacyConfig::default(),
+        };
+
+        assert!(matches!(
+            redeem_callback(
+                State(callback_state.clone()),
+                Json(RedeemCallbackReq {
+                    psbt: request_psbt.clone()
+                })
+            )
+            .await,
+            Ok(StatusCode::OK)
+        ));
+        assert!(matches!(
+            redeem_callback(
+                State(callback_state),
+                Json(RedeemCallbackReq { psbt: request_psbt })
+            )
+            .await,
+            Ok(StatusCode::OK)
+        ));
+        let persisted = service.get_stake_redeem(&outpoint).unwrap().unwrap();
+        assert_eq!(persisted.status, 1);
+        assert_eq!(
+            persisted.redeem_spend_txid.as_deref(),
+            Some(candidate.to_string().as_str())
+        );
+        let backend_state = mock
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(backend_state.broadcasts, 1);
+        drop(backend_state);
+
+        drop(service);
+        mock_server.abort();
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn callbacks_for_the_same_outpoint_share_a_lock() {
+        let first = redeem_outpoint_lock("test-outpoint:0");
+        let second = redeem_outpoint_lock("test-outpoint:0");
+        let different = redeem_outpoint_lock("different-outpoint:0");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &different));
+
+        let expired = Arc::downgrade(&different);
+        drop(different);
+        let replacement = redeem_outpoint_lock("different-outpoint:0");
+        assert!(expired.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&replacement), 1);
     }
 
     #[test]

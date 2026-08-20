@@ -470,7 +470,9 @@ fn parse_sql<R: BufRead>(reader: R, source_member: String) -> Result<ParsedStake
                     .transpose()
                     .map_err(|err| anyhow!("invalid transfer.confirm_height: {err}"))?,
             };
-            transfers.insert(row.id, row);
+            if transfers.insert(row.id, row).is_some() {
+                bail!("duplicate transfer.id at line {line_number}");
+            }
         }
     }
     if redeems.is_empty() {
@@ -963,6 +965,70 @@ fn atomic_write_report(path: &Path, report: &StakeRedeemImportReport) -> Result<
     Ok(())
 }
 
+fn repair_preliminary_report(
+    path: &Path,
+    marker: &StakeImportMarker,
+    postcheck: &PostImportReport,
+) -> Result<bool> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("read existing stake import report: {}", path.display()))?;
+    let mut report: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse existing stake import report: {}", path.display()))?;
+    let object = report.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "stake import report is not a JSON object: {}",
+            path.display()
+        )
+    })?;
+    if object.get("source_sha256").and_then(|value| value.as_str())
+        != Some(marker.source_sha256.as_str())
+    {
+        bail!(
+            "stake import report source sha256 does not match migration marker: {}",
+            path.display()
+        );
+    }
+    let report_complete = object
+        .get("success")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        && object
+            .get("post_import")
+            .and_then(|value| value.get("marker_verified"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    if report_complete {
+        return Ok(false);
+    }
+
+    object.insert("success".to_string(), json!(true));
+    object.insert("phase".to_string(), json!("already_applied_verified"));
+    object.insert("dry_run".to_string(), json!(false));
+    object.insert("idempotent_replay".to_string(), json!(true));
+    object.insert("completed_at_ms".to_string(), json!(now_ms()));
+    object.insert(
+        "import".to_string(),
+        json!({
+            "attempted": marker.record_count,
+            "inserted": 0,
+            "already_equal": marker.record_count,
+            "marker_written": true
+        }),
+    );
+    object.insert("post_import".to_string(), serde_json::to_value(postcheck)?);
+    object.insert("errors".to_string(), json!([]));
+    object.insert("recovered_from_marker".to_string(), json!(true));
+
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("stake-import-report.json");
+    let temp = path.with_file_name(format!(".{filename}.{}.tmp", std::process::id()));
+    fs::write(&temp, serde_json::to_vec_pretty(&report)?)?;
+    fs::rename(&temp, path)?;
+    Ok(true)
+}
+
 impl LocalDaemonService {
     fn load_stake_import_marker(&self) -> Result<Option<StakeImportMarker>> {
         let migrations = self
@@ -1106,11 +1172,14 @@ impl LocalDaemonService {
                 );
             }
             let postcheck = self.verify_marker(&marker)?;
+            let report_path = PathBuf::from(&marker.report_path);
+            let report_repaired = repair_preliminary_report(&report_path, &marker, &postcheck)?;
             self.logger.info(format!(
-                "wallet-v2 stake import already applied source_sha256={} records={} postcheck_records={} report={}",
+                "wallet-v2 stake import already applied source_sha256={} records={} postcheck_records={} report_repaired={} report={}",
                 source_hash,
                 marker.record_count,
                 postcheck.records_verified,
+                report_repaired,
                 marker.report_path
             ));
             return Ok(StakeRedeemImportRunSummary {
@@ -1119,7 +1188,7 @@ impl LocalDaemonService {
                 record_count: marker.record_count,
                 active_count: marker.initial_active_count,
                 spent_count: marker.initial_spent_count,
-                report_path: PathBuf::from(marker.report_path),
+                report_path,
             });
         }
 
@@ -1263,6 +1332,77 @@ impl LocalDaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_parser_rejects_duplicate_transfer_ids() {
+        let sql = concat!(
+            "INSERT INTO \"public\".\"transfer\" VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', NULL, NULL, NULL, NULL, 2, 2, 100, NULL, NULL);\n",
+            "INSERT INTO \"public\".\"transfer\" VALUES (1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', NULL, NULL, NULL, NULL, 2, 2, 100, NULL, NULL);\n"
+        );
+        let error = parse_sql(std::io::Cursor::new(sql), "duplicate.sql".to_string())
+            .expect_err("duplicate transfer ids must not be silently overwritten");
+        assert!(error
+            .to_string()
+            .contains("duplicate transfer.id at line 2"));
+    }
+
+    #[test]
+    fn preliminary_report_is_repaired_from_committed_marker() {
+        let path = std::env::temp_dir().join(format!(
+            "stake-import-report-repair-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "success": false,
+                "phase": "prechecked",
+                "source_sha256": source_sha256,
+                "post_import": { "marker_verified": false },
+                "errors": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let marker = StakeImportMarker {
+            schema_version: IMPORT_SCHEMA_VERSION,
+            source_sha256: source_sha256.to_string(),
+            source_member: "wallet-v2.sql".to_string(),
+            imported_at_ms: 1,
+            record_count: 358,
+            initial_active_count: 116,
+            initial_spent_count: 242,
+            immutable_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            outpoints: Vec::new(),
+            report_path: path.display().to_string(),
+        };
+        let postcheck = PostImportReport {
+            records_verified: 358,
+            indexes_verified: 358,
+            immutable_digest_matches: true,
+            marker_verified: true,
+        };
+
+        assert!(repair_preliminary_report(&path, &marker, &postcheck).unwrap());
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["success"], json!(true));
+        assert_eq!(repaired["phase"], json!("already_applied_verified"));
+        assert_eq!(repaired["idempotent_replay"], json!(true));
+        assert_eq!(repaired["import"]["attempted"], json!(358));
+        assert_eq!(repaired["import"]["already_equal"], json!(358));
+        assert_eq!(repaired["post_import"]["marker_verified"], json!(true));
+        assert_eq!(repaired["recovered_from_marker"], json!(true));
+        assert!(!repair_preliminary_report(&path, &marker, &postcheck).unwrap());
+
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn selected_sql_parser_handles_commas_null_and_doubled_quotes() {
