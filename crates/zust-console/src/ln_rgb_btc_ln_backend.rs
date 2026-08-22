@@ -452,6 +452,31 @@ struct ElectrumTxSync {
     confirmed_txs: Mutex<HashMap<Txid, (u32, BlockHash)>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelevantTxConfirmation {
+    Confirmed,
+    Reorged,
+    Unverified,
+}
+
+fn relevant_tx_reorged(expected_hash: Option<BlockHash>, current_hash: BlockHash) -> bool {
+    expected_hash.is_some_and(|expected_hash| expected_hash != current_hash)
+}
+
+fn notify_transaction_unconfirmed(
+    confirmed_txs: &Mutex<HashMap<Txid, (u32, BlockHash)>>,
+    confirmables: &[&(dyn Confirm + Sync + Send)],
+    txid: Txid,
+) {
+    confirmed_txs
+        .lock()
+        .expect("ln-rgb confirmed tx lock poisoned")
+        .remove(&txid);
+    for confirmable in confirmables {
+        confirmable.transaction_unconfirmed(&txid);
+    }
+}
+
 impl ElectrumTxSync {
     fn new(config: ElectrumConfig) -> Self {
         Self {
@@ -491,24 +516,54 @@ impl ElectrumTxSync {
             .flat_map(|confirmable| confirmable.get_relevant_txids())
             .filter(|(txid, height, _)| seen_confirmations.insert((*txid, *height)))
             .collect::<Vec<_>>();
+        let mut relevant_updates = Vec::new();
         for (txid, height, expected_hash) in relevant {
-            if self.confirm_relevant_tx(&confirmables, txid, height, expected_hash)? {
+            let confirmation =
+                self.confirm_relevant_tx(&confirmables, txid, height, expected_hash)?;
+            if confirmation == RelevantTxConfirmation::Confirmed {
                 continue;
             }
-            match electrum_transaction_status(&self.config, txid) {
-                Ok(Some(status)) if status.confirmed && status.block_hash == expected_hash => {}
+            relevant_updates.push((
+                txid,
+                height,
+                confirmation,
+                electrum_transaction_status(&self.config, txid),
+            ));
+        }
+
+        // LDK requires all unconfirmations in a reorg to be delivered before any transaction is
+        // reconfirmed in its replacement block.
+        for (txid, _, confirmation, status) in &relevant_updates {
+            let will_reconfirm = matches!(status, Ok(Some(status)) if status.confirmed);
+            if *confirmation == RelevantTxConfirmation::Reorged || will_reconfirm {
+                notify_transaction_unconfirmed(&self.confirmed_txs, &confirmables, *txid);
+            }
+        }
+        for (txid, height, confirmation, status) in relevant_updates {
+            match status {
                 Ok(Some(status)) if status.confirmed => {
-                    for confirmable in &confirmables {
-                        confirmable.transaction_unconfirmed(&txid);
-                    }
                     self.confirm_tx(&confirmables, status)?;
                 }
-                Ok(_) => ln_rgb_log_line(&format!(
-                    "[ln-rgb] Electrum could not verify relevant tx {txid} at height {height}; keeping existing LDK confirmation state"
-                )),
-                Err(err) => ln_rgb_log_line(&format!(
-                    "[ln-rgb] Electrum status lookup failed for relevant tx {txid} at height {height}: {err:#}; keeping existing LDK confirmation state"
-                )),
+                Ok(_) if confirmation == RelevantTxConfirmation::Reorged => {
+                    ln_rgb_log_line(&format!(
+                        "[ln-rgb] Electrum relevant tx {txid} was reorganized out of height {height} and is currently unconfirmed"
+                    ));
+                }
+                Ok(_) => {
+                    ln_rgb_log_line(&format!(
+                        "[ln-rgb] Electrum could not verify relevant tx {txid} at height {height}; keeping existing LDK confirmation state"
+                    ));
+                }
+                Err(err) if confirmation == RelevantTxConfirmation::Reorged => {
+                    ln_rgb_log_line(&format!(
+                        "[ln-rgb] Electrum relevant tx {txid} was reorganized out of height {height}; status lookup failed after LDK was notified: {err:#}"
+                    ));
+                }
+                Err(err) => {
+                    ln_rgb_log_line(&format!(
+                        "[ln-rgb] Electrum status lookup failed for relevant tx {txid} at height {height}: {err:#}; keeping existing LDK confirmation state"
+                    ));
+                }
             }
         }
 
@@ -537,7 +592,9 @@ impl ElectrumTxSync {
                             confirmed_from_history = true;
                             break;
                         }
-                        if self.confirm_relevant_tx(&confirmables, txid, height, None)? {
+                        if self.confirm_relevant_tx(&confirmables, txid, height, None)?
+                            == RelevantTxConfirmation::Confirmed
+                        {
                             confirmed_from_history = true;
                             break;
                         }
@@ -600,16 +657,14 @@ impl ElectrumTxSync {
         txid: Txid,
         height: u32,
         expected_hash: Option<BlockHash>,
-    ) -> Result<bool> {
+    ) -> Result<RelevantTxConfirmation> {
         if height == 0 {
-            return Ok(false);
+            return Ok(RelevantTxConfirmation::Unverified);
         }
         let header = electrum_block_header(&self.config, height)
             .with_context(|| format!("fetch Electrum block header at {height}"))?;
-        if let Some(expected_hash) = expected_hash {
-            if header.block_hash() != expected_hash {
-                return Ok(false);
-            }
+        if relevant_tx_reorged(expected_hash, header.block_hash()) {
+            return Ok(RelevantTxConfirmation::Reorged);
         }
         let tx = match electrum_get_transaction(&self.config, txid) {
             Ok(tx) => tx,
@@ -617,14 +672,14 @@ impl ElectrumTxSync {
                 ln_rgb_log_line(&format!(
                     "[ln-rgb] Electrum could not fetch relevant tx {txid} at height {height}: {err:#}"
                 ));
-                return Ok(false);
+                return Ok(RelevantTxConfirmation::Unverified);
             }
         };
         if tx.compute_txid() != txid {
-            return Ok(false);
+            return Ok(RelevantTxConfirmation::Unverified);
         }
         if !self.mark_confirmation_seen(txid, height, header.block_hash()) {
-            return Ok(true);
+            return Ok(RelevantTxConfirmation::Confirmed);
         }
         let position =
             crate::local_wallet::electrum_transaction_position(&self.config, txid, height)
@@ -633,7 +688,7 @@ impl ElectrumTxSync {
         for confirmable in confirmables {
             confirmable.transactions_confirmed(&header, &txdata, height);
         }
-        Ok(true)
+        Ok(RelevantTxConfirmation::Confirmed)
     }
 
     fn confirm_watched_output_spends(
@@ -6165,21 +6220,26 @@ fn now_nanos() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bitcoin::absolute::LockTime;
+    use bitcoin::block::Header;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
-    use bitcoin::{Amount, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+    use bitcoin::{Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
     use lightning::chain::channelmonitor::BalanceSource;
-    use lightning::chain::transaction::OutPoint as LdkOutPoint;
+    use lightning::chain::transaction::{OutPoint as LdkOutPoint, TransactionData};
+    use lightning::chain::Confirm;
     use lightning::ln::types::ChannelId as LnRgbChannelId;
     use lightning::sign::SpendableOutputDescriptor;
 
     use super::{
-        hex32, now_secs, LnRgbBtcLnBackend, LnRgbChannelOpenRequest, PaymentHash, PaymentId,
+        hex32, notify_transaction_unconfirmed, now_secs, relevant_tx_reorged,
+        LnRgbBtcLnBackend, LnRgbChannelOpenRequest, PaymentHash, PaymentId,
         PendingFundingTransaction, RgbFundingOutpointBinding, RgbFundingRef,
         RgbPendingMaturityRecord,
     };
@@ -6190,6 +6250,71 @@ mod tests {
         BtcLnRuntimeConfig,
     };
     use crate::lnnode::{RgbAssetAmount, RgbChannelOpenRequest, RgbLnNode, RgbPaymentRequest};
+
+    #[derive(Default)]
+    struct RecordingConfirm {
+        unconfirmed: Mutex<Vec<Txid>>,
+    }
+
+    impl Confirm for RecordingConfirm {
+        fn transactions_confirmed(
+            &self,
+            _header: &Header,
+            _txdata: &TransactionData,
+            _height: u32,
+        ) {
+        }
+
+        fn transaction_unconfirmed(&self, txid: &Txid) {
+            self.unconfirmed
+                .lock()
+                .expect("recording confirm lock poisoned")
+                .push(*txid);
+        }
+
+        fn best_block_updated(&self, _header: &Header, _height: u32) {}
+
+        fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<BlockHash>)> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn electrum_reorg_detection_requires_changed_known_block_hash() {
+        let original_hash = BlockHash::from_byte_array([89; 32]);
+        let replacement_hash = BlockHash::from_byte_array([90; 32]);
+
+        assert!(relevant_tx_reorged(
+            Some(original_hash),
+            replacement_hash
+        ));
+        assert!(!relevant_tx_reorged(Some(original_hash), original_hash));
+        assert!(!relevant_tx_reorged(None, replacement_hash));
+    }
+
+    #[test]
+    fn electrum_reorg_notification_clears_cache_and_notifies_ldk() {
+        let txid = Txid::from_byte_array([91; 32]);
+        let block_hash = BlockHash::from_byte_array([92; 32]);
+        let confirmed_txs = Mutex::new(HashMap::from([(txid, (100, block_hash))]));
+        let recorder = RecordingConfirm::default();
+        let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![&recorder];
+
+        notify_transaction_unconfirmed(&confirmed_txs, &confirmables, txid);
+
+        assert!(confirmed_txs
+            .lock()
+            .expect("confirmed tx lock poisoned")
+            .is_empty());
+        assert_eq!(
+            recorder
+                .unconfirmed
+                .lock()
+                .expect("recording confirm lock poisoned")
+                .as_slice(),
+            &[txid]
+        );
+    }
 
     #[test]
     fn derives_stable_node_id_from_runtime_config() {
