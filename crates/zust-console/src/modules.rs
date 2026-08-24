@@ -1756,6 +1756,25 @@ extern "C" fn btc_scan_deposits_batch(input: *const Dynamic) -> *const Dynamic {
         ensure!(!requests.is_empty(), "BTC scan batch must not be empty");
 
         let request_count = requests.len();
+        if let Some(source) = btc_esplora_urls()
+            .into_iter()
+            .find(|source| is_electrum_chain_source(source.trim_end_matches('/')))
+        {
+            if let Ok(results) = btc_scan_deposits_electrum_batch(
+                &requests,
+                source.trim_end_matches('/'),
+                std::time::Duration::from_secs(ADDRESS_TIMEOUT_SECS),
+            ) {
+                return Ok(btc_scan_deposits_batch_result(
+                    request_count,
+                    1,
+                    ADDRESS_TIMEOUT_SECS,
+                    results,
+                    "electrum_pipeline",
+                ));
+            }
+        }
+
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             requests.into_iter().collect::<std::collections::VecDeque<_>>(),
         ));
@@ -1802,40 +1821,55 @@ extern "C" fn btc_scan_deposits_batch(input: *const Dynamic) -> *const Dynamic {
         }
         drop(sender);
 
-        let mut indexed_results = receiver.into_iter().collect::<Vec<_>>();
-        indexed_results.sort_by_key(|(index, _)| *index);
-        let mut deposits = Vec::new();
-        let mut failed_addresses = 0usize;
-        let results = indexed_results
-            .into_iter()
-            .map(|(_, result)| {
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    if let Some(items) = result
-                        .get("scan")
-                        .and_then(|scan| scan.get("deposits"))
-                        .and_then(Value::as_array)
-                    {
-                        deposits.extend(items.iter().cloned());
-                    }
-                } else {
-                    failed_addresses += 1;
-                }
-                result
-            })
-            .collect::<Vec<_>>();
-
-        Ok(json_to_dynamic(&json!({
-            "module": "btc",
-            "ok": true,
-            "concurrency": worker_count,
-            "address_timeout_secs": ADDRESS_TIMEOUT_SECS,
-            "scanned_addresses": request_count,
-            "successful_addresses": request_count.saturating_sub(failed_addresses),
-            "failed_addresses": failed_addresses,
-            "deposits": deposits,
-            "results": results
-        })))
+        Ok(btc_scan_deposits_batch_result(
+            request_count,
+            worker_count,
+            ADDRESS_TIMEOUT_SECS,
+            receiver.into_iter().collect(),
+            "parallel_address_fallback",
+        ))
     })
+}
+
+fn btc_scan_deposits_batch_result(
+    request_count: usize,
+    concurrency: usize,
+    address_timeout_secs: u64,
+    mut indexed_results: Vec<(usize, Value)>,
+    strategy: &str,
+) -> Dynamic {
+    indexed_results.sort_by_key(|(index, _)| *index);
+    let mut deposits = Vec::new();
+    let mut failed_addresses = 0usize;
+    let results = indexed_results
+        .into_iter()
+        .map(|(_, result)| {
+            if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                if let Some(items) = result
+                    .get("scan")
+                    .and_then(|scan| scan.get("deposits"))
+                    .and_then(Value::as_array)
+                {
+                    deposits.extend(items.iter().cloned());
+                }
+            } else {
+                failed_addresses += 1;
+            }
+            result
+        })
+        .collect::<Vec<_>>();
+    json_to_dynamic(&json!({
+        "module": "btc",
+        "ok": true,
+        "strategy": strategy,
+        "concurrency": concurrency,
+        "address_timeout_secs": address_timeout_secs,
+        "scanned_addresses": request_count,
+        "successful_addresses": request_count.saturating_sub(failed_addresses),
+        "failed_addresses": failed_addresses,
+        "deposits": deposits,
+        "results": results
+    }))
 }
 
 extern "C" fn btc_scan_ident_deposits(input: *const Dynamic) -> *const Dynamic {
@@ -7138,6 +7172,246 @@ fn electrum_rpc_with_deadline(
         .get("result")
         .cloned()
         .context("Electrum response missing result")
+}
+
+fn electrum_rpc_pipeline_with_deadline(
+    source: &str,
+    calls: &[(u64, String, Value)],
+    deadline: std::time::Instant,
+) -> Result<std::collections::HashMap<u64, std::result::Result<Value, String>>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    let endpoint = electrum_endpoint(source)?;
+    let address = endpoint
+        .to_socket_addrs()
+        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
+        .next()
+        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
+    let connect_timeout = remaining.min(Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS));
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
+        .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
+    stream
+        .set_read_timeout(Some(remaining))
+        .context("set Electrum pipeline read timeout")?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .context("set Electrum pipeline write timeout")?;
+    for (id, method, params) in calls {
+        let request = json!({"id": id, "method": method, "params": params});
+        let request_line = format!("{}\n", serde_json::to_string(&request)?);
+        stream
+            .write_all(request_line.as_bytes())
+            .with_context(|| format!("write Electrum pipeline request {method} to {endpoint}"))?;
+    }
+    stream
+        .flush()
+        .with_context(|| format!("flush Electrum pipeline to {endpoint}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut responses = std::collections::HashMap::new();
+    while responses.len() < calls.len() {
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .with_context(|| format!("read Electrum pipeline response from {endpoint}"))?;
+        ensure!(!response_line.trim().is_empty(), "empty Electrum pipeline response from {endpoint}");
+        let response: Value = serde_json::from_str(&response_line)
+            .with_context(|| format!("decode Electrum pipeline response: {response_line}"))?;
+        let id = response
+            .get("id")
+            .and_then(Value::as_u64)
+            .context("Electrum pipeline response missing numeric id")?;
+        let result = if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            Err(format!("{error}"))
+        } else {
+            response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| "Electrum response missing result".to_string())
+        };
+        responses.insert(id, result);
+    }
+    Ok(responses)
+}
+
+fn btc_scan_deposits_electrum_batch(
+    requests: &[(usize, String, String)],
+    source: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<(usize, Value)>> {
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    let network = parse_ln_network(&ln_rgb_network_name())?;
+    let mut results = Vec::new();
+    let mut valid = Vec::new();
+    for (index, ident, address) in requests {
+        match Address::from_str(address)
+            .with_context(|| format!("invalid BTC deposit address: {address}"))
+            .and_then(|address| {
+                address
+                    .clone()
+                    .require_network(network)
+                    .with_context(|| format!("deposit address is not for {network:?}: {address:?}"))
+            }) {
+            Ok(parsed) => valid.push((*index, ident.clone(), address.clone(), parsed.script_pubkey())),
+            Err(error) => results.push((*index, json!({
+                "ok": false,
+                "ident": ident,
+                "address": address,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "error": format!("{error:#}")
+            }))),
+        }
+    }
+    if valid.is_empty() {
+        return Ok(results);
+    }
+
+    const TIP_CALL_ID: u64 = 1;
+    const ADDRESS_CALL_ID_BASE: u64 = 10;
+    let mut calls = vec![(
+        TIP_CALL_ID,
+        "blockchain.headers.subscribe".to_string(),
+        json!([]),
+    )];
+    for (position, (_, _, _, script)) in valid.iter().enumerate() {
+        calls.push((
+            ADDRESS_CALL_ID_BASE + position as u64,
+            "blockchain.scripthash.listunspent".to_string(),
+            json!([electrum_script_hash_hex(script)]),
+        ));
+    }
+    let address_responses = electrum_rpc_pipeline_with_deadline(source, &calls, deadline)?;
+    let tip_height = address_responses
+        .get(&TIP_CALL_ID)
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|header| header.get("height"))
+        .and_then(Value::as_u64)
+        .context("Electrum batch tip query failed")?;
+
+    let mut unspents_by_position = std::collections::HashMap::new();
+    let mut txids = std::collections::BTreeSet::new();
+    for (position, _) in valid.iter().enumerate() {
+        let call_id = ADDRESS_CALL_ID_BASE + position as u64;
+        match address_responses.get(&call_id) {
+            Some(Ok(unspents)) => {
+                for item in unspents.as_array().cloned().unwrap_or_default() {
+                    if let Some(txid) = item.get("tx_hash").and_then(Value::as_str) {
+                        if !txid.is_empty() {
+                            txids.insert(txid.to_string());
+                        }
+                    }
+                }
+                unspents_by_position.insert(position, Ok(unspents.clone()));
+            }
+            Some(Err(error)) => {
+                unspents_by_position.insert(position, Err(error.clone()));
+            }
+            None => {
+                unspents_by_position.insert(position, Err("missing Electrum listunspent response".to_string()));
+            }
+        }
+    }
+
+    const TX_CALL_ID_BASE: u64 = 1_000_000;
+    let txid_list = txids.into_iter().collect::<Vec<_>>();
+    let tx_calls = txid_list
+        .iter()
+        .enumerate()
+        .map(|(position, txid)| (
+            TX_CALL_ID_BASE + position as u64,
+            "blockchain.transaction.get".to_string(),
+            json!([txid]),
+        ))
+        .collect::<Vec<_>>();
+    let tx_responses = if tx_calls.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        electrum_rpc_pipeline_with_deadline(source, &tx_calls, deadline)?
+    };
+    let tx_call_ids = txid_list
+        .iter()
+        .enumerate()
+        .map(|(position, txid)| (txid.clone(), TX_CALL_ID_BASE + position as u64))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for (position, (index, ident, address, script)) in valid.into_iter().enumerate() {
+        let scan = (|| -> Result<Value> {
+            let unspents = unspents_by_position
+                .remove(&position)
+                .context("missing Electrum address result")?
+                .map_err(anyhow::Error::msg)?;
+            let mut txs = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for item in unspents.as_array().cloned().unwrap_or_default() {
+                let txid = item.get("tx_hash").and_then(Value::as_str).unwrap_or_default();
+                if txid.is_empty() || !seen.insert(txid.to_string()) {
+                    continue;
+                }
+                let call_id = tx_call_ids.get(txid).context("missing Electrum transaction call")?;
+                let raw = tx_responses
+                    .get(call_id)
+                    .context("missing Electrum transaction response")?
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!(error.clone()))?;
+                let raw_hex = raw
+                    .as_str()
+                    .with_context(|| format!("Electrum transaction.get returned non-string for {txid}"))?;
+                let tx: Transaction = encode::deserialize(&hex_to_bytes(raw_hex)?)
+                    .with_context(|| format!("decode Electrum raw transaction {txid}"))?;
+                let block_height = item
+                    .get("height")
+                    .and_then(Value::as_i64)
+                    .filter(|height| *height > 0)
+                    .map(|height| height as u64);
+                let vout = tx.output.iter().enumerate().map(|(n, output)| {
+                    let output_address = if output.script_pubkey == script {
+                        address.clone()
+                    } else {
+                        Address::from_script(&output.script_pubkey, network)
+                            .map(|address| address.to_string())
+                            .unwrap_or_default()
+                    };
+                    json!({
+                        "n": n,
+                        "scriptpubkey": bytes_to_hex(output.script_pubkey.as_bytes()),
+                        "scriptpubkey_address": output_address,
+                        "value": output.value.to_sat()
+                    })
+                }).collect::<Vec<_>>();
+                txs.push(json!({
+                    "txid": txid,
+                    "vout": vout,
+                    "status": {"confirmed": block_height.is_some(), "block_height": block_height}
+                }));
+            }
+            let utxos = unspents.as_array().cloned().unwrap_or_default().into_iter().filter_map(|utxo| {
+                let txid = utxo.get("tx_hash")?.as_str()?.to_string();
+                let block_height = utxo.get("height").and_then(Value::as_i64).filter(|height| *height > 0).map(|height| height as u64);
+                Some(json!({
+                    "txid": txid,
+                    "vout": utxo.get("tx_pos").and_then(Value::as_u64).unwrap_or_default(),
+                    "value": utxo.get("value").and_then(Value::as_u64).unwrap_or_default(),
+                    "status": {"confirmed": block_height.is_some(), "block_height": block_height}
+                }))
+            }).collect::<Vec<_>>();
+            btc_scan_deposit_records_from_chain_data(
+                &ident,
+                &address,
+                source,
+                tip_height,
+                Value::Array(txs),
+                Value::Array(utxos),
+            )
+        })();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        results.push((index, match scan {
+            Ok(scan) => json!({"ok": true, "ident": ident, "address": address, "elapsed_ms": elapsed_ms, "scan": scan}),
+            Err(error) => json!({"ok": false, "ident": ident, "address": address, "elapsed_ms": elapsed_ms, "error": format!("{error:#}")}),
+        }));
+    }
+    Ok(results)
 }
 
 fn btc_timed_esplora_json(url: &str, deadline: std::time::Instant) -> Result<Value> {
