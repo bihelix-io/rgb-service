@@ -1057,6 +1057,13 @@ fn register_rgb_module(vm: &Vm) -> Result<()> {
     )?;
     jit.add_native_module_ptr(
         "rgb",
+        "assets_by_utxos_sync",
+        &[Type::Any],
+        Type::Any,
+        rgb_assets_by_utxos_sync as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "rgb",
         "assert_psbt_no_assets",
         &[Type::Str],
         Type::Any,
@@ -4654,6 +4661,63 @@ extern "C" fn rgb_assets_by_utxo_sync(
         Ok(json_to_dynamic(&rgb_assets_by_utxo_json(
             outpoint, address, confirmed,
         )?))
+    })
+}
+
+extern "C" fn rgb_assets_by_utxos_sync(requests: *const Dynamic) -> *const Dynamic {
+    let requests = unsafe { &*requests };
+    native_result(|| {
+        let request_json = dynamic_to_json(requests);
+        let request_items = request_json
+            .as_array()
+            .context("RGB daemon batch UTXO query requests must be an array")?;
+        for (index, request) in request_items.iter().enumerate() {
+            ensure!(
+                request.get("account_id").and_then(Value::as_str).is_some(),
+                "RGB daemon batch UTXO query request {index} missing account_id"
+            );
+            ensure!(
+                request.get("outpoint").and_then(Value::as_str).is_some(),
+                "RGB daemon batch UTXO query request {index} missing outpoint"
+            );
+        }
+        let response = dynamic_to_json(&rgb_public_post_dynamic(
+            requests,
+            "/v1/assets/by-utxo",
+        )?);
+        let response_items = response
+            .as_array()
+            .context("RGB daemon batch UTXO query response must be an array")?;
+        ensure!(
+            response_items.len() == request_items.len(),
+            "RGB daemon batch UTXO query response length mismatch: requested={} returned={}",
+            request_items.len(),
+            response_items.len()
+        );
+        for (index, (request, response)) in request_items
+            .iter()
+            .zip(response_items.iter())
+            .enumerate()
+        {
+            let requested_outpoint = request
+                .get("outpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let returned_outpoint = response
+                .get("outpoint")
+                .and_then(Value::as_str)
+                .with_context(|| {
+                    format!("RGB daemon batch UTXO query response {index} missing outpoint")
+                })?;
+            ensure!(
+                returned_outpoint == requested_outpoint,
+                "RGB daemon batch UTXO query response {index} mismatched outpoint: requested={requested_outpoint} returned={returned_outpoint}"
+            );
+        }
+        Ok(json_to_dynamic(&json!({
+            "ok": true,
+            "results": response_items
+        })))
     })
 }
 
