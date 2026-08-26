@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::{
@@ -132,9 +132,34 @@ async fn list_assets(
 
 async fn assets_by_utxo(
     State(state): State<ApiState>,
-    Json(req): Json<UtxoAssetsRequest>,
-) -> Result<Json<UtxoAssetsResponse>, HttpError> {
-    Ok(Json(state.service.assets_by_utxo(req).await?))
+    Json(req): Json<UtxoAssetsRequestBody>,
+) -> Result<Json<UtxoAssetsResponseBody>, HttpError> {
+    match req {
+        UtxoAssetsRequestBody::Single(req) => Ok(Json(UtxoAssetsResponseBody::Single(
+            state.service.assets_by_utxo(req).await?,
+        ))),
+        UtxoAssetsRequestBody::Batch(requests) => {
+            let mut responses = Vec::with_capacity(requests.len());
+            for req in requests {
+                responses.push(state.service.assets_by_utxo(req).await?);
+            }
+            Ok(Json(UtxoAssetsResponseBody::Batch(responses)))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UtxoAssetsRequestBody {
+    Single(UtxoAssetsRequest),
+    Batch(Vec<UtxoAssetsRequest>),
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum UtxoAssetsResponseBody {
+    Single(UtxoAssetsResponse),
+    Batch(Vec<UtxoAssetsResponse>),
 }
 
 async fn token_list(State(state): State<ApiState>) -> Result<Json<TokenListResponse>, HttpError> {

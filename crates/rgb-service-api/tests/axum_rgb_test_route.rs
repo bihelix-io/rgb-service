@@ -278,6 +278,45 @@ async fn assets_by_utxo_route_returns_allocations_for_outpoint() {
 }
 
 #[tokio::test]
+async fn assets_by_utxo_route_accepts_and_returns_ordered_batch() {
+    let app = router(Arc::new(TestRgbService), Arc::new(AllowAllAuth));
+    let first_outpoint =
+        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:0".to_string();
+    let second_outpoint =
+        "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1".to_string();
+    let requests = vec![
+        UtxoAssetsRequest {
+            account_id: account("alice"),
+            outpoint: first_outpoint.clone(),
+            address: Some("bc1qalice".to_string()),
+            confirmed: true,
+        },
+        UtxoAssetsRequest {
+            account_id: account("bob"),
+            outpoint: second_outpoint.clone(),
+            address: Some("bc1qbob".to_string()),
+            confirmed: false,
+        },
+    ];
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/assets/by-utxo")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&requests).unwrap()))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let responses: Vec<UtxoAssetsResponse> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0].account_id, account("alice"));
+    assert_eq!(responses[0].outpoint, first_outpoint);
+    assert_eq!(responses[1].account_id, account("bob"));
+    assert_eq!(responses[1].outpoint, second_outpoint);
+}
+
+#[tokio::test]
 async fn rgb_test_route_returns_full_lifecycle_report() {
     let app = router(Arc::new(TestRgbService), Arc::new(AllowAllAuth));
     let signed = SignedRequest {

@@ -61,8 +61,9 @@ POST /v1/test/rgb
 ```
 
 `POST /v1/assets/by-utxo` 是只读接口，直接接收 JSON，不要求请求签名，也不扣 RNA。
-请求包含 `account_id`、`outpoint`、可选 `address` 和 `confirmed`；响应包含
-daemon stock 中该 outpoint 的 `assets` 元数据及 `allocations`。该接口只查询已经由
+单个请求包含 `account_id`、`outpoint`、可选 `address` 和 `confirmed`，响应为单个对象；
+也可以提交由相同请求对象组成的 JSON 数组，响应为保持输入顺序的对象数组。响应包含
+daemon stock 中对应 outpoint 的 `assets` 元数据及 `allocations`。该接口只查询已经由
 daemon 接受并验证的 RGB 状态，不导入 consignment，也不根据 BTC dust 猜测 RGB 入账。
 
 普通 L1 RGB pending/recovery 由 daemon 后台 scanner 自动推进，不暴露

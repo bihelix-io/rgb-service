@@ -367,6 +367,9 @@ The response returns `assets` and `allocations`. Allocations come exclusively fr
 account RGB stock after consignment acceptance; an ordinary BTC UTXO with no RGB assignment
 returns empty arrays.
 
+The route also accepts a JSON array of the same payload. An array request returns an array of
+responses in the same order; a single-object request continues to return a single object.
+
 `prepare` and `commit` also require `AssetSpendAuthorization`.
 
 The service uses direct send: sender prepares and commits the transfer, and
