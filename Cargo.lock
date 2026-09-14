@@ -7170,6 +7170,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tracing",
  "zust-dynamic",
  "zust-root",
  "zust-vm",

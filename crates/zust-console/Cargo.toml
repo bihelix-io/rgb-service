@@ -48,4 +48,5 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 strict_types = { package = "rgb-strict-types", version = "~1.0.1", features = ["serde"] }
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "time"] }
+tracing = "0.1"
 vm = { workspace = true }

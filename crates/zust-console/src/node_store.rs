@@ -148,6 +148,15 @@ impl LocalNodeStore {
             })
     }
 
+    pub fn get_btc_address_pool_record(&self, address: &str) -> Result<Option<Value>> {
+        let Some(bytes) = self.get_bytes(BTC_ADDRESS_POOL_PARTITION, address)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode BTC address pool record `{address}`"))
+            .map(Some)
+    }
+
     pub fn put_btc_address_pool_record(&self, address: &str, record: &Value) -> Result<()> {
         let bytes = serde_json::to_vec(record).context("encode BTC address pool record")?;
         self.put_bytes(BTC_ADDRESS_POOL_PARTITION, address, &bytes)
@@ -181,6 +190,15 @@ impl LocalNodeStore {
             format!("remove local Fjall key `{address}` from `{BTC_ADDRESS_POOL_PARTITION}`")
         })?;
         self.persist()
+    }
+
+    pub fn get_used_btc_address_pool_record(&self, address: &str) -> Result<Option<Value>> {
+        let Some(bytes) = self.get_bytes(BTC_ADDRESS_POOL_USED_PARTITION, address)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode used BTC address pool record `{address}`"))
+            .map(Some)
     }
 
     pub fn put_used_btc_address_pool_record(&self, address: &str, record: &Value) -> Result<()> {

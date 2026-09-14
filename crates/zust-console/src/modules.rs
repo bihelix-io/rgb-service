@@ -4,12 +4,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, SyncSender, TrySendError},
     Arc, Mutex, OnceLock,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::btc_ln::{
     BtcLnBackendKind, BtcLnBolt11InvoiceRequest, BtcLnBolt11PaymentRequest,
@@ -72,6 +72,12 @@ static RGB_CALLBACK_QUEUE: OnceLock<std::result::Result<SyncSender<RgbCallbackJo
     OnceLock::new();
 static LN_STARTED: AtomicBool = AtomicBool::new(false);
 static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
+static BTC_CONSOLIDATION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+const BTC_CONSOLIDATION_CHAIN_CONCURRENCY: usize = 5;
+
+#[cfg(test)]
+#[path = "consolidation_regression.rs"]
+mod consolidation_regression;
 
 pub(crate) fn daemon_url() -> Result<String> {
     let daemon_url =
@@ -458,16 +464,10 @@ fn refill_btc_address_pool_to_target(store: &LocalNodeStore, purpose: &str) -> R
 }
 
 fn btc_address_pool_record_for(store: &LocalNodeStore, address: &str) -> Result<Option<Value>> {
-    for (record_address, record) in store
-        .list_used_btc_address_pool_records()?
-        .into_iter()
-        .chain(store.list_btc_address_pool_records()?)
-    {
-        if record_address == address {
-            return Ok(Some(record));
-        }
+    if let Some(record) = store.get_used_btc_address_pool_record(address)? {
+        return Ok(Some(record));
     }
-    Ok(None)
+    store.get_btc_address_pool_record(address)
 }
 
 fn btc_xpub_lookup_limit() -> u32 {
@@ -3587,6 +3587,154 @@ extern "C" fn btc_prepare_sweep_with_inputs(
     })
 }
 
+fn consolidation_native_result(
+    operation: &'static str,
+    f: impl FnOnce() -> Result<Dynamic>,
+) -> *const Dynamic {
+    let trace_id = BTC_CONSOLIDATION_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::info_span!("btc_consolidation", operation, trace_id);
+    let _entered = span.enter();
+    let started = Instant::now();
+    tracing::info!("BTC consolidation stage started");
+    native_result(|| {
+        let result = f();
+        match &result {
+            Ok(_) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "BTC consolidation stage completed"
+            ),
+            Err(error) => tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %format!("{error:#}"),
+                "BTC consolidation stage failed"
+            ),
+        }
+        result
+    })
+}
+
+fn consolidation_live_utxos(
+    input_items: &[Value],
+    sources: &[String],
+) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
+    // Configuration is supplied by the caller. Workers perform only blocking
+    // chain I/O, without accessing a thread-local script/runtime context.
+    ensure!(!sources.is_empty(), "BTC consolidation chain source is not configured");
+    let mut addresses = BTreeSet::new();
+    for item in input_items {
+        let address = item
+            .get("address")
+            .or_else(|| item.get("deposit_address"))
+            .and_then(Value::as_str)
+            .context("consolidation input missing address")?
+            .trim();
+        Address::from_str(address)
+            .with_context(|| format!("invalid input BTC address: {address}"))?
+            .require_network(Network::Bitcoin)
+            .context("consolidation input address is not mainnet")?;
+        addresses.insert(address.to_string());
+    }
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
+    let started = Instant::now();
+    tracing::info!(
+        stage = "chain_utxos", address_count = addresses.len(),
+        concurrency = BTC_CONSOLIDATION_CHAIN_CONCURRENCY,
+        "BTC consolidation chain check started"
+    );
+    let mut results = BTreeMap::new();
+    for batch in addresses.chunks(BTC_CONSOLIDATION_CHAIN_CONCURRENCY) {
+        let fetched = thread::scope(|scope| -> Result<Vec<(String, BTreeMap<String, u64>)>> {
+            let mut workers = Vec::new();
+            for address in batch {
+                let sources = &sources;
+                let span = tracing::Span::current();
+                workers.push(thread::Builder::new()
+                    .name("btc-consolidation-chain".to_string())
+                    .spawn_scoped(scope, move || -> Result<(String, BTreeMap<String, u64>)> {
+                        let _entered = span.enter();
+                        let started = Instant::now();
+                        let result = (|| -> Result<BTreeMap<String, u64>> {
+                            let mut failures = Vec::new();
+                            for (source_index, source) in sources.iter().enumerate() {
+                                let response = if is_electrum_chain_source(source) {
+                                    electrum_address_utxos_json(address, source)
+                                } else {
+                                    esplora_get_json(&format!(
+                                        "{}/address/{address}/utxo", source.trim_end_matches('/')
+                                    ))
+                                };
+                                let response = match response {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        failures.push(format!("source[{source_index}]: {error:#}"));
+                                        continue;
+                                    }
+                                };
+                                // A malformed response is not evidence that an
+                                // address has no spendable UTXOs: fail closed.
+                                let items = response.as_array()
+                                    .context("consolidation chain UTXO response must be an array")?;
+                                let mut utxos = BTreeMap::new();
+                                for item in items {
+                                    if item.get("status")
+                                        .and_then(|status| status.get("confirmed"))
+                                        .and_then(Value::as_bool) != Some(true) {
+                                        continue;
+                                    }
+                                    let txid = item.get("txid").and_then(Value::as_str)
+                                        .context("consolidation chain UTXO missing txid")?;
+                                    let vout = item.get("vout").and_then(Value::as_u64)
+                                        .context("consolidation chain UTXO missing vout")?;
+                                    let value = item.get("value").and_then(Value::as_u64)
+                                        .context("consolidation chain UTXO missing value")?;
+                                    utxos.insert(format!("{txid}:{vout}"), value);
+                                }
+                                return Ok(utxos);
+                            }
+                            bail!("all consolidation chain sources failed: {}", failures.join(" | "))
+                        })();
+                        match &result {
+                            Ok(utxos) => tracing::info!(
+                                stage = "chain_utxos", address = %address,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                utxo_count = utxos.len(), "BTC consolidation address check completed"
+                            ),
+                            Err(error) => tracing::warn!(
+                                stage = "chain_utxos", address = %address,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                error = %format!("{error:#}"), "BTC consolidation address check failed"
+                            ),
+                        }
+                        result.map(|utxos| (address.clone(), utxos))
+                    })
+                    .context("start consolidation chain worker")?);
+            }
+            // Join every worker even on failure; do not leave detached queries
+            // behind when the caller receives an error.
+            let mut completed = Vec::new();
+            let mut failure = None;
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(result)) => completed.push(result),
+                    Ok(Err(error)) => { if failure.is_none() { failure = Some(error); } },
+                    Err(_) => { if failure.is_none() {
+                        failure = Some(anyhow::anyhow!("consolidation chain worker panicked"));
+                    } },
+                }
+            }
+            if let Some(error) = failure { return Err(error); }
+            Ok(completed)
+        })?;
+        results.extend(fetched);
+    }
+    tracing::info!(
+        stage = "chain_utxos", address_count = results.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "BTC consolidation chain check completed"
+    );
+    Ok(results)
+}
+
 extern "C" fn btc_prepare_consolidation_psbt(
     recipient: *const Dynamic,
     fee_rate_sat_vb: u64,
@@ -3594,7 +3742,7 @@ extern "C" fn btc_prepare_consolidation_psbt(
 ) -> *const Dynamic {
     let recipient = unsafe { &*recipient };
     let inputs = unsafe { &*inputs };
-    native_result(|| {
+    consolidation_native_result("prepare_psbt", || {
         ensure!(recipient.is_str(), "recipient must be string");
         let recipient_address = recipient.as_str().trim().to_string();
         ensure!(
@@ -3623,7 +3771,10 @@ extern "C" fn btc_prepare_consolidation_psbt(
         let mut selected = Vec::new();
         let mut xpub_rejected_inputs = Vec::new();
         let mut chain_rejected_inputs = Vec::new();
-        let mut live_utxos_by_address = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        let live_utxos_by_address = consolidation_live_utxos(&input_items, &btc_esplora_urls())?;
+        let mut key_sources_by_address = BTreeMap::<
+            String, Option<(PublicKey, Fingerprint, DerivationPath)>
+        >::new();
         let mut selected_sats = 0u64;
         let mut seen = std::collections::BTreeSet::new();
         for (input_index, item) in input_items.into_iter().enumerate() {
@@ -3679,33 +3830,6 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 confirmed,
                 "consolidation input must be confirmed: {outpoint}"
             );
-            if !live_utxos_by_address.contains_key(&address) {
-                let chain_source = btc_esplora_url();
-                let live_utxos = btc_address_utxos_json(&address, &chain_source)
-                    .with_context(|| {
-                        format!(
-                            "fetch live consolidation UTXOs for input_index={input_index}; deposit_address={address}"
-                        )
-                    })?
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|utxo| {
-                        utxo.get("status")
-                            .and_then(|status| status.get("confirmed"))
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|utxo| {
-                        let txid = utxo.get("txid")?.as_str()?;
-                        let vout = utxo.get("vout")?.as_u64()?;
-                        let value = utxo.get("value")?.as_u64()?;
-                        Some((format!("{txid}:{vout}"), value))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                live_utxos_by_address.insert(address.clone(), live_utxos);
-            }
             let live_value = live_utxos_by_address
                 .get(&address)
                 .and_then(|utxos| utxos.get(&outpoint.to_string()))
@@ -3732,9 +3856,17 @@ extern "C" fn btc_prepare_consolidation_psbt(
                 continue;
             }
             let source_script = source_address.script_pubkey();
-            let Some(key_source) =
-                btc_xpub_input_key_source(&store, &xpub_config, &address)?
-            else {
+            if !key_sources_by_address.contains_key(&address) {
+                let started = Instant::now();
+                tracing::info!(stage = "key_source", address = %address,
+                    "BTC consolidation key lookup started");
+                let key_source = btc_xpub_input_key_source(&store, &xpub_config, &address)?;
+                tracing::info!(stage = "key_source", address = %address,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    found = key_source.is_some(), "BTC consolidation key lookup completed");
+                key_sources_by_address.insert(address.clone(), key_source);
+            }
+            let Some(key_source) = key_sources_by_address.get(&address).cloned().flatten() else {
                 xpub_rejected_inputs.push(json!({
                     "input_index": input_index,
                     "address": address,
@@ -4666,11 +4798,13 @@ extern "C" fn rgb_assets_by_utxo_sync(
 
 extern "C" fn rgb_assets_by_utxos_sync(requests: *const Dynamic) -> *const Dynamic {
     let requests = unsafe { &*requests };
-    native_result(|| {
+    consolidation_native_result("rgb_batch", || {
         let request_json = dynamic_to_json(requests);
         let request_items = request_json
             .as_array()
             .context("RGB daemon batch UTXO query requests must be an array")?;
+        tracing::info!(input_count = request_items.len(),
+            "BTC consolidation RGB batch input count");
         for (index, request) in request_items.iter().enumerate() {
             ensure!(
                 request.get("account_id").and_then(Value::as_str).is_some(),
