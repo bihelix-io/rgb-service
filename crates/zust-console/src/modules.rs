@@ -75,6 +75,9 @@ static LN_SCANNER_STARTED: AtomicBool = AtomicBool::new(false);
 static BTC_CONSOLIDATION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 const BTC_CONSOLIDATION_CHAIN_CONCURRENCY: usize = 5;
 
+#[path = "deposit_sweep_batch.rs"]
+mod deposit_sweep_batch;
+
 #[cfg(test)]
 #[path = "consolidation_regression.rs"]
 mod consolidation_regression;
@@ -958,6 +961,13 @@ fn register_btc_module(vm: &Vm) -> Result<()> {
         &[Type::Str, Type::Str, Type::U64, Type::Str],
         Type::Any,
         btc_prepare_sweep_with_inputs as *const u8,
+    )?;
+    jit.add_native_module_ptr(
+        "btc",
+        "prepare_deposit_sweeps",
+        &[Type::Any, Type::Str, Type::U64, Type::U64],
+        Type::Any,
+        deposit_sweep_batch::prepare_deposit_sweeps as *const u8,
     )?;
     jit.add_native_module_ptr(
         "btc",
@@ -6775,9 +6785,7 @@ fn btc_account_for_ident(ident: &str) -> Result<Value> {
         format!("unknown BTC ident `{ident}`; call btc::get_deposit_address first")
     })?;
     let pool_record = store
-        .list_used_btc_address_pool_records()?
-        .into_iter()
-        .find_map(|(candidate, record)| (candidate == address).then_some(record))
+        .get_used_btc_address_pool_record(&address)?
         .unwrap_or(Value::Null);
     let signer_response = pool_record
         .get("signer_response")
