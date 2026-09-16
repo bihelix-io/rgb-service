@@ -1,0 +1,23 @@
+[Unit]
+Description=BiHelix RGB service UTEXO signet integration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/utexo-integration
+ExecStart=/home/ubuntu/utexo-integration/bin/rgb-service /home/ubuntu/utexo-integration/rgb-service.toml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/utexo-integration/service-data
+MemoryMax=1G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

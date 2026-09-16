@@ -1,0 +1,45 @@
+# UTEXO signet 部署记录
+
+验收时间：2026-09-16 11:42（Asia/Shanghai）。
+
+## 已部署
+
+- 分支：`feat/utexo-signet-integration`。
+- daemon 源码：`71c88087295027de384fd72910c7b33c785947ff`；本分支新增部署配置、探针及测试签名工具，未修改 daemon 业务逻辑。
+- 主机：`bihelix-aws`；目录：`/home/ubuntu/utexo-integration`。
+- systemd：`rgb-service-utexo-signet.service`，已启用开机启动。
+- API：`127.0.0.1:18787`，仅回环监听；运行用户 ubuntu。
+- 数据：`service-data/`；测试私钥：`signer/alice.wif`，权限 0600，目录 0700。私钥未进入 Git，也未提供给 daemon。
+- Esplora：`https://esplora-api.utexo.com`。
+- 二进制 SHA256：`f67eebd6ac87d9b145cfae0340ac207236ef4b486845c9a1fdfea0998ea5f41d`。
+- 构建：`cargo build --locked --release -p rgb-service-daemon --bin rgb-service --example signet_test_signer`，独立 target，2 个编译任务。
+
+可通过 `ssh -L 18787:127.0.0.1:18787 bihelix-aws` 建立本地访问隧道。
+
+## Faucet 已到账
+
+- 来源：官方 SDK sandbox 文档列出的 Telegram `@Utexo_RLN_bot`。
+- 地址：`tb1qd3aemqrz7a3z4cqqt2emmkecwme83s5p43lku9`。
+- 金额：50,000 sats（0.0005 测试 BTC）。
+- TXID：`0cfd1d29d89e8b2c87d19582c31519efe6e0823920011dcfe2491c79ba4751ba`，vout 0。
+- UTEXO Esplora 已确认：区块高度 627876。
+- Bot 帮助文本仍写 shared regtest；实际发款已通过上述 UTEXO Esplora 的 UTXO 与区块查询核实。
+
+UTEXO 高度 100 哈希为 `0000027606cb73bbf383cb8666bd402dd0de1e154c39688db7b72a6cb4b56a17`，与服务器现有普通 signet Bitcoin Core 不同。因此此实例未使用原有 Bitcoin Core。
+
+## 已验证
+
+- catalog API HTTP 200，初始合约及资产列表为空。
+- 专用测试密钥签名的 RNA 查询 HTTP 200。
+- 无签名请求 HTTP 422；错误签名请求 HTTP 401。
+- 为本实例测试账户计入 100,000 DAEMON_RNA 服务额度，使用唯一幂等键；这不是 BTC 或 RGB 资产。
+- 重启前后签名查询返回相同额度，持久化检查通过。
+- systemd active/running，NRestarts=0；监听地址为回环。
+- 原有 Docker 容器均仍运行，未重启。
+- 服务器保留 `smoke-results.json`、`chain-results.json`、`alice-public.json` 和 `build.log`。
+
+## 下一阶段
+
+第一步环境与 faucet 完成。尚未建立 UTEXO SDK 对照钱包，未导入指定 USDT 合约，未完成外部 invoice/consignment 收发、Mint 或 Lightning 验收。
+
+接下来按接入计划 P0 采集 UTEXO SDK 的实际版本、测试资产 contract/schema ID、invoice、consignment 和双向传输样例，再确定 P1/P2 所需兼容实现。当前测试签名工具仅支持地址生成和 RNA 请求，不应视为完整 RGB 钱包。

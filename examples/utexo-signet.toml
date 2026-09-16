@@ -1,0 +1,14 @@
+[service]
+bind = "127.0.0.1:18787"
+network = "signet"
+data_dir = "/home/ubuntu/utexo-integration/service-data"
+esplora_url = "https://esplora-api.utexo.com"
+recovery_scan_interval_secs = 30
+
+[rna]
+issue_fee = 1000
+transfer_fee = 100
+query_fee = 1
+
+[legacy]
+enabled = false
