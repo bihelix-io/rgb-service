@@ -1,0 +1,29 @@
+{
+  "asset_notice": "BHXTEST test NIA; not official USDT",
+  "contract_id": "rgb:LD5JyIwl-UJQCAdg-YRoXiaa-2Q8yV8V-Ry01N26-bNcbx40",
+  "reference_balance": {
+    "settled": 940,
+    "future": 940,
+    "spendable": 940
+  },
+  "reference_return_status": "Settled",
+  "reference_return_amount": [
+    {
+      "Fungible": 40
+    }
+  ],
+  "chain": {
+    "1e4d4212d58e2b9a277a37f931ed6448eb2a24d3a9a8a7bcc545e2a420c91049": {
+      "confirmed": true,
+      "block_height": 627939,
+      "block_hash": "0000012cab0da94f96ac6fce9b87c2db996548bd1c6f2a11c9361d20a7a3e3c8",
+      "block_time": 1789532004
+    },
+    "33dc625eae2f23c90670f1b425cfd4fe8ecf06d9715ad33195b254b95c2ec500": {
+      "confirmed": true,
+      "block_height": 627941,
+      "block_hash": "0000028f8de92e033a6540d3b0fdc178be60c3a04965ed850a746e8122491aa9",
+      "block_time": 1789532066
+    }
+  }
+}

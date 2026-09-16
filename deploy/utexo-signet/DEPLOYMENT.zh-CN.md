@@ -38,8 +38,6 @@ UTEXO 高度 100 哈希为 `0000027606cb73bbf383cb8666bd402dd0de1e154c39688db7b7
 - 原有 Docker 容器均仍运行，未重启。
 - 服务器保留 `smoke-results.json`、`chain-results.json`、`alice-public.json` 和 `build.log`。
 
-## 下一阶段
+## 后续互操作实测
 
-第一步环境与 faucet 完成。尚未建立 UTEXO SDK 对照钱包，未导入指定 USDT 合约，未完成外部 invoice/consignment 收发、Mint 或 Lightning 验收。
-
-接下来按接入计划 P0 采集 UTEXO SDK 的实际版本、测试资产 contract/schema ID、invoice、consignment 和双向传输样例，再确定 P1/P2 所需兼容实现。当前测试签名工具仅支持地址生成和 RNA 请求，不应视为完整 RGB 钱包。
+已建立官方 SDK 对照钱包，并完成通用 NIA 测试资产的链上双向往返。新增工具支持受限测试签名；这些操作使用独立 stock，运行中 daemon 二进制与业务 API 未因此更新。官方 USDT 未获发放，Mint 与 Lightning 未验收。完整版本、交易、故障及接续条件见 [互操作实测记录](INTEROP-REPORT.zh-CN.md)。

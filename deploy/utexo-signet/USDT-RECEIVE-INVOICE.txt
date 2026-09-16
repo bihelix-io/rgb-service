@@ -1,0 +1,1 @@
+rgb:~/~/kbbaY/sb:utxob:OefXcg~r-BqWenGQ-NrlpeLt-1nf7UhV-ZBSAUkV-Um6t6id-RPT1q?assignment_name=assetOwner&expiry=1789617940&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc

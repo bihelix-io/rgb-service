@@ -1,0 +1,24 @@
+{
+  "created_at": "2026-09-16",
+  "network": "UTEXO custom signet (SDK network=utexo)",
+  "sdk": "@utexo/rgb-sdk@1.0.0-beta.8",
+  "native": "@utexo/rgb-lib@0.3.0-beta.13",
+  "asset_notice": "BHXTEST is an integration-only NIA, not official USDT",
+  "first_contract_id": "rgb:b_dR~5l9-L9C80KW-7DXKfZg-fdnamKh-MZs88LZ-aRSDBRs",
+  "roundtrip_contract_id": "rgb:LD5JyIwl-UJQCAdg-YRoXiaa-2Q8yV8V-Ry01N26-bNcbx40",
+  "roundtrip_inbound_txid": "1e4d4212d58e2b9a277a37f931ed6448eb2a24d3a9a8a7bcc545e2a420c91049",
+  "roundtrip_return_txid": "33dc625eae2f23c90670f1b425cfd4fe8ecf06d9715ad33195b254b95c2ec500",
+  "rejected_return_txid": "dcfcfc05dc35a9ce6f22924c63ec361008a9c74391652882038a9b721ab3c35c",
+  "sha256": {
+    "accepted-opret-first.psbt": "0f6ab0bcb3ad5b998e905e089aea24183e8643c928e1a8e811b7999a9aac328e",
+    "bihelix-to-reference.consignment": "6ed3636b04d9c1ed858b6e2d51718b054119c899d9f3298432a5c5c52a159013",
+    "bihelix-witness.invoice": "25a57434b4f502928bc60e49e6e87e873535fa8e1914eed5a8ff3af763e3ed67",
+    "reference-blind.invoice": "388ab5d708072706f3162845e0760ca5c128e83f0f78a4f4ea2a95d051af5a22",
+    "reference-to-bihelix.consignment": "5650cbe39a57e237109152e1ba5a49b71ff01d0d1738dbee87dab24f8016ba74",
+    "reference-to-bob.consignment": "7afb13b5111c9bbeaffbebe118630e5e33a1cc876b678df00cc35ca5ef6032f3",
+    "reference-witness.invoice": "27dbddfa4032e809e2e8e9066ce1381e006e406c8447f01e14008d3eb516ee49",
+    "rejected-taproot-first.consignment": "95c64eb3f56039404d22d6e90e9521710bb7acb567d3026a49b1d57a630aafc3",
+    "rejected-taproot-first.psbt": "e6ee5b58e0aad6ceab6626fb4a2424b8b8d361eb2d9f2f801aaf44586fe0301f",
+    "roundtrip-public-evidence.json": "ab7d92b04b06ab1047eb2303d69566c24ecc2e3a578823efcc2500ea4179cb7e"
+  }
+}

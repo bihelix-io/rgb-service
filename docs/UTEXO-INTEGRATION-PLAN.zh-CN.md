@@ -226,4 +226,4 @@ Mint 的 Lightning 路线与普通 LN 节点互通分别验收；API 有字段�
 6. 正式 Mint 的网络、资产、限额、费用和生产 endpoint 何时可用？承兑/冻结规则在哪里公布？
 7. Lightning 是否使用与 L1 相同合约？如果不同，兑换和退出由谁执行？推荐的互联节点/LSP 是哪个？
 
-本次没有向群里发送消息，没有创建外部订单、签名或执行资金交易。完成的是文档及静态代码核对；待上述里程碑实施后才形成兼容性结论。
+2026-09-16 实施更新：已建立隔离 signet 环境、领取测试 BTC，并完成通用 NIA 的 SDK → BiHelix 核心 → SDK 链上往返。官方 USDT Faucet 三次失败，Mint networks 返回 403；P0 的官方资产验证及 P1/P2 daemon 接口仍未完成。未向群里发送消息，也未创建 Mint 订单或使用真实 EVM 资金。详见 [互操作实测记录](../deploy/utexo-signet/INTEROP-REPORT.zh-CN.md)。

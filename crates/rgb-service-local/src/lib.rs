@@ -1116,6 +1116,37 @@ pub fn prepare_rgb20_psbt(
     Ok(PreparedRgb20Psbt { fascia, psbt })
 }
 
+/// UTEXO's deployed validator requires the first DBC-capable output to match
+/// the OP_RETURN proof method. Preserve legacy validation semantics, but reject
+/// an incompatible external carrier before building or signing any transition.
+/// Output indexes belong to the caller; this function never silently reorders them.
+pub fn validate_rgb20_external_carrier(psbt: &Psbt) -> Result<()> {
+    let outputs = &psbt.unsigned_tx.output;
+    let opret = outputs
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .context("external RGB carrier requires OP_RETURN")?;
+    anyhow::ensure!(
+        outputs.iter().filter(|o| o.script_pubkey.is_op_return()).count() == 1,
+        "external RGB carrier requires exactly one OP_RETURN"
+    );
+    anyhow::ensure!(
+        !outputs[..opret].iter().any(|o| o.script_pubkey.is_p2tr()),
+        "external RGB OP_RETURN must precede every Taproot output for UTEXO compatibility"
+    );
+    Ok(())
+}
+
+pub fn prepare_rgb20_external_psbt(
+    stock_dir: &Path,
+    psbt: Psbt,
+    change_vout: u32,
+    assignments: impl IntoIterator<Item = Rgb20PsbtAssignment>,
+) -> Result<PreparedRgb20Psbt> {
+    validate_rgb20_external_carrier(&psbt)?;
+    prepare_rgb20_psbt(stock_dir, psbt, change_vout, assignments)
+}
+
 pub fn build_rgb20_transfer_consignment(
     stock_dir: &Path,
     fascia: Fascia,

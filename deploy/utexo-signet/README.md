@@ -60,3 +60,5 @@ appears on the correct chain. These checks do not certify RGB interoperability.
 Stop only `rgb-service-utexo-signet.service` to pause this environment. Preserve
 the database and signer backups. Do not stop existing Bitcoin or application
 containers.
+
+互操作测试进度与 USDT Faucet 错误详见 [实测记录](INTEROP-REPORT.zh-CN.md)；可复用对照工具见 [reference harness](../../integration/utexo-reference/README.md)。
