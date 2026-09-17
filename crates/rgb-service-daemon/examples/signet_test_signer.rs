@@ -34,9 +34,8 @@ fn main() -> Result<()> {
             file.sync_all()?;
             key
         }
-        "rna-request" | "test-payment" | "sign-test-psbt" => {
-            PrivateKey::from_wif(std::fs::read_to_string(&path)?.trim())?
-        }
+        "rna-request" | "test-payment" | "sign-test-psbt" | "external-request"
+        | "assets-request" => PrivateKey::from_wif(std::fs::read_to_string(&path)?.trim())?,
         _ => bail!("unsupported mode"),
     };
     anyhow::ensure!(
@@ -47,6 +46,69 @@ fn main() -> Result<()> {
     let public_key = key.public_key(&secp);
     let address =
         Address::p2wpkh(&CompressedPublicKey(public_key.inner), Network::Signet).to_string();
+    if mode == "assets-request" {
+        let payload = rgb_service_api::ListAssetsRequest {
+            account_id: address.clone(),
+        };
+        let signature = sign_payload(&key, "read_assets", &payload)?;
+        println!(
+            "{}",
+            serde_json::to_string(&rgb_service_api::SignedRequest { payload, signature })?
+        );
+        return Ok(());
+    }
+    if mode == "external-request" {
+        use rgb_service_api::{
+            AssetSpendAuthorization, AssetSpendPurpose, ExternalRgbAction, ExternalRgbRequest,
+        };
+        #[derive(serde::Serialize)]
+        struct Unsigned<'a> {
+            asset_id: &'a str,
+            amount: u64,
+            purpose: &'a AssetSpendPurpose,
+            recipient: &'a Option<String>,
+            anchor_psbt: &'a Option<String>,
+            expires_at_ms: u64,
+        }
+        let file = args.next().context("request payload file required")?;
+        let mut payload: ExternalRgbRequest = serde_json::from_slice(&std::fs::read(file)?)?;
+        anyhow::ensure!(
+            payload.account_id == address,
+            "request account differs from test key"
+        );
+        let sign_spend = |a: &mut AssetSpendAuthorization| -> Result<()> {
+            a.signature = sign_payload(
+                &key,
+                "asset_spend",
+                &Unsigned {
+                    asset_id: &a.asset_id,
+                    amount: a.amount,
+                    purpose: &a.purpose,
+                    recipient: &a.recipient,
+                    anchor_psbt: &a.anchor_psbt,
+                    expires_at_ms: a.expires_at_ms,
+                },
+            )?;
+            Ok(())
+        };
+        match &mut payload.action {
+            ExternalRgbAction::Prepare {
+                asset_authorization,
+                ..
+            }
+            | ExternalRgbAction::Finalize {
+                asset_authorization,
+                ..
+            } => sign_spend(asset_authorization)?,
+            _ => {}
+        }
+        let signature = sign_payload(&key, "external_rgb", &payload)?;
+        println!(
+            "{}",
+            serde_json::to_string(&rgb_service_api::SignedRequest { payload, signature })?
+        );
+        return Ok(());
+    }
     if mode == "sign-test-psbt" {
         use bitcoin::sighash::{EcdsaSighashType, SighashCache};
         let file = args.next().context("PSBT file required")?;
@@ -83,9 +145,18 @@ fn main() -> Result<()> {
             .context("output overflow")?;
         let fee = total.checked_sub(spent).context("negative fee")?;
         anyhow::ensure!(fee > 0 && fee <= 2000, "test fee exceeds limit");
+        let mut finalized = psbt.clone();
+        for (input, signed) in finalized.inputs.iter_mut().zip(&tx.input) {
+            input.final_script_witness = Some(signed.witness.clone());
+        }
+        let signed_psbt = finalized
+            .serialize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         println!(
             "{}",
-            json!({"txid":tx.compute_txid().to_string(),"hex":bitcoin::consensus::encode::serialize_hex(&tx),"fee":fee})
+            json!({"txid":tx.compute_txid().to_string(),"hex":bitcoin::consensus::encode::serialize_hex(&tx),"fee":fee,"signed_psbt":signed_psbt})
         );
         return Ok(());
     }
@@ -178,4 +249,34 @@ fn main() -> Result<()> {
         }})
     );
     Ok(())
+}
+
+fn sign_payload<T: serde::Serialize>(
+    key: &PrivateKey,
+    purpose: &str,
+    payload: &T,
+) -> Result<rgb_service_api::RequestSignature> {
+    let secp = Secp256k1::new();
+    let public = key.public_key(&secp);
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let timestamp_ms = time.as_millis() as u64;
+    let nonce = format!("external-test-{}-{}", std::process::id(), time.as_nanos());
+    let mut engine = sha256::Hash::engine();
+    engine.input(b"bihelix-ln-rgb-auth-v1");
+    engine.input(purpose.as_bytes());
+    engine.input(nonce.as_bytes());
+    engine.input(&timestamp_ms.to_be_bytes());
+    engine.input(&serde_json::to_vec(payload)?);
+    let signature = secp.sign_ecdsa(
+        &Message::from_digest(sha256::Hash::from_engine(engine).to_byte_array()),
+        &key.inner,
+    );
+    Ok(rgb_service_api::RequestSignature {
+        signer_id: Address::p2wpkh(&CompressedPublicKey(public.inner), Network::Signet).to_string(),
+        public_key: public.to_string(),
+        scheme: rgb_service_api::SignatureScheme::Ecdsa,
+        nonce,
+        timestamp_ms,
+        signature: signature.to_string(),
+    })
 }

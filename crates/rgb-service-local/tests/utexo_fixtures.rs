@@ -2,14 +2,62 @@
 //! These offline tests cover wire compatibility; live validation is separate.
 use rgb_service_local::{decode_rgb20_transfer_consignment, encode_rgb20_transfer_consignment};
 use rgbstd::{
-    ChainNet,
     containers::ConsignmentExt,
     invoice::{Beneficiary, InvoiceState, RgbInvoice},
+    ChainNet,
 };
 use std::str::FromStr;
 
 const PROOF: &[u8] =
     include_bytes!("../../../tests/fixtures/utexo/reference-to-bihelix.consignment");
+
+#[test]
+fn daemon_http_roundtrip_preserves_history_and_targets_the_blind_invoice() {
+    let proofs: [(&[u8], usize); 3] = [
+        (
+            include_bytes!("../../../tests/fixtures/utexo-daemon/reference-to-a.consignment"),
+            107,
+        ),
+        (
+            include_bytes!("../../../tests/fixtures/utexo-daemon/a-to-b.consignment"),
+            108,
+        ),
+        (
+            include_bytes!("../../../tests/fixtures/utexo-daemon/b-to-reference.consignment"),
+            109,
+        ),
+    ];
+    for (bytes, bundles) in proofs {
+        let transfer = decode_rgb20_transfer_consignment(bytes).unwrap();
+        assert_eq!(
+            transfer.contract_id().to_string(),
+            "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y"
+        );
+        assert_eq!(
+            transfer.schema_id().to_string(),
+            "rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango"
+        );
+        assert_eq!(transfer.bundles.len(), bundles);
+        assert_eq!(encode_rgb20_transfer_consignment(&transfer).unwrap(), bytes);
+    }
+    let invoice = RgbInvoice::from_str(
+        include_str!("../../../tests/fixtures/utexo-daemon/b-blind.invoice").trim(),
+    )
+    .unwrap();
+    assert_eq!(invoice.chain_network(), ChainNet::BitcoinSignet);
+    assert_eq!(
+        invoice.assignment_state,
+        Some(InvoiceState::Amount(200000u64.into()))
+    );
+    let Beneficiary::BlindedSeal(seal) = invoice.beneficiary.into_inner() else {
+        panic!("expected the actual daemon blind invoice");
+    };
+    let transfer = decode_rgb20_transfer_consignment(proofs[1].0).unwrap();
+    assert!(transfer
+        .terminals
+        .values()
+        .any(|seals| seals.contains(&seal)));
+}
 
 #[test]
 fn official_test_usdt_ifa_roundtrip_preserves_contract_and_wire_format() {

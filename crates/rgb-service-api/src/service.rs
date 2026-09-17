@@ -4,6 +4,15 @@ use crate::{auth::Authorized, dto::*, error::Result};
 
 #[async_trait]
 pub trait RgbServiceApi: Send + Sync + 'static {
+    async fn external_rgb(
+        &self,
+        _req: Authorized<crate::ExternalRgbRequest>,
+    ) -> Result<crate::ExternalRgbResponse> {
+        Err(crate::RgbServiceError::NotImplemented(
+            "external RGB disabled".into(),
+        ))
+    }
+
     async fn rna_balance(&self, req: Authorized<RnaBalanceRequest>) -> Result<RnaBalanceResponse>;
 
     async fn issue_asset(&self, req: Authorized<IssueAssetRequest>) -> Result<IssueAssetResponse>;

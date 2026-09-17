@@ -2,6 +2,8 @@
 
 初次测试：2026-09-16；最新验收：2026-09-17，Asia/Shanghai。最新状态见文末。分支：`feat/utexo-signet-integration`。
 
+**后续 HTTP 验收已完成：**官方测试 USDT 经公共 API 完成 UTEXO → daemon A → daemon B → UTEXO，含 blinded 接收、SIGKILL 恢复和重启余额一致性。最终参考端 99.0 / A 0.3 / B 0.1 / 原 Carol 0.6 USDT。见 [HTTP 验收报告](HTTP-INTEROP-REPORT.zh-CN.md)。以下保留此前核心 harness 的历史记录；Mint 和 Lightning 尚未验收。
+
 ## 结果与范围
 
 通用 NIA 及官方 Faucet 测试 RGB USDT 均已完成 UTEXO 参考端 → BiHelix 核心 → UTEXO 参考端的真实链上往返。官方 USDT 使用隔离 Rust 参考端，最终余额为参考端 99.4 USDT、BiHelix 0.6 USDT，合计 100 USDT；详见文末。测试通过 `rgb-service-local` 独立 harness 完成，不等于 daemon 已实现公共外部收发 HTTP API，也没有完成 BiHelix A → B、故障恢复或 Mint 承兑验收。

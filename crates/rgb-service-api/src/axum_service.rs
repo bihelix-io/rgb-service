@@ -27,6 +27,13 @@ pub struct ApiState {
 pub fn router(service: Arc<dyn RgbServiceApi>, auth: Arc<dyn AuthVerifier>) -> Router {
     let state = ApiState { service, auth };
     Router::new()
+        .route("/v1/external/receives/create", post(external_receive))
+        .route("/v1/external/transfers/prepare", post(external_prepare))
+        .route("/v1/external/transfers/finalize", post(external_finalize))
+        .route("/v1/external/operations/get", post(external_get))
+        .route("/v1/external/operations/list", post(external_list))
+        .route("/v1/external/operations/refresh", post(external_refresh))
+        .route("/v1/external/operations/cancel", post(external_cancel))
         .route("/v1/rna/balance", post(rna_balance))
         .route("/v1/daemon-rna/balance", post(rna_balance))
         .route("/v1/assets/issue", post(issue_asset))
@@ -304,3 +311,46 @@ impl IntoResponse for HttpError {
 struct ErrorBody {
     error: String,
 }
+
+async fn external_dispatch(
+    state: ApiState,
+    signed: SignedRequest<crate::ExternalRgbRequest>,
+    kind: &str,
+) -> Result<Json<crate::ExternalRgbResponse>, HttpError> {
+    if signed.payload.action.kind() != kind {
+        return Err(
+            RgbServiceError::InvalidRequest("action does not match endpoint".into()).into(),
+        );
+    }
+    state
+        .auth
+        .verify_account_key(&signed.payload.account_id, &signed.signature.public_key)
+        .await?;
+    let req = if let Some(spend) = signed.payload.asset_spend_authorization() {
+        state
+            .auth
+            .verify_account_key(&signed.payload.account_id, &spend.signature.public_key)
+            .await?;
+        authorize_asset_spend(&state, Permission::ExternalRgb, signed).await?
+    } else {
+        authorize(&state, Permission::ExternalRgb, signed).await?
+    };
+    Ok(Json(state.service.external_rgb(req).await?))
+}
+macro_rules! external_handler {
+    ($name:ident, $kind:literal) => {
+        async fn $name(
+            State(state): State<ApiState>,
+            Json(req): Json<SignedRequest<crate::ExternalRgbRequest>>,
+        ) -> Result<Json<crate::ExternalRgbResponse>, HttpError> {
+            external_dispatch(state, req, $kind).await
+        }
+    };
+}
+external_handler!(external_receive, "receive");
+external_handler!(external_prepare, "prepare");
+external_handler!(external_finalize, "finalize");
+external_handler!(external_get, "get");
+external_handler!(external_list, "list");
+external_handler!(external_refresh, "refresh");
+external_handler!(external_cancel, "cancel");

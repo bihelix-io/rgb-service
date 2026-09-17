@@ -1,0 +1,12 @@
+{
+  "Cargo.lock": "1dd88141e2c48aba3883107071367e0cdb77e34e66c5c27c4bac0de6430bf889",
+  "crates/rgb-service-daemon/Cargo.toml": "156ca950ee7568700d6ead52887efc3c0898f56d8ff7ecf6975046595d66cd42",
+  "crates/rgb-service-daemon/src/main.rs": "7d6af597976c6700b49a54c6858a71c4e35188831a91d8fb0a5e6df14af924e8",
+  "crates/rgb-service-daemon/src/external.rs": "7d508dd48ee4fe5ac5852f95e4a8a41c437eb7472dc46de98661d18f125c9061",
+  "crates/rgb-service-api/src/auth.rs": "ab6b25657d0f1fa7aff00d943c6ff1a9b4961c99e9dd68acf05db580c05cec2d",
+  "crates/rgb-service-api/src/axum_service.rs": "a74448474c319379fe9844f19b64ddacf99b4c259881857ef0164f47cedba599",
+  "crates/rgb-service-api/src/lib.rs": "69d16161a0c5b5aedce97557ce5ede9459487784d98f3c70089fc5663a96d87f",
+  "crates/rgb-service-api/src/service.rs": "b7bc41c60ebf114b12f6cabdbb7072f3b467770abe352c1d860d9276db85f5c4",
+  "crates/rgb-service-api/src/external.rs": "4d1e7b5c9acb73946cbd411065a835afecbaedff9659925f049eb2acc2a4fe35",
+  "crates/rgb-service-local/src/lib.rs": "5c04799b1abbc6ceb780a1f2fd54b3eb6951514a3159c21b13abe5b3144f6785"
+}

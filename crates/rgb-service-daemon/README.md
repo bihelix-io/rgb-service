@@ -74,6 +74,26 @@ query:                1 RNA
 
 The daemon writes internal usage logs, but does not expose per-user transaction history in the public API.
 
+## External L1 RGB transfers
+
+The opt-in `service.external_rgb` module receives witness/blinded RGB invoices,
+prepares externally addressed payments and broadcasts only finalized, authorized
+carriers. Private keys stay with the wallet. Its account-scoped operation API
+exposes delivery, broadcast, confirmation and recovery state for these transfers.
+See the [API and configuration](../../docs/EXTERNAL-RGB-API.zh-CN.md) and
+[test client](../../integration/utexo-daemon/README.md).
+
+External accounts use persistent input reservations. Asset lists and balance
+breakdowns exclude reserved or quarantined allocations from available funds.
+Queries of pending operations include external tasks. The first version requires
+`legacy.enabled=false` and fences external accounts from old issue/direct-send/LN
+write paths; other accounts retain the existing API. Reorgs freeze affected
+accounts for review rather than automatically rebuilding their state.
+
+Back up the entire service database and account stocks together, including receive
+secrets. Never restore a pre-payment snapshot to an active wallet after broadcast.
+Disabling new work does not justify deleting in-flight operations or their proofs.
+
 DAEMON_RNA metering is temporarily disabled. The configured fee schedule and
 balance/credit APIs remain available, but issue, query, L1 transfer prepare and
 LN channel-open prepare do not debit or refund DAEMON_RNA while metering is

@@ -627,6 +627,15 @@ For an L1 transfer, the external wallet remains responsible for BTC ownership:
 
 The external caller never receives raw fascia in this public flow. Consignment
 is delivered internally by `/v1/transfers/commit`. The current direct-send flow
-is for accounts on the same `rgb-service-daemon`; extending it to multiple
-daemons mainly requires a remote consignment transport and receiver-side staging
-API.
+is for accounts on the same `rgb-service-daemon`.
+
+For external wallets/daemons, the opt-in `/v1/external/...` API supports witness
+and blinded invoices. The wallet calls `transfers/prepare`, signs the returned
+RGB PSBT, then calls `transfers/finalize`; the daemon persists that exact signed
+transaction before proxy delivery and broadcast. Receive validation, input
+reservations and restart recovery are tracked by account-scoped operations.
+See the [external API contract](docs/EXTERNAL-RGB-API.zh-CN.md) and
+[UTEXO HTTP acceptance report](deploy/utexo-signet/HTTP-INTEROP-REPORT.zh-CN.md).
+This first version requires `legacy.enabled=false` and fences external accounts
+from the old issue/direct-send/LN write paths so their inputs cannot bypass
+reservations.

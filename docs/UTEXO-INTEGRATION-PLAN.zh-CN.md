@@ -5,6 +5,8 @@
 
 目标：保留 BiHelix daemon 和 SDK，由 daemon 管理用户 RGB 状态、验证和转账，让已有钱包及应用接收、使用并转出 UTEXO 指定的 RGB USDT；另以 Mint 适配层提供跨链进入和退出入口。
 
+2026-09-17 进展：L1 公共 API 已完成官方测试 USDT 的 UTEXO → daemon A → daemon B → UTEXO HTTP 闭环，包含 blinded 接收、强制终止恢复及余额守恒，见 [验收报告](../deploy/utexo-signet/HTTP-INTEROP-REPORT.zh-CN.md)。Mint 双向承兑和 Lightning 仍独立待实施/验收，不能由 L1 结果推导完成。
+
 ## 0. 从 bihelix-aws 开始的执行顺序
 
 第一个部署里程碑是在 bihelix-aws 建立独立的 UTEXO signet 联调实例，现已完成。已检查远端现有服务、端口、磁盘和实际网络；下方保留原规划，部署的具体配置以部署记录为准。
@@ -153,6 +155,8 @@ UTEXO Mint 描述了通过 Arbitrum/USDT0 连接 RGB 的锁定、铸造与退出
 P1/P2 共同测试：并发花费冲突、坏证明、ACK/NACK、丢回执、输入已花费、未确认交易、重组、取消、备份恢复后继续转出。若暂不支持 RBF，显式阻止该转账流程使用 RBF，不能沿用旧 txid/proof。
 
 ## 7. P3：Mint 进入和退出（预计 3–5 人日，外部等待另计）
+
+2026-09-17 用户明确要求补齐 Mint 承兑。具体公共接口、持久化、验收及上游阻塞记录已展开为 [Mint 实施方案](UTEXO-MINT-API.zh-CN.md)。本机与 AWS 当前访问文档指定网关 `/networks` 均返回 HTTP 403，真实路线及 Faucet 资产可承兑性尚未核实。
 
 负责人角色：业务后端 + 钱包前端。复用 P1/P2 的 RGB 收发，订单逻辑不进入 RGB 共识代码。
 

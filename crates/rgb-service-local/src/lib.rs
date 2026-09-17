@@ -1127,7 +1127,11 @@ pub fn validate_rgb20_external_carrier(psbt: &Psbt) -> Result<()> {
         .position(|o| o.script_pubkey.is_op_return())
         .context("external RGB carrier requires OP_RETURN")?;
     anyhow::ensure!(
-        outputs.iter().filter(|o| o.script_pubkey.is_op_return()).count() == 1,
+        outputs
+            .iter()
+            .filter(|o| o.script_pubkey.is_op_return())
+            .count()
+            == 1,
         "external RGB carrier requires exactly one OP_RETURN"
     );
     anyhow::ensure!(
@@ -1168,6 +1172,127 @@ pub fn build_rgb20_transfer_consignment(
             Some(txid_to_rgb(txid)),
         )
         .map_err(|err| anyhow!("failed to build RGB transfer consignment: {err:?}"))
+}
+
+pub fn external_rgb_schema(stock_dir: &Path, contract: ContractId) -> Result<rgbstd::SchemaId> {
+    let stock = open_or_create_stock(stock_dir)?;
+    let schema = stock
+        .as_stash_provider()
+        .contract_schema(contract)
+        .map_err(|e| anyhow!("read external contract schema: {e:?}"))?;
+    Ok(schema.schema_id())
+}
+
+/// External recipients retain their actual concealed or witness beneficiary.
+#[derive(Clone, Copy, Debug)]
+pub enum ExternalRgbSeal {
+    Witness(u32),
+    Blind(rgbstd::SecretSeal),
+}
+
+pub fn prepare_external_rgb_transfer(
+    stock_dir: &Path,
+    psbt: Psbt,
+    change_vout: u32,
+    contract: ContractId,
+    amount: u64,
+    recipient: ExternalRgbSeal,
+) -> Result<(PreparedRgb20Psbt, Transfer)> {
+    anyhow::ensure!(amount > 0, "amount must be positive");
+    validate_rgb20_external_carrier(&psbt)?;
+    let mut stock = open_or_create_stock(stock_dir)?;
+    let seal = match recipient {
+        ExternalRgbSeal::Witness(v) => {
+            anyhow::ensure!(v != change_vout, "recipient and change must differ");
+            anyhow::ensure!(
+                (v as usize) < psbt.unsigned_tx.output.len(),
+                "missing recipient output"
+            );
+            RgbSeal::Vout(v)
+        }
+        ExternalRgbSeal::Blind(s) => RgbSeal::Blind(s),
+    };
+    let (fascia, psbt) = prepare_rgb20_psbt_inner(
+        &mut stock,
+        psbt,
+        change_vout,
+        [(contract, amount.into(), seal)],
+    )?;
+    let txid = psbt.unsigned_tx.compute_txid();
+    let mut staged = stock.clone_no_persistence();
+    staged
+        .consume_fascia(fascia.clone(), TentativeWitnessOrd)
+        .map_err(|e| anyhow!("stage external fascia: {e:?}"))?;
+    let (outputs, secrets) = match recipient {
+        ExternalRgbSeal::Witness(v) => (vec![OutputSeal::with(txid_to_rgb(txid), v)], vec![]),
+        ExternalRgbSeal::Blind(s) => (vec![], vec![s]),
+    };
+    let transfer = staged
+        .transfer(
+            contract,
+            outputs,
+            secrets,
+            transfer_opids(&fascia, contract),
+            Some(txid_to_rgb(txid)),
+        )
+        .map_err(|e| anyhow!("build external consignment: {e:?}"))?;
+    Ok((PreparedRgb20Psbt { fascia, psbt }, transfer))
+}
+
+/// Validate in a non-persistent stock before acknowledging or crediting a receive.
+/// Only the exact current candidate transaction may be tentative; historical
+/// witnesses still resolve through the configured chain source.
+pub fn preview_external_rgb_receive(
+    stock_dir: &Path,
+    network: Network,
+    source: &ChainSource,
+    transfer: Transfer,
+    candidate: Transaction,
+    outpoint: OutPoint,
+    secret: Option<rgbstd::GraphSeal>,
+) -> Result<Vec<Rgb20AssetAllocation>> {
+    let resolver = rgb_resolver_with_consignment(network, source, &transfer, [candidate.clone()])?;
+    let validation = ValidationConfig {
+        chain_net: network_to_rgb(network),
+        trusted_typesystem: transfer.types.clone(),
+        ..Default::default()
+    };
+    let valid = transfer
+        .validate(&resolver, &validation)
+        .map_err(|s| anyhow!("invalid external transfer: {s:?}"))?;
+    let resolver = rgb_resolver_with_consignment(network, source, &valid, [candidate])?;
+    let mut stock = open_or_create_stock(stock_dir)?.clone_no_persistence();
+    if let Some(secret) = secret {
+        stock
+            .store_secret_seal(secret)
+            .map_err(|e| anyhow!("store receive seal: {e:?}"))?;
+    }
+    stock
+        .accept_transfer(valid, resolver)
+        .map_err(|e| anyhow!("preview receive: {e:?}"))?;
+    list_rgb20_assets_from_stock(
+        &stock,
+        [Rgb20TrackedUtxo {
+            outpoint,
+            address: None,
+            confirmed: false,
+        }],
+    )
+}
+
+pub fn store_external_rgb_receive_secret(
+    stock_dir: &Path,
+    secret: rgbstd::GraphSeal,
+) -> Result<()> {
+    with_rgb_stock_write_lock(stock_dir, || {
+        let mut stock = open_or_create_stock(stock_dir)?;
+        stock
+            .store_secret_seal(secret)
+            .map_err(|e| anyhow!("store receive seal: {e:?}"))?;
+        stock
+            .store()
+            .map_err(|e| anyhow!("persist receive seal: {e:?}"))
+    })
 }
 
 pub fn accept_rgb20_transfer_with_chain_source(
@@ -1428,6 +1553,7 @@ pub fn scan_and_promote_confirmed_staged_rgb_stocks(
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RgbSeal {
     Vout(u32),
+    Blind(rgbstd::SecretSeal),
 }
 
 fn prepare_rgb20_psbt_inner(
@@ -1507,6 +1633,7 @@ fn prepare_rgb20_psbt_inner(
 
         let mut change_amount = total_input;
         for (seal, amount) in assign {
+            anyhow::ensure!(change_amount >= amount, "insufficient RGB input amount");
             change_amount = change_amount.saturating_sub(amount);
             builder = builder
                 .add_fungible_state(assignment_name, builder_seal(seal, contract_id), amount)
@@ -1612,6 +1739,7 @@ fn prepare_rgb20_psbt_inner(
 
 fn builder_seal(seal: RgbSeal, contract_id: ContractId) -> BuilderSeal<rgbstd::GraphSeal> {
     match seal {
+        RgbSeal::Blind(seal) => BuilderSeal::Concealed(seal),
         RgbSeal::Vout(vout) => {
             let mut hasher = std::hash::DefaultHasher::new();
             contract_id.hash(&mut hasher);
@@ -2084,5 +2212,132 @@ mod tests {
 
         let second = migrate_rgb_account_store(&source_dir, &target_locator).unwrap();
         assert_eq!(second, RgbAccountStoreMigrationReport::default());
+    }
+    #[test]
+    fn external_blind_assignment_preserves_value_and_rejects_overspend() {
+        use rgbstd::rgbcore::commit_verify::Conceal;
+        struct Resolver(Transaction);
+        impl ResolveWitness for Resolver {
+            fn check_chain_net(&self, _: rgbstd::ChainNet) -> Result<(), WitnessResolverError> {
+                Ok(())
+            }
+            fn resolve_witness(&self, id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
+                Ok(if id == self.0.compute_txid() {
+                    WitnessStatus::Resolved(self.0.clone(), WitnessOrd::Tentative)
+                } else {
+                    WitnessStatus::Unresolved
+                })
+            }
+        }
+        let funding = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(5000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let outpoint = OutPoint {
+            txid: funding.compute_txid(),
+            vout: 0,
+        };
+        let contract = ContractBuilder::with(
+            Identity::default(),
+            NonInflatableAsset::schema(),
+            NonInflatableAsset::types(),
+            NonInflatableAsset::scripts(),
+            network_to_rgb(Network::Signet),
+        )
+        .add_global_state(
+            "spec",
+            AssetSpec {
+                ticker: "BLIND".try_into().unwrap(),
+                name: "Blind fixture".try_into().unwrap(),
+                details: None,
+                precision: rgbstd::Precision::Indivisible,
+            },
+        )
+        .unwrap()
+        .add_global_state(
+            "terms",
+            ContractTerms {
+                text: Default::default(),
+                media: None,
+            },
+        )
+        .unwrap()
+        .add_global_state("issuedSupply", rgbstd::Amount::from(10u64))
+        .unwrap()
+        .add_fungible_state(
+            "assetOwner",
+            BuilderSeal::Revealed(GenesisSeal::new_random(outpoint.txid, outpoint.vout)),
+            10u64,
+        )
+        .unwrap()
+        .issue_contract()
+        .unwrap();
+        let id = contract.contract_id();
+        let mut stock = Stock::in_memory();
+        stock.import_contract(contract, Resolver(funding)).unwrap();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![
+                bitcoin::TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+                bitcoin::TxOut {
+                    value: Amount::from_sat(4500),
+                    script_pubkey: ScriptBuf::new(),
+                },
+            ],
+        };
+        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let secret = rgbstd::GraphSeal::new_random(Txid::from_byte_array([4; 32]), 0u32).conceal();
+        let error = prepare_rgb20_psbt_inner(
+            &mut stock,
+            psbt.clone(),
+            1,
+            [(id, 11u64.into(), RgbSeal::Blind(secret))],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("insufficient RGB input amount"));
+        let (fascia, psbt) = prepare_rgb20_psbt_inner(
+            &mut stock,
+            psbt,
+            1,
+            [(id, 4u64.into(), RgbSeal::Blind(secret))],
+        )
+        .unwrap();
+        let txid = psbt.unsigned_tx.compute_txid();
+        let opids = transfer_opids(&fascia, id);
+        stock.consume_fascia(fascia, TentativeWitnessOrd).unwrap();
+        let proof = stock.transfer(id, [], [secret], opids, Some(txid)).unwrap();
+        assert!(proof.terminals.values().any(|s| s.contains(&secret)));
+        let allocations = list_rgb20_assets_from_stock(
+            &stock,
+            [Rgb20TrackedUtxo {
+                outpoint: OutPoint { txid, vout: 1 },
+                address: None,
+                confirmed: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(allocations.iter().map(|a| a.amount_raw).sum::<u64>(), 6);
+        let encoded = encode_rgb20_transfer_consignment(&proof).unwrap();
+        assert_eq!(
+            decode_rgb20_transfer_consignment(&encoded)
+                .unwrap()
+                .contract_id(),
+            id
+        );
     }
 }

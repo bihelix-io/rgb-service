@@ -1,0 +1,152 @@
+{
+  "observed_at_utc": "2026-09-17T04:04:00.547546+00:00",
+  "scope": "Official Faucet test USDT daemon HTTP interoperability, not Mint or mainnet redemption",
+  "reference_commit": "b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4",
+  "reference_asset": {
+    "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+    "ticker": "USDT",
+    "name": "USDT Token",
+    "details": null,
+    "precision": 6,
+    "initial_supply": 1000000000000,
+    "max_supply": 1000000000000,
+    "known_circulating_supply": 1000000000000,
+    "timestamp": 1781004102,
+    "added_at": 1789612511,
+    "balance": {
+      "settled": 99000000,
+      "future": 99000000,
+      "spendable": 99000000
+    },
+    "media": null,
+    "reject_list_url": null
+  },
+  "reference_transfers": [
+    {
+      "idx": 12,
+      "status": "Settled",
+      "kind": "Send",
+      "txid": "87e4619446a193f135f3d202da49c45a52d7fda9c3d1e661b0287ee1a37db5bc",
+      "requested_assignment": {
+        "Fungible": 500000
+      },
+      "assignments": [
+        {
+          "Fungible": 98900000
+        }
+      ],
+      "receive_utxo": null,
+      "change_utxo": {
+        "txid": "87e4619446a193f135f3d202da49c45a52d7fda9c3d1e661b0287ee1a37db5bc",
+        "vout": 2
+      }
+    },
+    {
+      "idx": 13,
+      "status": "Settled",
+      "kind": "ReceiveWitness",
+      "txid": "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60",
+      "requested_assignment": {
+        "Fungible": 100000
+      },
+      "assignments": [
+        {
+          "Fungible": 100000
+        }
+      ],
+      "receive_utxo": {
+        "txid": "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60",
+        "vout": 1
+      },
+      "change_utxo": null
+    }
+  ],
+  "final_raw_balances": {
+    "reference": 99000000,
+    "daemon_a": 300000,
+    "daemon_b": 100000,
+    "prior_core_carol": 600000
+  },
+  "conserved_raw_total": 100000000,
+  "idempotency": {
+    "prepare": {
+      "http_status": 200,
+      "operation_id": "0a3902e8f18ecf3264d1bc8513d2bf7af0d1d3a977d939b938d3bda0c31f3b37",
+      "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+      "status": "waiting_confirmations"
+    },
+    "finalize": {
+      "http_status": 200,
+      "operation_id": "0a3902e8f18ecf3264d1bc8513d2bf7af0d1d3a977d939b938d3bda0c31f3b37",
+      "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+      "status": "waiting_confirmations"
+    },
+    "changed_parameters": {
+      "http_status": 409,
+      "error": "{\"error\":\"conflict: request_id already used with different parameters\"}"
+    },
+    "recorded_at": 1789616984
+  },
+  "recovery_before_kill": {
+    "before": {
+      "operation_id": "0a3902e8f18ecf3264d1bc8513d2bf7af0d1d3a977d939b938d3bda0c31f3b37",
+      "direction": "send",
+      "status": "delivering",
+      "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+      "amount": 200000,
+      "invoice": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y/~/kagFg/sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf?assignment_name=assetOwner&expiry=1789701890&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc",
+      "recipient_id": "sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf",
+      "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+      "delivery_status": "not_started",
+      "broadcast_status": "not_started",
+      "acknowledged": null,
+      "confirmations": 0,
+      "required_confirmations": 1,
+      "retryable": true,
+      "last_error": null,
+      "created_at": 1789616174,
+      "updated_at": 1789616174
+    },
+    "pid_before": "3563172",
+    "at": 1789616927,
+    "signal": "SIGKILL"
+  },
+  "deployment": {
+    "binary_sha256": "9fdef04a202ab3a112c11288d412ef427c442f52ad86d0a6cecc00a10f422b69",
+    "deployed_at": 1789616857,
+    "temporary_scan_interval": 3600,
+    "final_scan_interval": 30
+  },
+  "recovery_command": "sudo systemctl kill --kill-who=main --signal=SIGKILL rgb-service-utexo-signet.service",
+  "recovery_journal": "Sep 17 03:48:59 ip-10-192-9-162 systemd[1]: rgb-service-utexo-signet.service: Sent signal SIGKILL to main process 3563172 (rgb-service) on client request.\nSep 17 03:48:59 ip-10-192-9-162 systemd[1]: rgb-service-utexo-signet.service: Main process exited, code=killed, status=9/KILL\nSep 17 03:48:59 ip-10-192-9-162 systemd[1]: rgb-service-utexo-signet.service: Failed with result 'signal'.\nSep 17 03:49:04 ip-10-192-9-162 systemd[1]: rgb-service-utexo-signet.service: Scheduled restart job, restart counter is at 1.\nSep 17 03:49:04 ip-10-192-9-162 systemd[1]: Stopped BiHelix RGB service UTEXO signet integration.\nSep 17 03:49:04 ip-10-192-9-162 systemd[1]: Started BiHelix RGB service UTEXO signet integration.\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: starting rgb-service on 127.0.0.1:18787 for signet with data_dir /home/ubuntu/utexo-integration/service-data\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: 1789616944502 INFO starting rgb-service http=127.0.0.1:18787 network=signet data_dir=/home/ubuntu/utexo-integration/service-data\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: 1789616944502 INFO log_file=/home/ubuntu/utexo-integration/service-data/rgb-service.log\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: 1789616944507 INFO DAEMON_RNA issue_fee=1000 transfer_fee=100 query_fee=1\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: 1789616944507 INFO rgb pending scanner registered 0 stock dirs at startup\nSep 17 03:49:04 ip-10-192-9-162 rgb-service[3564114]: 1789616944507 INFO rgb pending recovery scanner enabled interval_secs=30\n",
+  "reservation_observation": {
+    "assets": [
+      {
+        "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+        "contract_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+        "ticker": "USDT",
+        "name": "USDT Token",
+        "precision": 6,
+        "supply": null,
+        "issue_utxo": "",
+        "contract_type": "",
+        "issuer_desc": "",
+        "created_at": "",
+        "ext": null
+      }
+    ],
+    "utxo_assets": {
+      "96f1ccff85074dda66300d1e1cdb5ce0679e49e3b96db4fd8e32225e4180eda8:0": [
+        {
+          "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+          "outpoint": "96f1ccff85074dda66300d1e1cdb5ce0679e49e3b96db4fd8e32225e4180eda8:0",
+          "amount": 200000,
+          "layer": "l1",
+          "status": "reserved",
+          "address": "tb1qlxm00ugdjddrx44wmztd9l9v96hq2w4t77yw0c",
+          "confirmed": true
+        }
+      ]
+    }
+  }
+}

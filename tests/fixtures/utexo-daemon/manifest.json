@@ -1,0 +1,65 @@
+{
+  "network": "UTEXO custom signet; RGB BitcoinSignet",
+  "contract_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+  "precision": 6,
+  "fixtures": [
+    {
+      "file": "reference-to-a.consignment",
+      "txid": "87e4619446a193f135f3d202da49c45a52d7fda9c3d1e661b0287ee1a37db5bc",
+      "vout": 1,
+      "validated": true,
+      "sha256": "384002c6f7dbc93ddf6391d3b335e38807c54fb974826cd2de91aff92c5f4570",
+      "bytes": 73463,
+      "recipient_id": "sb:wvout:A1yG8QbT-PCOZwPV-O~o3FSZ-9pfgq2A-AAAAAAA-AAAAAAA-Ajp6ePQ",
+      "raw_amount": 500000,
+      "acknowledged": true,
+      "chain_status": {
+        "confirmed": true,
+        "block_height": 630661,
+        "block_hash": "0000024ee03b9b7096704c3b1ae5e074ec5bb1a584256795a0067186a00197ab",
+        "block_time": 1789616028
+      },
+      "fee_sats": 487,
+      "bundles": 107
+    },
+    {
+      "file": "a-to-b.consignment",
+      "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+      "validated": true,
+      "sha256": "691dab9d5a211d0b7bec2bee2580842a2d7151cea37304d098906fc627db5175",
+      "bytes": 74039,
+      "recipient_id": "sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf",
+      "raw_amount": 200000,
+      "acknowledged": true,
+      "chain_status": {
+        "confirmed": true,
+        "block_height": 630691,
+        "block_hash": "000002081bafaf6f7b240d27c34473ca1262a8c66e338a80bde5afc02488b71e",
+        "block_time": 1789616956
+      },
+      "fee_sats": 500,
+      "bundles": 108
+    },
+    {
+      "file": "b-to-reference.consignment",
+      "txid": "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60",
+      "vout": 1,
+      "validated": true,
+      "sha256": "7e780cec219ece981ea2fec2ae6b4b754b5c30f6ecbea9c069e9268cfa5ed93a",
+      "bytes": 74523,
+      "recipient_id": "sb:wvout:BaW8OBke-MNz2vFo-cEStsXf-EaiHur0-y6TGQl7-ebTfUJE-87y8vPA",
+      "raw_amount": 100000,
+      "acknowledged": true,
+      "chain_status": {
+        "confirmed": true,
+        "block_height": 630696,
+        "block_hash": "00000175cc16da67576f1d14d32686eff93a2e556edec51a2aaa6d4df34a540f",
+        "block_time": 1789617112
+      },
+      "fee_sats": 500,
+      "bundles": 109
+    }
+  ],
+  "schema_id": "rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango",
+  "provenance": "Official UTEXO Faucet test USDT via daemon HTTP; no redemption claim"
+}

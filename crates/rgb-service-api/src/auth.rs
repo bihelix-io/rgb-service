@@ -6,6 +6,7 @@ use crate::error::Result;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
+    ExternalRgb,
     ReadRnaBalance,
     ReadAssets,
     IssueAsset,
@@ -95,6 +96,13 @@ pub trait AssetSpendAuthorized {
 
 #[async_trait]
 pub trait AuthVerifier: Send + Sync + 'static {
+    /// External operations fail closed unless the backend proves account ownership.
+    async fn verify_account_key(&self, _account_id: &str, _public_key: &str) -> Result<()> {
+        Err(crate::RgbServiceError::Forbidden(
+            "external account ownership verification unavailable".into(),
+        ))
+    }
+
     async fn verify_request(
         &self,
         permission: Permission,

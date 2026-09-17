@@ -1,8 +1,18 @@
 # UTEXO signet 部署记录
 
-验收时间：2026-09-16 11:42（Asia/Shanghai）。
+初始验收时间：2026-09-16 11:42（Asia/Shanghai）。
 
-## 已部署
+## 2026-09-17 外部 HTTP API 更新
+
+隔离实例已更新并启用 `[service.external_rgb]`，legacy 保持关闭，proxy 允许列表为 `https://rgb-proxy.utexo.com/json-rpc`，恢复扫描间隔为 30 秒。API 继续仅监听 `127.0.0.1:18787`。
+
+当前 daemon 二进制 SHA256：`9fdef04a202ab3a112c11288d412ef427c442f52ad86d0a6cecc00a10f422b69`。对应 daemon/core/API 源文件哈希在 `tests/fixtures/utexo-daemon/deployed-source-sha256.json`，与本次提交源码一致；下方 `71c8808` 与旧二进制哈希是初次部署历史。
+
+官方测试 USDT 的三段 HTTP 转账及真实 SIGKILL 恢复已通过。结算后再次重启，四个 operation/txid 和 A/B 余额保持一致；最终服务 active。完整证据见 [HTTP 验收报告](HTTP-INTEROP-REPORT.zh-CN.md)。
+
+部署前备份位于 AWS `http-interop/rgb-service.before-external`、`rgb-service.before-external.toml` 与 `service-data.before-external.tgz`。当前数据库已有新付款和 blind 接收秘密，不能恢复该旧数据快照继续花费。私钥和原始数据库未进入 Git。
+
+## 初次部署记录
 
 - 分支：`feat/utexo-signet-integration`。
 - daemon 源码：`71c88087295027de384fd72910c7b33c785947ff`；本分支新增部署配置、探针及测试签名工具，未修改 daemon 业务逻辑。

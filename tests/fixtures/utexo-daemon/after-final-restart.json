@@ -1,0 +1,154 @@
+{
+  "observed_at": 1789617225,
+  "accounts": {
+    "a": {
+      "address": "tb1qtjr0zpkn8s3ens84fmlgm32fna5huz4k2um9lh",
+      "operations": [
+        {
+          "operation_id": "0a3902e8f18ecf3264d1bc8513d2bf7af0d1d3a977d939b938d3bda0c31f3b37",
+          "direction": "send",
+          "status": "settled",
+          "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+          "amount": 200000,
+          "invoice": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y/~/kagFg/sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf?assignment_name=assetOwner&expiry=1789701890&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc",
+          "recipient_id": "sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf",
+          "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+          "delivery_status": "delivered",
+          "broadcast_status": "broadcast",
+          "acknowledged": true,
+          "confirmations": 7,
+          "required_confirmations": 1,
+          "retryable": false,
+          "last_error": null,
+          "created_at": 1789616174,
+          "updated_at": 1789617162
+        },
+        {
+          "operation_id": "b5fff90c88788da2d4d175d85c2dbd9ef9e64e3ae215451c19a0018664eea1d6",
+          "direction": "receive",
+          "status": "settled",
+          "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+          "amount": 500000,
+          "invoice": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y/~/ecFFD/sb:wvout:A1yG8QbT-PCOZwPV-O~o3FSZ-9pfgq2A-AAAAAAA-AAAAAAA-Ajp6ePQ?assignment_name=assetOwner&expiry=1789701890&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc",
+          "recipient_id": "sb:wvout:A1yG8QbT-PCOZwPV-O~o3FSZ-9pfgq2A-AAAAAAA-AAAAAAA-Ajp6ePQ",
+          "txid": "87e4619446a193f135f3d202da49c45a52d7fda9c3d1e661b0287ee1a37db5bc",
+          "delivery_status": "validated",
+          "broadcast_status": "confirmed",
+          "acknowledged": true,
+          "confirmations": 37,
+          "required_confirmations": 1,
+          "retryable": false,
+          "last_error": null,
+          "created_at": 1789615728,
+          "updated_at": 1789617164
+        }
+      ],
+      "assets": {
+        "assets": [
+          {
+            "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+            "contract_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+            "ticker": "USDT",
+            "name": "USDT Token",
+            "precision": 6,
+            "supply": null,
+            "issue_utxo": "",
+            "contract_type": "",
+            "issuer_desc": "",
+            "created_at": "",
+            "ext": null
+          }
+        ],
+        "utxo_assets": {
+          "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf:1": [
+            {
+              "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+              "outpoint": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf:1",
+              "amount": 300000,
+              "layer": "l1",
+              "status": "available",
+              "address": "tb1qtjr0zpkn8s3ens84fmlgm32fna5huz4k2um9lh",
+              "confirmed": true
+            }
+          ]
+        }
+      },
+      "raw_balance": 300000
+    },
+    "b": {
+      "address": "tb1qlxm00ugdjddrx44wmztd9l9v96hq2w4t77yw0c",
+      "operations": [
+        {
+          "operation_id": "cabb774b0651e4361750ae6036a2abf97a80eb5a682b344557f82e4140c7cb34",
+          "direction": "send",
+          "status": "settled",
+          "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+          "amount": 100000,
+          "invoice": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y/IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE/Mcdac/sb:wvout:BaW8OBke-MNz2vFo-cEStsXf-EaiHur0-y6TGQl7-ebTfUJE-87y8vPA?assignment_name=assetOwner&expiry=1789702519&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc",
+          "recipient_id": "sb:wvout:BaW8OBke-MNz2vFo-cEStsXf-EaiHur0-y6TGQl7-ebTfUJE-87y8vPA",
+          "txid": "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60",
+          "delivery_status": "delivered",
+          "broadcast_status": "broadcast",
+          "acknowledged": true,
+          "confirmations": 2,
+          "required_confirmations": 1,
+          "retryable": false,
+          "last_error": null,
+          "created_at": 1789617032,
+          "updated_at": 1789617161
+        },
+        {
+          "operation_id": "fad2de7761337071bf0dc2c06d67f950b1f09f0edcb5c7baa6a172ec436e3225",
+          "direction": "receive",
+          "status": "settled",
+          "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+          "amount": 200000,
+          "invoice": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y/~/kagFg/sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf?assignment_name=assetOwner&expiry=1789701890&endpoints=rpcs://rgb-proxy.utexo.com/json-rpc",
+          "recipient_id": "sb:utxob:Lt_cQdrB-X3YUOcA-~Zb6CL4-u6q77I1-oVGuo9Y-tEUg8_g-2CQlf",
+          "txid": "8abc3493e7c490da90e21375b7cd0908ada55f0afed6820f21da37bf493359bf",
+          "delivery_status": "validated",
+          "broadcast_status": "confirmed",
+          "acknowledged": true,
+          "confirmations": 7,
+          "required_confirmations": 1,
+          "retryable": false,
+          "last_error": null,
+          "created_at": 1789615731,
+          "updated_at": 1789617165
+        }
+      ],
+      "assets": {
+        "assets": [
+          {
+            "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+            "contract_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+            "ticker": "USDT",
+            "name": "USDT Token",
+            "precision": 6,
+            "supply": null,
+            "issue_utxo": "",
+            "contract_type": "",
+            "issuer_desc": "",
+            "created_at": "",
+            "ext": null
+          }
+        ],
+        "utxo_assets": {
+          "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60:2": [
+            {
+              "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+              "outpoint": "daea30e262cc5de6639d323e1c5a9039691ea4e87cf0dbb8c73476ea64c2ee60:2",
+              "amount": 100000,
+              "layer": "l1",
+              "status": "available",
+              "address": "tb1qlxm00ugdjddrx44wmztd9l9v96hq2w4t77yw0c",
+              "confirmed": true
+            }
+          ]
+        }
+      },
+      "raw_balance": 100000
+    }
+  },
+  "pid": "3566958"
+}

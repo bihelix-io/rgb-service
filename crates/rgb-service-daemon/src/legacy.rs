@@ -2614,6 +2614,7 @@ mod tests {
         ));
         let service = LocalDaemonService::new(crate::DaemonConfig {
             service: crate::ServiceConfig {
+                external_rgb: Default::default(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 network: "mainnet".to_string(),
                 data_dir: data_dir.clone(),
@@ -2858,6 +2859,7 @@ mod tests {
         let service = Arc::new(
             LocalDaemonService::new(crate::DaemonConfig {
                 service: crate::ServiceConfig {
+                    external_rgb: Default::default(),
                     bind: "127.0.0.1:0".parse().unwrap(),
                     network: "mainnet".to_string(),
                     data_dir: data_dir.clone(),

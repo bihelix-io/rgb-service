@@ -68,6 +68,7 @@ use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal};
 use tower_http::cors::CorsLayer;
 
+mod external;
 mod legacy;
 mod stake_import;
 
@@ -97,6 +98,8 @@ struct DaemonConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 struct ServiceConfig {
+    #[serde(default)]
+    external_rgb: external::ExternalConfig,
     bind: SocketAddr,
     network: String,
     data_dir: PathBuf,
@@ -1405,7 +1408,7 @@ fn spawn_recovery_scanner(service: Arc<LocalDaemonService>) {
     let Some(interval_secs) = service.config.recovery_scan_interval_secs.or(Some(60)) else {
         return;
     };
-    if interval_secs == 0 {
+    if interval_secs == 0 && !service.config.external_rgb.enabled {
         service
             .logger
             .info("rgb pending recovery scanner disabled by config");
@@ -1415,11 +1418,26 @@ fn spawn_recovery_scanner(service: Arc<LocalDaemonService>) {
         "rgb pending recovery scanner enabled interval_secs={interval_secs}"
     ));
     tokio::spawn(async move {
-        let interval = Duration::from_secs(interval_secs);
+        let interval = Duration::from_secs(if interval_secs == 0 {
+            60
+        } else {
+            interval_secs
+        });
         loop {
             let service_for_scan = Arc::clone(&service);
-            match tokio::task::spawn_blocking(move || service_for_scan.scan_pending_rgb_stocks())
-                .await
+            match tokio::task::spawn_blocking(move || {
+                if service_for_scan.config.external_rgb.enabled {
+                    match external::Engine::new(&service_for_scan).and_then(|engine| engine.scan())
+                    {
+                        Ok(()) => {}
+                        Err(err) => service_for_scan
+                            .logger
+                            .warn(format!("external RGB recovery: {err}")),
+                    }
+                }
+                service_for_scan.scan_pending_rgb_stocks()
+            })
+            .await
             {
                 Ok(Ok(report)) => {
                     if report.scanned > 0
@@ -1538,6 +1556,7 @@ impl ConfiguredAuthVerifier {
 
     fn permission_purposes(permission: &Permission) -> &'static [&'static str] {
         match permission {
+            Permission::ExternalRgb => &["external_rgb"],
             Permission::ReadRnaBalance => &["read_rna_balance", "rna_balance"],
             Permission::ReadAssets => {
                 &["read_assets", "list_assets", "balance", "balance_breakdown"]
@@ -1594,6 +1613,14 @@ impl ConfiguredAuthVerifier {
 
 #[async_trait]
 impl AuthVerifier for ConfiguredAuthVerifier {
+    async fn verify_account_key(
+        &self,
+        account_id: &str,
+        public_key: &str,
+    ) -> rgb_service_api::Result<()> {
+        external::verify_account_key(account_id, public_key)
+    }
+
     async fn verify_request(
         &self,
         permission: Permission,
@@ -1656,6 +1683,7 @@ struct LocalDaemonService {
     logger: DaemonLogger,
     pending_stock_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
     daemon_rna_mutation: Mutex<()>,
+    external_mutation: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -1931,6 +1959,13 @@ impl LocalDaemonService {
             "log_file={}",
             config.service.data_dir.join("rgb-service.log").display()
         ));
+        config.service.external_rgb.validate()?;
+        if config.service.external_rgb.enabled && config.legacy.enabled {
+            return Err(
+                "external RGB requires legacy.enabled=false until legacy shares input reservations"
+                    .into(),
+            );
+        }
         let kv_dir = config.service.data_dir.join("kv");
         fs::create_dir_all(&kv_dir)?;
         let db = SingleWriterTxDatabase::builder(&kv_dir).open()?;
@@ -1965,6 +2000,7 @@ impl LocalDaemonService {
             logger,
             pending_stock_dirs: Arc::new(Mutex::new(pending_stock_dirs)),
             daemon_rna_mutation: Mutex::new(()),
+            external_mutation: Arc::new(Mutex::new(())),
         };
         let legacy_migrated = legacy::migrate_legacy_wallets_to_database(&service)?;
         if legacy_migrated > 0 {
@@ -3103,6 +3139,7 @@ impl LocalDaemonService {
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         self.register_pending_stock_dir(&stock_dir)?;
         for recipient in record.recipients_or_legacy() {
+            external::guard_legacy_account(&self.db, &recipient.recipient_account_id)?;
             let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&recipient.asset_id)
                 .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
             let consignment = build_rgb20_transfer_consignment(
@@ -3808,6 +3845,16 @@ impl LocalDaemonService {
 
 #[async_trait]
 impl RgbServiceApi for LocalDaemonService {
+    async fn external_rgb(
+        &self,
+        req: Authorized<rgb_service_api::ExternalRgbRequest>,
+    ) -> rgb_service_api::Result<rgb_service_api::ExternalRgbResponse> {
+        let engine = external::Engine::new(self)?;
+        tokio::task::spawn_blocking(move || engine.execute(req.payload))
+            .await
+            .map_err(|e| RgbServiceError::Backend(format!("external RGB task: {e}")))?
+    }
+
     async fn rna_balance(
         &self,
         req: Authorized<RnaBalanceRequest>,
@@ -3830,6 +3877,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<IssueAssetRequest>,
     ) -> rgb_service_api::Result<IssueAssetResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         let ticker = payload.ticker.clone();
@@ -3897,6 +3949,7 @@ impl RgbServiceApi for LocalDaemonService {
         //     "list_assets",
         //     self.daemon_rna.query_fee,
         // )?;
+        let projection = external::account_projection(&self.db, &req.payload.account_id)?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
         let known_outpoints = account_utxos
@@ -3931,10 +3984,10 @@ impl RgbServiceApi for LocalDaemonService {
                 .or_default()
                 .push(RgbAllocation {
                     asset_id: allocation.contract_id.to_string(),
-                    outpoint,
+                    outpoint: outpoint.clone(),
                     amount: allocation.amount_raw,
                     layer: AssetLayer::L1,
-                    status: AllocationStatus::Available,
+                    status: projection.allocation_status(&outpoint, allocation.confirmed),
                     address: allocation.address.clone(),
                     confirmed: Some(allocation.confirmed),
                 });
@@ -4084,6 +4137,7 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<BalanceBreakdownRequest>,
     ) -> rgb_service_api::Result<BalanceBreakdownResponse> {
+        let projection = external::account_projection(&self.db, &req.payload.account_id)?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let account_utxos = self.account_rgb20_utxos(&req.payload.account_id)?;
         let known_outpoints = account_utxos
@@ -4115,13 +4169,19 @@ impl RgbServiceApi for LocalDaemonService {
                 continue;
             }
             summary.total += allocation.amount_raw;
-            summary.l1_available += allocation.amount_raw;
+            let status = projection.allocation_status(&outpoint, allocation.confirmed);
+            match status {
+                AllocationStatus::Available => summary.l1_available += allocation.amount_raw,
+                AllocationStatus::Reserved => summary.reserved += allocation.amount_raw,
+                AllocationStatus::PendingIn => summary.l1_pending_in += allocation.amount_raw,
+                _ => summary.settling += allocation.amount_raw,
+            }
             let response_allocation = RgbAllocation {
                 asset_id: req.payload.asset_id.clone(),
                 outpoint: outpoint.clone(),
                 amount: allocation.amount_raw,
                 layer: AssetLayer::L1,
-                status: AllocationStatus::Available,
+                status,
                 address: allocation.address.clone(),
                 confirmed: Some(allocation.confirmed),
             };
@@ -4142,7 +4202,11 @@ impl RgbServiceApi for LocalDaemonService {
             summary,
             allocations: response_allocations,
             utxo_assets,
-            pending_ops: Vec::new(),
+            pending_ops: projection
+                .pending
+                .into_iter()
+                .filter(|op| op.asset_id.as_deref() == Some(req.payload.asset_id.as_str()))
+                .collect(),
         })
     }
 
@@ -4150,6 +4214,12 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<PrepareTransferRequest>,
     ) -> rgb_service_api::Result<PrepareTransferResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
+        external::guard_legacy_account(&self.db, &req.payload.recipient)?;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.recipient.trim().is_empty() {
@@ -4233,17 +4303,26 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<CommitTransferRequest>,
     ) -> rgb_service_api::Result<CommitTransferResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         let stock_dir = self.account_stock_dir(&req.payload.account_id);
         let txid = Txid::from_str(&req.payload.txid)
             .map_err(|err| RgbServiceError::InvalidRequest(err.to_string()))?;
         let record =
             self.get_prepared_transfer(&req.payload.account_id, &req.payload.transfer_id)?;
+        for recipient in record.recipients_or_legacy() {
+            external::guard_legacy_account(&self.db, &recipient.recipient_account_id)?;
+        }
         let fascia = rgb_service_local::decode_fascia_bytes(&record.fascia)
             .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:#}")))?;
         stage_sender_fascia(&stock_dir, txid, &fascia)
             .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
         self.register_pending_stock_dir(&stock_dir)?;
         for recipient in record.recipients_or_legacy() {
+            external::guard_legacy_account(&self.db, &recipient.recipient_account_id)?;
             let contract_id = rgb_service_local::rgbstd::ContractId::from_str(&recipient.asset_id)
                 .map_err(|err| RgbServiceError::InvalidRequest(format!("{err:?}")))?;
             let consignment = build_rgb20_transfer_consignment(
@@ -4273,6 +4352,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<CancelTransferRequest>,
     ) -> rgb_service_api::Result<CancelTransferResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         Ok(CancelTransferResponse {
             transfer_id: req.payload.transfer_id,
             status: OperationStatus::Cancelled,
@@ -4281,10 +4365,10 @@ impl RgbServiceApi for LocalDaemonService {
 
     async fn list_pending(
         &self,
-        _req: Authorized<ListPendingRequest>,
+        req: Authorized<ListPendingRequest>,
     ) -> rgb_service_api::Result<ListPendingResponse> {
         Ok(ListPendingResponse {
-            pending: Vec::new(),
+            pending: external::account_projection(&self.db, &req.payload.account_id)?.pending,
         })
     }
 
@@ -4319,6 +4403,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnChannelOpenPrepareRequest>,
     ) -> rgb_service_api::Result<LnChannelOpenPrepareResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         let payload = req.payload;
         let account_id = payload.account_id.clone();
         if payload.channel_id.trim().is_empty() {
@@ -4452,6 +4541,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnCommitmentComposeRequest>,
     ) -> rgb_service_api::Result<LnComposeResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
         })?;
@@ -4506,6 +4600,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnPaymentClaimRequest>,
     ) -> rgb_service_api::Result<LnPaymentClaimResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         if req.payload.payment_hash.trim().is_empty() {
             return Err(RgbServiceError::InvalidRequest(
                 "payment_hash must not be empty".to_string(),
@@ -4545,6 +4644,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnClosingComposeRequest>,
     ) -> rgb_service_api::Result<LnComposeResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         OutPoint::from_str(&req.payload.funding_outpoint).map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid funding_outpoint: {err}"))
         })?;
@@ -4589,6 +4693,11 @@ impl RgbServiceApi for LocalDaemonService {
         &self,
         req: Authorized<LnOnchainClaimComposeRequest>,
     ) -> rgb_service_api::Result<LnComposeResponse> {
+        let _external_guard = self
+            .external_mutation
+            .lock()
+            .map_err(|e| RgbServiceError::Backend(e.to_string()))?;
+        external::guard_legacy_account(&self.db, &req.payload.account_id)?;
         Txid::from_str(&req.payload.commitment_txid).map_err(|err| {
             RgbServiceError::InvalidRequest(format!("invalid commitment_txid: {err}"))
         })?;
@@ -4913,6 +5022,7 @@ query_fee = 1
         ));
         let service = LocalDaemonService::new(DaemonConfig {
             service: ServiceConfig {
+                external_rgb: Default::default(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 network: "mainnet".to_string(),
                 data_dir: data_dir.clone(),
@@ -4970,6 +5080,7 @@ query_fee = 1
         ));
         let service = LocalDaemonService::new(DaemonConfig {
             service: ServiceConfig {
+                external_rgb: Default::default(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 network: "mainnet".to_string(),
                 data_dir: data_dir.clone(),
@@ -5041,6 +5152,7 @@ query_fee = 1
         ));
         let service = LocalDaemonService::new(DaemonConfig {
             service: ServiceConfig {
+                external_rgb: Default::default(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 network: "mainnet".to_string(),
                 data_dir: data_dir.clone(),
@@ -5135,6 +5247,7 @@ query_fee = 1
         ));
         let service = LocalDaemonService::new(DaemonConfig {
             service: ServiceConfig {
+                external_rgb: Default::default(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 network: "mainnet".to_string(),
                 data_dir: data_dir.clone(),
