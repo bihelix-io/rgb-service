@@ -1,15 +1,48 @@
-//! Cross-implementation fixtures created by @utexo/rgb-sdk 1.0.0-beta.8.
+//! Cross-implementation fixtures from UTEXO Node SDK and Rust reference wallets.
 //! These offline tests cover wire compatibility; live validation is separate.
 use rgb_service_local::{decode_rgb20_transfer_consignment, encode_rgb20_transfer_consignment};
 use rgbstd::{
+    ChainNet,
     containers::ConsignmentExt,
     invoice::{Beneficiary, InvoiceState, RgbInvoice},
-    ChainNet,
 };
 use std::str::FromStr;
 
 const PROOF: &[u8] =
     include_bytes!("../../../tests/fixtures/utexo/reference-to-bihelix.consignment");
+
+#[test]
+fn official_test_usdt_ifa_roundtrip_preserves_contract_and_wire_format() {
+    let fixtures: [(&[u8], usize); 3] = [
+        (
+            include_bytes!("../../../tests/fixtures/utexo-usdt/official-faucet-usdt.consignment"),
+            104,
+        ),
+        (
+            include_bytes!(
+                "../../../tests/fixtures/utexo-usdt/usdt-reference-to-carol.consignment"
+            ),
+            105,
+        ),
+        (
+            include_bytes!("../../../tests/fixtures/utexo-usdt/return.consignment"),
+            106,
+        ),
+    ];
+    for (bytes, bundles) in fixtures {
+        let transfer = decode_rgb20_transfer_consignment(bytes).unwrap();
+        assert_eq!(
+            transfer.contract_id().to_string(),
+            "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y"
+        );
+        assert_eq!(
+            transfer.schema_id().to_string(),
+            "rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango"
+        );
+        assert_eq!(transfer.bundles.len(), bundles);
+        assert_eq!(encode_rgb20_transfer_consignment(&transfer).unwrap(), bytes);
+    }
+}
 
 #[test]
 fn utexo_transfer_preserves_contract_schema_and_wire_format() {

@@ -1,0 +1,137 @@
+{
+  "observed_at_utc": "2026-09-17T02:59:42.373103+00:00",
+  "scope": "Official UTEXO faucet test USDT core interoperability; not daemon HTTP API or mainnet redemption",
+  "reference_commit": "b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4",
+  "asset": {
+    "asset_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+    "ticker": "USDT",
+    "name": "USDT Token",
+    "details": null,
+    "precision": 6,
+    "initial_supply": 1000000000000,
+    "max_supply": 1000000000000,
+    "known_circulating_supply": 1000000000000,
+    "timestamp": 1781004102,
+    "added_at": 1789612511,
+    "balance": {
+      "settled": 99400000,
+      "future": 99400000,
+      "spendable": 99400000
+    },
+    "media": null,
+    "reject_list_url": null
+  },
+  "transfers": [
+    {
+      "idx": 6,
+      "status": "Settled",
+      "kind": "ReceiveBlind",
+      "txid": "067078c9bdb413e252c06ae4cba69e223793afb7a87d9ccd70fe91069943fb58",
+      "requested_assignment": {
+        "Fungible": 1000000
+      },
+      "assignments": [
+        {
+          "Fungible": 100000000
+        }
+      ],
+      "receive_utxo": {
+        "txid": "c14bec09c099247ab3d693b74808e21e2515faa78dd5c5aece500908aec0f8e3",
+        "vout": 1
+      },
+      "change_utxo": null
+    },
+    {
+      "idx": 10,
+      "status": "Settled",
+      "kind": "Send",
+      "txid": "e03949b3ae3b7403524433b9e644a6f174d24cc5e911371c181da65e06dfafb3",
+      "requested_assignment": {
+        "Fungible": 1000000
+      },
+      "assignments": [
+        {
+          "Fungible": 99000000
+        }
+      ],
+      "receive_utxo": null,
+      "change_utxo": {
+        "txid": "e03949b3ae3b7403524433b9e644a6f174d24cc5e911371c181da65e06dfafb3",
+        "vout": 2
+      }
+    },
+    {
+      "idx": 11,
+      "status": "Settled",
+      "kind": "ReceiveWitness",
+      "txid": "b66a5c2f97d0fd2e5b96da9f6427be524f748b7b625c742bce6e91d39d8597e5",
+      "requested_assignment": {
+        "Fungible": 400000
+      },
+      "assignments": [
+        {
+          "Fungible": 400000
+        }
+      ],
+      "receive_utxo": {
+        "txid": "b66a5c2f97d0fd2e5b96da9f6427be524f748b7b625c742bce6e91d39d8597e5",
+        "vout": 1
+      },
+      "change_utxo": null
+    }
+  ],
+  "refresh": {
+    "11": {
+      "updated_status": "Settled",
+      "failure": null
+    },
+    "1": {
+      "updated_status": null,
+      "failure": null
+    },
+    "2": {
+      "updated_status": null,
+      "failure": null
+    }
+  },
+  "bihelix_settled": {
+    "amounts": [
+      600000
+    ],
+    "promoted": 1
+  },
+  "proxy_acks": [
+    {
+      "recipient_id": "sb:wvout:A4TrpRdm-cPQ9qzf-HvBhXaT-A4h_IOA-AAAAAAA-AAAAAAA-AmhcXKQ",
+      "ack": true
+    },
+    {
+      "recipient_id": "sb:wvout:BW2fFzyZ-rPF9Sy1-V5DZzmZ-YSFEKAF-CbmBQBP-xgIe191-N1YaG4g",
+      "ack": true
+    }
+  ],
+  "chain": [
+    {
+      "txid": "067078c9bdb413e252c06ae4cba69e223793afb7a87d9ccd70fe91069943fb58",
+      "confirmed": true,
+      "block_height": 630486,
+      "block_hash": "000001dad76e61719edbae93bbf27d897b900236adde678db27e4af5f7232bff",
+      "block_time": 1789610657
+    },
+    {
+      "txid": "e03949b3ae3b7403524433b9e644a6f174d24cc5e911371c181da65e06dfafb3",
+      "confirmed": true,
+      "block_height": 630570,
+      "block_hash": "000001d95c22e5e13396edc2485e750dff4ce6cedda722391797aa30ff459309",
+      "block_time": 1789613231
+    },
+    {
+      "txid": "b66a5c2f97d0fd2e5b96da9f6427be524f748b7b625c742bce6e91d39d8597e5",
+      "confirmed": true,
+      "block_height": 630577,
+      "block_hash": "000002aaf3c3eaf8845835106f920e11124445a84374484a65859f829c6e361d",
+      "block_time": 1789613446
+    }
+  ],
+  "raw_balance_sum": 100000000
+}

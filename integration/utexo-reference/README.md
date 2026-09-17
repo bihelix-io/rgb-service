@@ -1,5 +1,10 @@
 # UTEXO reference wallet and BiHelix compatibility harness
 
+> 2026-09-17: This Node reference wallet is frozen. Its native beta.13 cannot
+> recognize the current faucet IFA schema. The active test wallet uses the
+> [isolated Rust reference client](../utexo-rust-reference/README.md). Do not
+> resume spending from the old wallet or a local snapshot after migration.
+
 This is an isolated **UTEXO signet** integration harness, not a new daemon HTTP
 API or a production wallet. The BiHelix side uses `rgb-service-local` directly;
 its stock must be separate from any running daemon database. The reference SDK

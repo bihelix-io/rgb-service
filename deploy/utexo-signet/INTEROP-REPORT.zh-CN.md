@@ -1,10 +1,10 @@
 # UTEXO 互操作实测记录
 
-初次测试：2026-09-16；最新重试：2026-09-17，Asia/Shanghai。最新状态见文末。分支：`feat/utexo-signet-integration`。
+初次测试：2026-09-16；最新验收：2026-09-17，Asia/Shanghai。最新状态见文末。分支：`feat/utexo-signet-integration`。
 
 ## 结果与范围
 
-通用 NIA 测试资产完成 UTEXO SDK → BiHelix 核心 → UTEXO SDK 的真实链上往返；官方 RGB USDT 尚未获得，未验收。测试通过 `rgb-service-local` 独立 harness 完成，不等于 daemon 已实现公共外部收发 HTTP API，也没有完成 BiHelix A → B、故障恢复或 Mint 承兑验收。
+通用 NIA 及官方 Faucet 测试 RGB USDT 均已完成 UTEXO 参考端 → BiHelix 核心 → UTEXO 参考端的真实链上往返。官方 USDT 使用隔离 Rust 参考端，最终余额为参考端 99.4 USDT、BiHelix 0.6 USDT，合计 100 USDT；详见文末。测试通过 `rgb-service-local` 独立 harness 完成，不等于 daemon 已实现公共外部收发 HTTP API，也没有完成 BiHelix A → B、故障恢复或 Mint 承兑验收。
 
 对照版本：Node 22.23.2、`@utexo/rgb-sdk@1.0.0-beta.8`、`@utexo/rgb-lib@0.3.0-beta.13`。网络为 SDK 的 `utexo` 自定义 signet；Esplora 为 https://esplora-api.utexo.com，proxy 为 https://rgb-proxy.utexo.com/json-rpc。
 
@@ -110,3 +110,47 @@ SDK beta.9 的 Node binding gitHead `adb1c010cbe1d455759ba9bac474db5449589ed7` �
 结论：已定位到“Rust 核心支持更新，已发布 Node SDK/native 滞后”。单纯 `npm update` 或改 SDK beta.9 不能据此解决。接续应在隔离测试环境构建支持该 IFA 的 native/参考客户端，先验证 API 与数据库迁移兼容性，再处理现有接收状态；不能只替换 schema 常量或直接让新版打开唯一钱包副本。
 
 发布元数据来源：[SDK](https://registry.npmjs.org/@utexo/rgb-sdk)、[Node native](https://registry.npmjs.org/@utexo/rgb-lib)、[Linux native](https://registry.npmjs.org/@utexo/rgb-lib-linux-x64)、[RN SDK](https://registry.npmjs.org/@utexo/rgb-sdk-rn)。
+
+## 2026-09-17 官方测试 USDT：隔离 Rust 参考端实测
+
+在钱包副本构建官方 `rgb-lib` [v0.3.0-beta.20](https://github.com/UTEXO-Protocol/rgb-lib/tree/v0.3.0-beta.20)，固定 commit `b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4`，锁定依赖。该 tag 的 Cargo package 版本仍写 beta.5，复现时必须以 git commit 为准。客户端位于 `integration/utexo-rust-reference`，已在 AWS release 构建并执行真实交易；不是将新版 native 强行装入旧 Node SDK。
+
+### 迁移与故障处理
+
+- 冻结旧 Node runner，复制完整钱包和接收秘密到 `reference-rust-signet-state`。原钱包及本地旧快照保留，不得再用于花费。
+- 旧 BDK watch-only 链缓存报 `bincode ... tag for enum is not valid, found 10`。仅在隔离副本中归档 `bdk_db_watch_only` 为 `.pre-beta20`，保留 RGB stock、SQLite 和秘密，启用一致性检查后重新全量扫描。
+- 必须使用 `BitcoinNetwork::Signet`，与旧 SDK 的 `utexo` 映射和 Faucet 合约一致；`SignetCustom` 导致网络不匹配。失败试验目录 `reference-rust-state` 保留作取证，不能用于花费。
+- 显式配置 NIA/IFA/CFA/UDA schemas；该 revision 的空列表实际报 `NoSupportedSchemas`。没有改 schema 常量或跳过共识验证。
+- 首次准备发送报 `InsufficientAllocationSlots`，未广播。向官方 Bot 申请测试 BTC，到账 50000 sats（TX `a9eac85170f8edd0b8da588fd2f5398dddf35346f5d98eb81e17bcba122b8680`，高度 630563），再用全新操作目录准备发送。
+- 所有签名 PSBT 在广播前核对输出、资产数量及费用，保留 intent/result；发生不明确错误时不自动重发。测试私钥、助记词、钱包数据库均未进入 Git。
+
+### 资产与交易
+
+- Contract：`rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y`。
+- IFA schema：`rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango`。
+- 元数据：ticker `USDT`，name `USDT Token`，precision **6**；initial/max/known circulating supply 均为 1000000000000 原始单位，reject_list_url=null。
+- Faucet 实收 **100000000 原始单位，即 100 测试 USDT**，已结算。invoice 请求 1000000，不代表实际到账也是 1000000；数量以验证后钱包资产状态为准。
+
+| 操作 | USDT | TXID | 确认高度 |
+| --- | ---: | --- | ---: |
+| 官方 Faucet → 参考端 | 100 | `067078c9bdb413e252c06ae4cba69e223793afb7a87d9ccd70fe91069943fb58` | 630486 |
+| 参考端 → BiHelix Carol | 1 | `e03949b3ae3b7403524433b9e644a6f174d24cc5e911371c181da65e06dfafb3` | 630570 |
+| BiHelix Carol → 参考端 | 0.4 | `b66a5c2f97d0fd2e5b96da9f6427be524f748b7b625c742bce6e91d39d8597e5` | 630577 |
+
+BiHelix 完整验证来款并接受 1000000 原始单位，位于来款 TX vout=1。返还 TX vout=0 为 OP_RETURN，vout=1 给参考端 2000 sats，vout=2 给 Carol 2500 sats；BTC 费用 500 sats。参考端发送的 BTC 费用为 487 sats。两个方向的 proxy ACK 查询均为 true，返还接收端 refresh 无验证错误。BiHelix scanner 返还结算输出为 `{"amounts":[600000],"promoted":1}`。
+
+公开 consignment 位于 `tests/fixtures/utexo-usdt/`，三个证明分别包含 104、105、106 bundles；`manifest.json` 保存 SHA256、字节数和交易来源。新增官方 IFA 证明回归测试覆盖 contract/schema、历史 bundles 数及字节级往返，AWS `cargo test --locked --release -p rgb-service-local --test utexo_fixtures` **5 项全部通过**。此离线测试不替代上述链上验收。
+
+活动钱包：AWS `/home/ubuntu/utexo-integration/reference-rust-signet-state`；BiHelix 活动 USDT stock：`interop-stock-usdt-carol`。各自保留自己的 consignment 与钱包状态。运行中的 daemon、公共 API 和共识规则未修改。
+
+范围：本次资产来自 UTEXO 官方测试 Faucet，不能据此证明主网 Tether USDT 发行身份、储备、承兑或 Mint 权限。Mint networks 之前的 403、daemon 外部 HTTP 收发与恢复测试、Lightning、主网接入仍需分别完成。旧错误说明和 SDK 审计段保留为历史记录，应以本节后续最终结算结果为准。
+
+### 最终验收：双向已结算
+
+最终参考端 Faucet receive、1 USDT send、0.4 USDT return receive 均为 `Settled`；USDT 的 settled/future/spendable 均为 **99400000**。BiHelix 持有已确认找零 **600000**，总额 **100000000 = 100 USDT**，与 Faucet 实收一致。中途 `WaitingConfirmations` 阶段 future 曾显示 99800000，不作为验收余额；完成下一轮刷新后全部收敛。公开查询时间、双方余额、transfer 状态、ACK 和区块确认快照见 `tests/fixtures/utexo-usdt/roundtrip-public-evidence.json`。
+
+**官方 Faucet 测试 RGB USDT 的核心链上双向互操作通过。** P0 官方资产互操作证据已补齐；P1/P2 daemon 公共外部收发接口及故障恢复尚待实现与验收。本次没有向讨论组发送消息。
+
+可供人工转发的英文结论（未代发）：
+
+> Resolved for the testnet core interoperability flow: the official faucet delivered 100 test USDT (precision 6). Using an isolated reference client pinned to official rgb-lib v0.3.0-beta.20, commit b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4, we sent 1 USDT to BiHelix and returned 0.4 USDT. Both directions confirmed and settled. Final balances are 99.4 USDT in the reference wallet and 0.6 USDT in BiHelix. The older published Node SDK/native combination failed with UnknownRgbSchema for the current faucet IFA schema. This result covers on-chain core interoperability; daemon API integration, Mint access and mainnet redemption remain separate work.

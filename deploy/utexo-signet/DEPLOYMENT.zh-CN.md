@@ -40,4 +40,4 @@ UTEXO 高度 100 哈希为 `0000027606cb73bbf383cb8666bd402dd0de1e154c39688db7b7
 
 ## 后续互操作实测
 
-已建立官方 SDK 对照钱包，并完成通用 NIA 测试资产的链上双向往返。新增工具支持受限测试签名；这些操作使用独立 stock，运行中 daemon 二进制与业务 API 未因此更新。官方 USDT 未获发放，Mint 与 Lightning 未验收。完整版本、交易、故障及接续条件见 [互操作实测记录](INTEROP-REPORT.zh-CN.md)。
+已建立官方 SDK 对照钱包，并完成通用 NIA 测试资产的链上双向往返。新增工具支持受限测试签名；这些操作使用独立 stock，运行中 daemon 二进制与业务 API 未因此更新。2026-09-17 已用隔离 Rust 参考端完成官方 Faucet 测试 USDT 的核心链上往返（1 USDT 来款、0.4 USDT 返还，最终参考端 99.4 / BiHelix 0.6）。活动参考钱包为 `reference-rust-signet-state`，USDT stock 为 `interop-stock-usdt-carol`；旧 Node 钱包已冻结。daemon 外部 HTTP API、Mint 与 Lightning 未验收。完整版本、交易、故障及接续条件见 [互操作实测记录](INTEROP-REPORT.zh-CN.md)。

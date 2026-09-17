@@ -1,0 +1,11 @@
+[package]
+name = "utexo-rust-reference"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rgb-lib = { git = "https://github.com/UTEXO-Protocol/rgb-lib", rev = "b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4", default-features = false, features = ["esplora"] }
+serde_json = "1"

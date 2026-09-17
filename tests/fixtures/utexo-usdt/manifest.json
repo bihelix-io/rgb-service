@@ -1,0 +1,40 @@
+{
+  "network": "UTEXO custom signet; RGB BitcoinSignet",
+  "provenance": "Official UTEXO RGBLNBot test USDT, received 2026-09-17; not mainnet USDT or redemption evidence",
+  "contract_id": "rgb:f~9F4X0C-TiLOTvy-pALF29V-2xJ2p0m-hP3_vpW-Alj4G5Y",
+  "schema_id": "rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango",
+  "precision": 6,
+  "reference_rgb_lib": {
+    "tag": "v0.3.0-beta.20",
+    "commit": "b5c2fb6e53bc8bce2c72e5e9ee50412d2a2f16a4"
+  },
+  "fixtures": [
+    {
+      "file": "official-faucet-usdt.consignment",
+      "sha256": "01e8f55af34f277b375b44ffcdf2038720222057bbefdf61d56f71ab7bb09c87",
+      "bytes": 71705,
+      "txid": "067078c9bdb413e252c06ae4cba69e223793afb7a87d9ccd70fe91069943fb58",
+      "raw_amount": 100000000,
+      "bundles": 104,
+      "confirmed_height": 630486
+    },
+    {
+      "file": "usdt-reference-to-carol.consignment",
+      "sha256": "39870d8a6d82b5debe9b2c006189af36a010c24c8df99a3a0f48d7a65a18a8aa",
+      "bytes": 72237,
+      "txid": "e03949b3ae3b7403524433b9e644a6f174d24cc5e911371c181da65e06dfafb3",
+      "raw_amount": 1000000,
+      "bundles": 105,
+      "confirmed_height": 630570
+    },
+    {
+      "file": "return.consignment",
+      "sha256": "7c17e320c9ee597a9c8b0a22f97d10ee2c97c13b882fa06095b2a464f1c25db2",
+      "bytes": 72774,
+      "txid": "b66a5c2f97d0fd2e5b96da9f6427be524f748b7b625c742bce6e91d39d8597e5",
+      "raw_amount": 400000,
+      "bundles": 106,
+      "confirmed_height": 630577
+    }
+  ]
+}
