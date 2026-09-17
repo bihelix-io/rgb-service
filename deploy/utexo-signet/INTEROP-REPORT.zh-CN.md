@@ -88,3 +88,25 @@ AWS 上执行 `cargo test --locked --release -p rgb-service-local --test utexo_f
 可发送的英文补充（未代发）：
 
 > Update: the faucet retry succeeded on Sep 17 at approximately 02:04 UTC. TXID: `067078c9bdb413e252c06ae4cba69e223793afb7a87d9ccd70fe91069943fb58`. We downloaded the consignment and BiHelix core successfully validated it against the chain. However, the native refresh result under `@utexo/rgb-sdk@1.0.0-beta.8` / `@utexo/rgb-lib@0.3.0-beta.13` reports `UnknownRgbSchema` for `rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango`. The receive remains `WaitingCounterparty` and no USDT balance is listed. Which SDK/native version supports this faucet asset? Also, the dev bridge `/api/v0/networks` endpoint still returns 403 from both environments; could you confirm how access is delivered and enabled for the email already provided? Correction to our previous report: the bot displays 100000000, not 1000000. The submitted invoice requests 1000000 raw units; we have not yet verified the actual received amount or precision.
+
+## 2026-09-17 SDK 版本与源码核对
+
+直接查询 npm registry、GitHub 发布源码，并静态检查 Linux native 发布包，未变更运行中依赖/钱包数据库。
+
+| 组件 | 发布状态 | 底层依赖/结论 |
+| --- | --- | --- |
+| `@utexo/rgb-sdk` latest | `1.0.0-beta.8`，2026-04-03 | 精确锁定 rgb-lib beta.13 / sdk-core beta.2；当前正在使用 |
+| `@utexo/rgb-sdk` beta | `1.0.0-beta.9`，2026-04-09 | 精确锁定 rgb-lib `0.3.0-beta.16.dev` / sdk-core beta.3；仅切 beta 不足以匹配本次 IFA |
+| `@utexo/rgb-lib` latest | `0.3.0-beta.18`，2026-04-14 | Linux 平台包于 04-16 发布；其 `.so` 包含旧 IFA schema `p6H_wt...scale-year-shave`，未发现 Faucet 的 `IpjJh...shoe-colombo-mango` 常量 |
+| `@utexo/rgb-sdk-rn` latest | `1.0.0-beta.32`，2026-09-14 | 移动端另一发布线，依赖 sdk-core beta.9；不能直接替换 Node SDK |
+| `@utexo/rgb-sdk-core` latest | `1.0.0-beta.9`，2026-09-14 | JS 核心更新不等于 Node native schema 支持更新 |
+
+Node SDK 的 [GitHub 仓库](https://github.com/UTEXO-Protocol/rgb-sdk) 已于 2026-07-28 归档。`npm latest` 不代表当前维护中的整个 UTEXO 栈。
+
+Faucet schema 精确对应 rgb-lib 的 `SCHEMA_ID_IFA`（可增发资产）。已逐个检查 Rust 标签 beta.19 至 beta.34：beta.19 为旧 ID；[beta.20 源码](https://github.com/UTEXO-Protocol/rgb-lib/blob/v0.3.0-beta.20/src/wallet/mod.rs)及本次检查的后续标签含当前 ID。当前 dev commit `66e558cef0a562a6234639d0641caea30f4d4382` 也包含该 ID。此为源码识别能力证据，不是这些版本已完成本钱包接收/返还的运行验收。
+
+SDK beta.9 的 Node binding gitHead `adb1c010cbe1d455759ba9bac474db5449589ed7` 指向 rgb-lib 子模块 `e8d8c7a162bb5ecb3bb6edaefe9637be2d1996ed`，其 IFA 常量仍为旧 ID。Node Linux beta.18 发布包独立核查，不能把 Rust 同名标签与 npm 平台包假定为同一构建。
+
+结论：已定位到“Rust 核心支持更新，已发布 Node SDK/native 滞后”。单纯 `npm update` 或改 SDK beta.9 不能据此解决。接续应在隔离测试环境构建支持该 IFA 的 native/参考客户端，先验证 API 与数据库迁移兼容性，再处理现有接收状态；不能只替换 schema 常量或直接让新版打开唯一钱包副本。
+
+发布元数据来源：[SDK](https://registry.npmjs.org/@utexo/rgb-sdk)、[Node native](https://registry.npmjs.org/@utexo/rgb-lib)、[Linux native](https://registry.npmjs.org/@utexo/rgb-lib-linux-x64)、[RN SDK](https://registry.npmjs.org/@utexo/rgb-sdk-rn)。
