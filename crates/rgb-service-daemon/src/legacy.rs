@@ -845,7 +845,7 @@ fn add_redeem_bip32_derivation(
     Ok(())
 }
 
-const LEGACY_BLOCKING_MAX_CONCURRENCY: usize = 4;
+const LEGACY_BLOCKING_MAX_CONCURRENCY: usize = 8;
 const LEGACY_BLOCKING_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const LEGACY_BLOCKING_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
