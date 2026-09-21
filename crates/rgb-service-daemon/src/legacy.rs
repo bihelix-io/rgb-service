@@ -36,7 +36,7 @@ use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase, SingleWr
 use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
 use rgb_service_local::{
     is_electrum_url, list_rgb20_assets_for_utxos, normalize_electrum_url, prepare_rgb20_psbt,
-    select_rgb20_inputs, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
+    select_rgb20_inputs, shared_rgb_store_account_id, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1445,7 +1445,7 @@ async fn transfer_psbt(
     if rgb_assignments.is_empty() {
         let mut wallet = open_legacy_wallet(&state.service, &state.config, desc)?;
         sync_legacy_wallet(&state.service, &state.config, &mut wallet)?;
-        let psbt = build_legacy_btc_only_psbt(&state, &account_id, &mut wallet, &req)?;
+        let psbt = build_legacy_btc_only_psbt(&state, &account_ids, &mut wallet, &req)?;
         wallet.persist()?;
         return Ok(Json(TransferPsbtResp {
             psbt: psbt.to_string(),
@@ -1612,13 +1612,13 @@ async fn transfer_psbt(
 
 fn build_legacy_btc_only_psbt(
     state: &LegacyState,
-    account_id: &str,
+    account_ids: &[String],
     wallet: &mut LegacyWallet,
     req: &TransferReq,
 ) -> Result<Psbt, LegacyHttpError> {
     let fee_rate = FeeRate::from_sat_per_vb(req.fee_rate)
         .ok_or_else(|| RgbServiceError::InvalidRequest("invalid fee_rate".to_string()))?;
-    let rgb_outpoints = legacy_rgb_allocated_outpoints(state, account_id, wallet)?;
+    let rgb_outpoints = legacy_rgb_allocated_outpoints(state, account_ids, wallet)?;
     let change_script = legacy_change_script(&wallet.wallet);
     let mut builder = wallet.wallet.build_tx();
     builder
@@ -1653,6 +1653,15 @@ fn build_legacy_btc_only_psbt(
     }
 
     if !rgb_outpoints.is_empty() {
+        state.service.logger().info(format!(
+            "legacy BTC-only PSBT protected RGB outpoints count={} outpoints={}",
+            rgb_outpoints.len(),
+            rgb_outpoints
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
         builder.unspendable(rgb_outpoints);
     }
     builder
@@ -1662,7 +1671,7 @@ fn build_legacy_btc_only_psbt(
 
 fn legacy_rgb_allocated_outpoints(
     state: &LegacyState,
-    account_id: &str,
+    account_ids: &[String],
     wallet: &LegacyWallet,
 ) -> Result<Vec<OutPoint>, LegacyHttpError> {
     let wallet_utxos = wallet
@@ -1674,15 +1683,23 @@ fn legacy_rgb_allocated_outpoints(
             confirmed: utxo.chain_position.is_confirmed(),
         })
         .collect::<Vec<_>>();
-    let allocations =
-        list_rgb20_assets_for_utxos(&state.service.account_stock_dir(account_id), wallet_utxos)
-            .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
-    Ok(allocations
-        .into_iter()
-        .map(|allocation| allocation.outpoint)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+    let mut outpoints = BTreeSet::new();
+    for account_id in account_ids {
+        if !state.service.account_stock_has_data(account_id) {
+            continue;
+        }
+        let allocations = list_rgb20_assets_for_utxos(
+            &state.service.account_stock_dir(account_id),
+            wallet_utxos.clone(),
+        )
+        .map_err(|err| RgbServiceError::Backend(format!("{err:#}")))?;
+        outpoints.extend(
+            allocations
+                .into_iter()
+                .map(|allocation| allocation.outpoint),
+        );
+    }
+    Ok(outpoints.into_iter().collect())
 }
 
 fn maybe_add_legacy_rgb_fee_assignment(
@@ -1892,6 +1909,80 @@ struct TransferCallbackReq {
     utxos: Option<Vec<TrackedUtxo>>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LegacyRgbInputAllocation {
+    account_id: String,
+    outpoint: String,
+    contract_id: String,
+}
+
+fn legacy_rgb_input_allocations(
+    state: &LegacyState,
+    tx: &Transaction,
+) -> Result<Vec<LegacyRgbInputAllocation>, LegacyHttpError> {
+    let input_utxos = tx
+        .input
+        .iter()
+        .filter(|input| !input.previous_output.is_null())
+        .map(|input| Rgb20TrackedUtxo {
+            outpoint: input.previous_output,
+            address: None,
+            confirmed: true,
+        })
+        .collect::<Vec<_>>();
+    if input_utxos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut protected = BTreeSet::new();
+    for stock_dir in state.service.account_stock_dirs()? {
+        let account_id = shared_rgb_store_account_id(&stock_dir).ok_or_else(|| {
+            RgbServiceError::Backend(format!(
+                "invalid shared RGB account stock locator: {}",
+                stock_dir.display()
+            ))
+        })?;
+        let allocations =
+            list_rgb20_assets_for_utxos(&stock_dir, input_utxos.clone()).map_err(|err| {
+                RgbServiceError::Backend(format!(
+                    "inspect RGB inputs for account {account_id}: {err:#}"
+                ))
+            })?;
+        protected.extend(
+            allocations
+                .into_iter()
+                .map(|allocation| LegacyRgbInputAllocation {
+                    account_id: account_id.clone(),
+                    outpoint: allocation.outpoint.to_string(),
+                    contract_id: allocation.contract_id.to_string(),
+                }),
+        );
+    }
+    Ok(protected.into_iter().collect())
+}
+
+fn reject_unprepared_rgb_inputs(
+    txid: &str,
+    allocations: &[LegacyRgbInputAllocation],
+) -> Result<(), RgbServiceError> {
+    if allocations.is_empty() {
+        return Ok(());
+    }
+    let details = allocations
+        .iter()
+        .map(|allocation| {
+            format!(
+                "{} contract={} account={}",
+                allocation.outpoint, allocation.contract_id, allocation.account_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(RgbServiceError::Conflict(format!(
+        "refusing BTC-only transfer {txid}: RGB-bearing inputs require a prepared RGB transfer: {details}"
+    )))
+}
+
 async fn transfer_callback(
     State(state): State<LegacyState>,
     Json(req): Json<TransferCallbackReq>,
@@ -1927,14 +2018,14 @@ async fn transfer_callback(
     state.service.logger().info(format!(
         "legacy transfer callback txid={txid} transfer_id={transfer_id} has_desc={has_desc} has_transfer_id_field={has_transfer_id_field}"
     ));
-    let account_id = state
+    let prepared_account_id = state
         .service
-        .legacy_find_prepared_transfer_account_id(&transfer_id)?
-        .or(desc_account_id);
+        .legacy_find_prepared_transfer_account_id(&transfer_id)?;
+    let account_id = prepared_account_id.clone().or(desc_account_id);
     // RGB commit first: stage the fascia/consignment into stock so that RGB
     // state is persisted before we attempt broadcast. If broadcast fails the
     // RGB transition is already recorded and the tx can be re-broadcast later.
-    if let Some(account_id) = &account_id {
+    if let Some(account_id) = &prepared_account_id {
         state
             .service
             .legacy_commit_prepared_transfer(
@@ -1943,12 +2034,25 @@ async fn transfer_callback(
                 &txid,
                 req.utxos.unwrap_or_default(),
             )
-            .or_else(|err| match err {
-                RgbServiceError::NotFound(_) if req.desc.is_some() => Ok(()),
-                err => Err(err),
-            })?;
+            ?;
     } else {
-        // No prepared transfer and no desc: BTC-only transfer, nothing to commit.
+        // A callback without a matching prepared transfer may only spend pure
+        // BTC inputs. Scan every persisted account stock so a missing alias or
+        // descriptor mapping cannot make an RGB-bearing UTXO look spendable.
+        let protected = legacy_rgb_input_allocations(&state, &tx)?;
+        if let Err(err) = reject_unprepared_rgb_inputs(&txid, &protected) {
+            state.service.logger().info(format!(
+                "legacy transfer callback rejected unprepared RGB spend txid={txid} inputs={}",
+                protected
+                    .iter()
+                    .map(|allocation| allocation.outpoint.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            return Err(err.into());
+        }
         state.service.logger().info(format!(
             "legacy transfer callback btc-only (no rgb commit) txid={txid}"
         ));
@@ -2416,6 +2520,28 @@ mod tests {
     use bdk_wallet::bitcoin::{Network, PublicKey};
 
     const LEGACY_DESCRIPTOR_KEY: &str = "[a49cd98b/84'/827166'/0']xpub6Bz49QXuN7g57fzNQJA8sbQKu8ihjcaPKCwYUq3HXXn5LXNn6ejuXEUSmcHgAFAdtyBgxFyumSNivxp5gtwbN7XkUTEMh4vuLTBfW3ff82T/0/*";
+
+    #[test]
+    fn unprepared_rgb_input_guard_allows_pure_btc_and_rejects_rgb() {
+        assert!(reject_unprepared_rgb_inputs("btc-only", &[]).is_ok());
+
+        let protected = LegacyRgbInputAllocation {
+            account_id: "legacy-desc:test".to_string(),
+            outpoint: "c0c8cb590532cc3a844abf799a8cc57f401c9221a4374e748a975fdad6b0a23b:0"
+                .to_string(),
+            contract_id: "rgb:CYSnItgu-test".to_string(),
+        };
+        let error = reject_unprepared_rgb_inputs("unsafe", &[protected]).unwrap_err();
+        let RgbServiceError::Conflict(message) = error else {
+            panic!("RGB-bearing BTC-only input must return a conflict");
+        };
+        assert!(message.contains("unsafe"));
+        assert!(
+            message.contains("c0c8cb590532cc3a844abf799a8cc57f401c9221a4374e748a975fdad6b0a23b:0")
+        );
+        assert!(message.contains("rgb:CYSnItgu-test"));
+        assert!(message.contains("legacy-desc:test"));
+    }
 
     #[test]
     fn stake_address_script_matches_wallet_service_v2_contract() {
