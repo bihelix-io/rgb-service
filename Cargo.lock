@@ -7132,9 +7132,9 @@ dependencies = [
 
 [[package]]
 name = "zust-compiler"
-version = "0.9.47"
+version = "0.9.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1fc3a2445bcf11770d47be7e342b024277c5546720f278f734b46945a025e4f"
+checksum = "fe9dffa47bb944953f67b42dd3d4893791ae3f92b04a1e9b04e9aef943217444"
 dependencies = [
  "anyhow",
  "indexmap 2.14.0",
@@ -7186,9 +7186,9 @@ dependencies = [
 
 [[package]]
 name = "zust-dynamic"
-version = "0.9.25"
+version = "0.9.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f40866b0adea47d8104f80271815a76f97881d8333e538b0db4ceabf4d8dcec"
+checksum = "4360b710e656b376d36837d3027cd95b44e8677af75659b895ddd2153f1be3a6"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -7207,9 +7207,9 @@ dependencies = [
 
 [[package]]
 name = "zust-parser"
-version = "0.9.26"
+version = "0.9.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d842f7dd8986c4718bcbaa60a281f4d48c867d17c12d012449c57b951fdb8132"
+checksum = "393c30dd90f43f78be838e90e4b367edadf161bcbab9b39384baf92c21916c76"
 dependencies = [
  "anyhow",
  "num_enum",
@@ -7220,9 +7220,9 @@ dependencies = [
 
 [[package]]
 name = "zust-root"
-version = "0.9.28"
+version = "0.9.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee9f87c0dbd64b9d0db3acdbd6851671530e7c9edd7b0d60208a6b5236f88e38"
+checksum = "11870f222b795f70cecde7b1837f83d2d0903f203800816f7d53fb82f297ee58"
 dependencies = [
  "anndists",
  "anyhow",
@@ -7247,9 +7247,9 @@ dependencies = [
 
 [[package]]
 name = "zust-vm"
-version = "0.9.108"
+version = "0.9.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a88d05e8f0eadfe80a0ccda59f533bdc11cfcf177d803cb0cd6efb8de48de18"
+checksum = "71cbcdb7be333e0ad558668186ef617f4c7e4242df03bf757565deafc4bdab1a"
 dependencies = [
  "anyhow",
  "axum",

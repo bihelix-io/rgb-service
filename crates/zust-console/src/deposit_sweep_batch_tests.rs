@@ -175,7 +175,7 @@ fn rgb_checks_are_chunked_and_preserve_all_safe_inputs() {
     let mut candidates = vec![candidate(65)];
     candidates[0].safe.clear();
     classify_rgb(&mut candidates, &url, Instant::now() + Duration::from_secs(3));
-    assert_eq!(job.join().unwrap(), vec![64, 1]);
+    assert_eq!(job.join().unwrap_or_else(|_| panic!("RGB mock failed; client errors: {:?}", candidates[0].failed)), vec![64, 1]);
     assert_eq!(candidates[0].safe.len(), 65);
     assert!(candidates[0].failed.is_empty());
 }
@@ -186,7 +186,7 @@ fn missing_rgb_allocations_are_not_treated_as_safe() {
     let mut candidates = vec![candidate(1)];
     candidates[0].safe.clear();
     classify_rgb(&mut candidates, &url, Instant::now() + Duration::from_secs(3));
-    job.join().unwrap();
+    job.join().unwrap_or_else(|_| panic!("RGB mock failed; client errors: {:?}", candidates[0].failed));
     assert!(candidates[0].safe.is_empty());
     assert_eq!(candidates[0].failed.len(), 1);
 }

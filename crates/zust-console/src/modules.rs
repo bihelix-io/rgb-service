@@ -82,6 +82,10 @@ mod deposit_sweep_batch;
 #[path = "consolidation_regression.rs"]
 mod consolidation_regression;
 
+#[cfg(test)]
+#[path = "native_return_regression.rs"]
+mod native_return_regression;
+
 pub(crate) fn daemon_url() -> Result<String> {
     let daemon_url =
         local_string("rgb-service").context("missing root value `local/rgb-service`")?;
@@ -8250,21 +8254,21 @@ fn native_dynamic_result(
 ) -> *const Dynamic {
     let input = unsafe { &*input };
     match f(input) {
-        Ok(value) => Box::into_raw(Box::new(value)),
-        Err(err) => Box::into_raw(Box::new(json_to_dynamic(&json!({
+        Ok(value) => vm::alloc_dynamic(value),
+        Err(err) => vm::alloc_dynamic(json_to_dynamic(&json!({
             "ok": false,
             "error": format!("{err:#}")
-        })))),
+        }))),
     }
 }
 
 fn native_result(f: impl FnOnce() -> Result<Dynamic>) -> *const Dynamic {
     match f() {
-        Ok(value) => Box::into_raw(Box::new(value)),
-        Err(err) => Box::into_raw(Box::new(json_to_dynamic(&json!({
+        Ok(value) => vm::alloc_dynamic(value),
+        Err(err) => vm::alloc_dynamic(json_to_dynamic(&json!({
             "ok": false,
             "error": format!("{err:#}")
-        })))),
+        }))),
     }
 }
 
