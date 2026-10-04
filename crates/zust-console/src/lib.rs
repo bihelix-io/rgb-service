@@ -1,3 +1,4 @@
+mod electrum_transport;
 pub mod btc_ln;
 pub mod ln_rgb_btc_ln_backend;
 pub mod lnnode;

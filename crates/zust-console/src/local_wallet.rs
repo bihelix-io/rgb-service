@@ -745,50 +745,15 @@ fn electrum_endpoint(source: &str) -> Result<String> {
 }
 
 pub fn electrum_rpc(config: &ElectrumConfig, method: &str, params: Value) -> Result<Value> {
-    let endpoint = electrum_endpoint(&config.url)?;
-    let address = endpoint
-        .to_socket_addrs()
-        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
-        .next()
-        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .context("set Electrum read timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(15)))
-        .context("set Electrum write timeout")?;
-    let request = json!({
-        "id": now_secs(),
-        "method": method,
-        "params": params.as_array().cloned().unwrap_or_default()
-    });
-    let request_line = serde_json::to_string(&request).context("encode Electrum request")? + "\n";
-    stream
-        .write_all(request_line.as_bytes())
-        .with_context(|| format!("write Electrum request {method} to {endpoint}"))?;
-    stream
-        .flush()
-        .with_context(|| format!("flush Electrum request {method} to {endpoint}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .with_context(|| format!("read Electrum response {method} from {endpoint}"))?;
-    if response_line.trim().is_empty() {
-        bail!("empty Electrum response for {method} from {endpoint}");
-    }
-    let response: Value = serde_json::from_str(&response_line)
-        .with_context(|| format!("decode Electrum response for {method}: {response_line}"))?;
-    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        bail!("Electrum {method} failed: {error}");
-    }
-    response
-        .get("result")
-        .cloned()
-        .context("Electrum response missing result")
+    crate::electrum_transport::rpc(
+        &config.url,
+        method,
+        params,
+        Duration::from_secs(5),
+        std::time::Instant::now() + Duration::from_secs(35),
+    )
 }
+
 
 pub fn electrum_script_hash_hex(script: &ScriptBuf) -> String {
     let digest = sha256::Hash::hash(script.as_bytes());

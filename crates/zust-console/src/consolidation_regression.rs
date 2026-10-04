@@ -30,27 +30,42 @@ impl MockElectrum {
                         let requests = requests.clone();
                         let active = active.clone();
                         let peak = peak.clone();
+                        let stop = stop.clone();
                         connections.push(thread::spawn(move || {
-                            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                            socket.set_nonblocking(false).unwrap();
+                            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
                             socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-                            let mut line = String::new();
-                            BufReader::new(socket.try_clone().unwrap()).read_line(&mut line).unwrap();
-                            let request: Value = serde_json::from_str(&line).unwrap();
-                            assert_eq!(request["method"], "blockchain.scripthash.listunspent");
-                            requests.fetch_add(1, Ordering::SeqCst);
-                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                            peak.fetch_max(current, Ordering::SeqCst);
-                            thread::sleep(Duration::from_millis(80));
-                            let response = if fail {
-                                json!({"id": request["id"], "error": {"code": -1, "message": "mock unavailable"}})
-                            } else {
-                                json!({"id": request["id"], "result": [
-                                    {"tx_hash": "11".repeat(32), "tx_pos": 0, "value": 4000, "height": 800000},
-                                    {"tx_hash": "22".repeat(32), "tx_pos": 1, "value": 5000, "height": 0}
-                                ]})
-                            };
-                            active.fetch_sub(1, Ordering::SeqCst);
-                            writeln!(socket, "{response}").unwrap();
+                            let mut reader = BufReader::new(socket.try_clone().unwrap());
+                            while !stop.load(Ordering::SeqCst) {
+                                let mut line = String::new();
+                                loop {
+                                    match reader.read_line(&mut line) {
+                                        Ok(0) => return,
+                                        Ok(_) => break,
+                                        Err(error) if matches!(error.kind(),
+                                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                                            if stop.load(Ordering::SeqCst) { return; }
+                                        }
+                                        Err(error) => panic!("mock read failed: {error}"),
+                                    }
+                                }
+                                let request: Value = serde_json::from_str(&line).unwrap();
+                                assert_eq!(request["method"], "blockchain.scripthash.listunspent");
+                                requests.fetch_add(1, Ordering::SeqCst);
+                                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(current, Ordering::SeqCst);
+                                thread::sleep(Duration::from_millis(80));
+                                let response = if fail {
+                                    json!({"id": request["id"], "error": {"code": -1, "message": "mock unavailable"}})
+                                } else {
+                                    json!({"id": request["id"], "result": [
+                                        {"tx_hash": "11".repeat(32), "tx_pos": 0, "value": 4000, "height": 800000},
+                                        {"tx_hash": "22".repeat(32), "tx_pos": 1, "value": 5000, "height": 0}
+                                    ]})
+                                };
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                writeln!(socket, "{response}").unwrap();
+                            }
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

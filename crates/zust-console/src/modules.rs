@@ -7333,117 +7333,23 @@ fn electrum_rpc_with_deadline(
     params: Value,
     deadline: std::time::Instant,
 ) -> Result<Value> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
-    let endpoint = electrum_endpoint(source)?;
-    let address = endpoint
-        .to_socket_addrs()
-        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
-        .next()
-        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
-    let connect_timeout = remaining.min(Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS));
-    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
-        .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
-    stream
-        .set_read_timeout(Some(remaining))
-        .context("set Electrum read timeout")?;
-    stream
-        .set_write_timeout(Some(remaining))
-        .context("set Electrum write timeout")?;
-    let request = json!({
-        "id": now_ms(),
-        "method": method,
-        "params": params
-    });
-    let request_line = format!("{}\n", serde_json::to_string(&request)?);
-    stream
-        .write_all(request_line.as_bytes())
-        .with_context(|| format!("write Electrum request {method} to {endpoint}"))?;
-    stream
-        .flush()
-        .with_context(|| format!("flush Electrum request {method} to {endpoint}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .with_context(|| format!("read Electrum response {method} from {endpoint}"))?;
-    ensure!(
-        !response_line.trim().is_empty(),
-        "empty Electrum response for {method} from {endpoint}"
-    );
-    let response: Value = serde_json::from_str(&response_line)
-        .with_context(|| format!("decode Electrum response for {method}: {response_line}"))?;
-    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        bail!("Electrum {method} failed: {error}");
-    }
-    response
-        .get("result")
-        .cloned()
-        .context("Electrum response missing result")
+    crate::electrum_transport::rpc(
+        source, method, params,
+        Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS), deadline,
+    )
 }
+
 
 fn electrum_rpc_pipeline_with_deadline(
     source: &str,
     calls: &[(u64, String, Value)],
     deadline: std::time::Instant,
 ) -> Result<std::collections::HashMap<u64, std::result::Result<Value, String>>> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
-    let endpoint = electrum_endpoint(source)?;
-    let address = endpoint
-        .to_socket_addrs()
-        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
-        .next()
-        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
-    let connect_timeout = remaining.min(Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS));
-    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
-        .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    ensure!(!remaining.is_zero(), "BTC address scan deadline exceeded");
-    stream
-        .set_read_timeout(Some(remaining))
-        .context("set Electrum pipeline read timeout")?;
-    stream
-        .set_write_timeout(Some(remaining))
-        .context("set Electrum pipeline write timeout")?;
-    for (id, method, params) in calls {
-        let request = json!({"id": id, "method": method, "params": params});
-        let request_line = format!("{}\n", serde_json::to_string(&request)?);
-        stream
-            .write_all(request_line.as_bytes())
-            .with_context(|| format!("write Electrum pipeline request {method} to {endpoint}"))?;
-    }
-    stream
-        .flush()
-        .with_context(|| format!("flush Electrum pipeline to {endpoint}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut responses = std::collections::HashMap::new();
-    while responses.len() < calls.len() {
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .with_context(|| format!("read Electrum pipeline response from {endpoint}"))?;
-        ensure!(!response_line.trim().is_empty(), "empty Electrum pipeline response from {endpoint}");
-        let response: Value = serde_json::from_str(&response_line)
-            .with_context(|| format!("decode Electrum pipeline response: {response_line}"))?;
-        let id = response
-            .get("id")
-            .and_then(Value::as_u64)
-            .context("Electrum pipeline response missing numeric id")?;
-        let result = if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-            Err(format!("{error}"))
-        } else {
-            response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| "Electrum response missing result".to_string())
-        };
-        responses.insert(id, result);
-    }
-    Ok(responses)
+    crate::electrum_transport::pipeline(
+        source, calls, Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS), deadline,
+    )
 }
+
 
 fn btc_scan_deposits_electrum_batch(
     requests: &[(usize, String, String)],
@@ -8002,54 +7908,16 @@ fn electrum_endpoint(source: &str) -> Result<String> {
 }
 
 fn electrum_rpc(source: &str, method: &str, params: Value) -> Result<Value> {
-    let endpoint = electrum_endpoint(source)?;
-    let address = endpoint
-        .to_socket_addrs()
-        .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
-        .next()
-        .with_context(|| format!("Electrum endpoint {endpoint} resolved no addresses"))?;
-    let mut stream = TcpStream::connect_timeout(
-        &address,
+    crate::electrum_transport::rpc(
+        source,
+        method,
+        params,
         Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS),
+        std::time::Instant::now()
+            + Duration::from_secs(BTC_ESPLORA_CONNECT_TIMEOUT_SECS + 2 * BTC_ESPLORA_REQUEST_TIMEOUT_SECS),
     )
-    .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(BTC_ESPLORA_REQUEST_TIMEOUT_SECS)))
-        .context("set Electrum read timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(BTC_ESPLORA_REQUEST_TIMEOUT_SECS)))
-        .context("set Electrum write timeout")?;
-    let request = json!({
-        "id": now_ms(),
-        "method": method,
-        "params": params.as_array().cloned().unwrap_or_default()
-    });
-    let request_line = serde_json::to_string(&request).context("encode Electrum request")? + "\n";
-    stream
-        .write_all(request_line.as_bytes())
-        .with_context(|| format!("write Electrum request {method} to {endpoint}"))?;
-    stream
-        .flush()
-        .with_context(|| format!("flush Electrum request {method} to {endpoint}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .with_context(|| format!("read Electrum response {method} from {endpoint}"))?;
-    ensure!(
-        !response_line.trim().is_empty(),
-        "empty Electrum response for {method} from {endpoint}"
-    );
-    let response: Value = serde_json::from_str(&response_line)
-        .with_context(|| format!("decode Electrum response for {method}: {response_line}"))?;
-    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        bail!("Electrum {method} failed: {error}");
-    }
-    response
-        .get("result")
-        .cloned()
-        .context("Electrum response missing result")
 }
+
 
 fn electrum_script_hash_hex(script: &ScriptBuf) -> String {
     let digest = sha256::Hash::hash(script.as_bytes());

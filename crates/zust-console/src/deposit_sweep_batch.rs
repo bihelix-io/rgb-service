@@ -164,40 +164,30 @@ fn read_rpc_line(reader: &mut BufReader<TcpStream>, deadline: Instant) -> Result
 }
 
 fn electrum_batch(source: &str, addresses: &[String], deadline: Instant) -> Vec<Result<Value>> {
-    let mut results: BTreeMap<usize, Result<Value>> = BTreeMap::new();
-    let run = (|| -> Result<()> {
-        let endpoint = electrum_endpoint(source)?;
-        let remote = endpoint.to_socket_addrs()?.next().context("Electrum DNS returned no addresses")?;
-        let mut stream = TcpStream::connect_timeout(&remote, remaining(deadline)?)?;
-        for (id, address) in addresses.iter().enumerate() {
+    let run = (|| -> Result<_> {
+        let calls = addresses.iter().enumerate().map(|(id, address)| {
             let address = Address::from_str(address)?.require_network(Network::Bitcoin)?;
-            let call = json!({"id": id, "method": "blockchain.scripthash.listunspent",
-                "params": [electrum_script_hash_hex(&address.script_pubkey())]});
-            stream.set_write_timeout(Some(remaining(deadline)?))?;
-            writeln!(stream, "{call}")?;
-        }
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        stream.flush()?;
-        let mut reader = BufReader::new(stream);
-        while results.len() < addresses.len() {
-            let response = read_rpc_line(&mut reader, deadline)?;
-            let id = response.get("id").and_then(Value::as_u64).context("Electrum response missing id")?;
-            let id = usize::try_from(id)?;
-            ensure!(id < addresses.len() && !results.contains_key(&id), "unexpected or duplicate Electrum response id");
-            let result = if let Some(error) = response.get("error").filter(|v| !v.is_null()) {
-                Err(anyhow::anyhow!("Electrum listunspent failed: {error}"))
-            } else {
-                response.get("result").cloned().context("Electrum result missing")
-                    .and_then(|value| normalize_utxos(value, true))
-            };
-            results.insert(id, result);
-        }
-        Ok(())
+            Ok((id as u64, "blockchain.scripthash.listunspent".to_string(),
+                json!([electrum_script_hash_hex(&address.script_pubkey())])))
+        }).collect::<Result<Vec<_>>>()?;
+        crate::electrum_transport::pipeline_partial(
+            source, &calls, Duration::from_secs(5), deadline,
+        )
     })();
-    let missing = run.err().map(|e| format!("{e:#}")).unwrap_or_else(|| "Electrum response missing".into());
-    (0..addresses.len()).map(|id| results.remove(&id)
-        .unwrap_or_else(|| Err(anyhow::anyhow!("{missing}")))).collect()
+    match run {
+        Ok(mut responses) => (0..addresses.len()).map(|id| {
+            responses.remove(&(id as u64))
+                .ok_or_else(|| anyhow::anyhow!("Electrum response missing"))?
+                .map_err(|error| anyhow::anyhow!("Electrum listunspent failed: {error}"))
+                .and_then(|value| normalize_utxos(value, true))
+        }).collect(),
+        Err(error) => {
+            let message = format!("{error:#}");
+            (0..addresses.len()).map(|_| Err(anyhow::anyhow!(message.clone()))).collect()
+        }
+    }
 }
+
 
 fn normalize_utxos(value: Value, electrum: bool) -> Result<Value> {
     let items = value.as_array().context("UTXO response is not an array")?;

@@ -49,13 +49,13 @@ fn electrum_mock(count: usize, omit_last: bool, fail_one: bool) -> (String, thre
             calls.push(call);
         }
         // Out-of-order replies exercise ID correlation, not array order.
-        for call in calls.iter().rev() {
+        for (position, call) in calls.iter().enumerate().rev() {
             let id = call["id"].as_u64().unwrap();
-            if omit_last && id == (count - 1) as u64 { continue; }
-            let response = if fail_one && id == 1 {
+            if omit_last && position == count - 1 { continue; }
+            let response = if fail_one && position == 1 {
                 json!({"id": id, "error": {"code": 1, "message": "mock address error"}})
             } else {
-                json!({"id": id, "result": [utxo(id as usize + 1, 10000 + id)]})
+                json!({"id": id, "result": [utxo(position + 1, 10000 + position as u64)]})
             };
             writeln!(stream, "{response}").unwrap();
         }
