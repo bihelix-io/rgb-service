@@ -5,8 +5,8 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,32 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDLE: Duration = Duration::from_secs(300);
 static POOLS: OnceLock<Mutex<HashMap<String, Arc<Pool>>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static DNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DnsPermit;
+impl Drop for DnsPermit {
+    fn drop(&mut self) { DNS_IN_FLIGHT.fetch_sub(1, Ordering::Release); }
+}
+
+fn resolve_bounded(endpoint: &str, deadline: Instant) -> Result<SocketAddr> {
+    remaining(deadline)?;
+    if let Ok(address) = endpoint.parse::<SocketAddr>() { return Ok(address); }
+    DNS_IN_FLIGHT.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |count| (count < 8).then_some(count + 1))
+        .map_err(|_| anyhow!("Electrum DNS capacity exhausted"))?;
+    let permit = DnsPermit;
+    let endpoint = endpoint.to_owned();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    // Only name resolution can outlive the budget. This bounded worker never
+    // connects, writes a request, or owns wallet state.
+    std::thread::Builder::new().name("electrum-dns".into()).spawn(move || {
+        let _permit = permit;
+        let result = endpoint.to_socket_addrs().map(|mut values| values.next());
+        let _ = send.send(result);
+    }).context("start Electrum DNS resolver")?;
+    receive.recv_timeout(remaining(deadline)?).context("Electrum DNS deadline exceeded")?
+        .context("resolve Electrum endpoint")?.context("Electrum endpoint resolved no addresses")
+}
 
 type Responses = HashMap<u64, std::result::Result<Value, String>>;
 
@@ -101,9 +127,7 @@ fn checkout(endpoint: &str, connect_timeout: Duration, deadline: Instant) -> Res
             drop(state);
             let mut lease = Lease { pool, connection: None, reusable: false };
             // No socket or registry lock is held during DNS resolution or I/O.
-            let address = endpoint.to_socket_addrs()
-                .with_context(|| format!("resolve Electrum endpoint {endpoint}"))?
-                .next().context("Electrum endpoint resolved no addresses")?;
+            let address = resolve_bounded(endpoint, deadline)?;
             let stream = TcpStream::connect_timeout(&address, remaining(deadline)?.min(connect_timeout))
                 .with_context(|| format!("connect Electrum endpoint {endpoint}"))?;
             stream.set_nodelay(true).context("set Electrum TCP_NODELAY")?;

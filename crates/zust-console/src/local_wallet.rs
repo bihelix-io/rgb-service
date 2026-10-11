@@ -37,6 +37,33 @@ use bdk_wallet::{ChangeSet, KeychainKind, PersistedWallet, Wallet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "wallet_sync_budget.rs"]
+pub(crate) mod sync_budget;
+
+fn bounded_wallet_write_lock(lock: &'static RwLock<()>) -> Result<RwLockWriteGuard<'static, ()>> {
+    let started = std::time::Instant::now();
+    let deadline = sync_budget::rpc_deadline(Duration::from_secs(5));
+    tracing::info!(stage = "wallet_lock_wait", "LN hot wallet lock");
+    loop {
+        sync_budget::check()?;
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64,
+                stage = "wallet_lock_deadline", "LN hot wallet lock wait expired");
+            bail!("WALLET_LOCK_DEADLINE_EXCEEDED");
+        }
+        match lock.try_write() {
+            Ok(guard) => {
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                    stage = "wallet_lock_acquired", "LN hot wallet lock acquired");
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(err)) => bail!("BDK store write lock poisoned: {err}"),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_millis(10))),
+        }
+    }
+}
+
 pub const MAGIC: &[u8] = b"LocalBtcWallet";
 pub const CONFIG_FILE: &str = "wallet.json";
 pub const BDK_FILE: &str = "bdk_wallet";
@@ -331,9 +358,7 @@ impl LocalWallet {
                     .map_err(|err| anyhow!("BDK store read lock poisoned: {err}"))?,
             ),
             LocalWalletOpenMode::Write => LocalWalletStoreGuard::Write(
-                store_lock
-                    .write()
-                    .map_err(|err| anyhow!("BDK store write lock poisoned: {err}"))?,
+                bounded_wallet_write_lock(store_lock)?,
             ),
         };
         let (mut db, _) = load_bdk_store(&store_path)?;
@@ -371,11 +396,20 @@ impl LocalWallet {
 
     pub fn persist(&mut self) -> Result<()> {
         if self.wallet.staged().is_some() {
+            self.invalidate_sync_cache()?;
             self.wallet
                 .persist(&mut self.db)
                 .context("failed to persist wallet")?;
         }
         Ok(())
+    }
+
+    pub(crate) fn invalidate_sync_cache(&self) -> Result<()> {
+        match fs::remove_file(self.data_dir.join(BDK_SYNC_CACHE_FILE)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).context("invalidate BDK sync cache"),
+        }
     }
 
     pub fn list_address_utxos(
@@ -501,11 +535,15 @@ fn sync_wallet_esplora(local: &mut LocalWallet, esplora: &EsploraConfig) -> Resu
 }
 
 fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> Result<()> {
+    let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
+    sync_budget::check()?;
     let mut request = local.wallet.start_sync_with_revealed_spks().build();
     let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
     let mut checkpoint_blocks = Vec::new();
+    let mut processed = HashMap::new();
 
     while let Some(item) = request.next_spk_with_expected_txids() {
+        sync_budget::check()?;
         let history = match electrum_script_history(electrum, &item.spk) {
             Ok(history) => history,
             Err(err) if is_electrum_history_limit_error(&err) => {
@@ -519,7 +557,12 @@ fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> R
         };
         let mut seen = std::collections::HashSet::new();
         for entry in history {
+            sync_budget::check()?;
             seen.insert(entry.txid);
+            if let Some(height) = processed.insert(entry.txid, entry.height) {
+                if height != entry.height { bail!("Electrum history changed during wallet sync"); }
+                continue;
+            }
             electrum_add_tx_update(electrum, &mut tx_update, &mut checkpoint_blocks, entry)?;
         }
         for txid in item.expected_txids {
@@ -530,12 +573,15 @@ fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> R
     }
 
     while let Some(txid) = request.next_txid() {
+        sync_budget::check()?;
+        if processed.contains_key(&txid) { continue; }
         if let Some(status) = electrum_transaction_status(electrum, txid)? {
             electrum_add_status_update(electrum, &mut tx_update, &mut checkpoint_blocks, status)?;
         }
     }
 
     while let Some(outpoint) = request.next_outpoint() {
+        sync_budget::check()?;
         if let Some(status) = electrum_transaction_status(electrum, outpoint.txid)? {
             if let Some(txout) = status.tx.output.get(outpoint.vout as usize) {
                 tx_update.txouts.insert(outpoint, txout.clone());
@@ -546,6 +592,7 @@ fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> R
 
     checkpoint_blocks.push(electrum_chain_tip(electrum)?);
     let checkpoint = extend_latest_checkpoint(local.wallet.latest_checkpoint(), checkpoint_blocks)?;
+    sync_budget::check()?;
     local
         .wallet
         .apply_update(Update {
@@ -576,6 +623,7 @@ pub fn sync_wallet_cached_with_chain_source(
     if let Ok(bytes) = fs::read(&cache_path) {
         if let Ok(cache) = serde_json::from_slice::<BdkSyncCache>(&bytes) {
             if cache.source_key() == source_key
+                && cache.synced_at_secs <= now_secs()
                 && now_secs().saturating_sub(cache.synced_at_secs) < min_interval.as_secs()
             {
                 return Ok(false);
@@ -584,6 +632,9 @@ pub fn sync_wallet_cached_with_chain_source(
     }
 
     sync_wallet_with_chain_source(local, source)?;
+    sync_budget::check()?;
+    // A cache marker must never outlive an unpersisted sync update.
+    local.persist()?;
     fs::write(
         &cache_path,
         serde_json::to_vec_pretty(&BdkSyncCache {
@@ -745,13 +796,20 @@ fn electrum_endpoint(source: &str) -> Result<String> {
 }
 
 pub fn electrum_rpc(config: &ElectrumConfig, method: &str, params: Value) -> Result<Value> {
-    crate::electrum_transport::rpc(
+    sync_budget::check()?;
+    if let Some(value) = sync_budget::cached_header(&config.url, method, &params) {
+        return Ok(value);
+    }
+    let result = crate::electrum_transport::rpc(
         &config.url,
         method,
-        params,
+        params.clone(),
         Duration::from_secs(5),
-        std::time::Instant::now() + Duration::from_secs(35),
-    )
+        sync_budget::rpc_deadline(Duration::from_secs(35)),
+    )?;
+    sync_budget::check()?;
+    sync_budget::remember_header(&config.url, method, &params, &result);
+    Ok(result)
 }
 
 
@@ -931,13 +989,16 @@ fn electrum_add_tx_update(
     checkpoint_blocks: &mut Vec<BlockId>,
     entry: ElectrumHistoryEntry,
 ) -> Result<()> {
-    let status = electrum_transaction_status(config, entry.txid)?;
-    let Some(mut status) = status else {
-        return Ok(());
+    // get_history already supplies confirmation height. Do not fetch verbose
+    // status, chain tip and merkle position again for every historical tx.
+    let status = ElectrumTxStatus {
+        tx: electrum_get_transaction(config, entry.txid)?,
+        confirmed: entry.height.is_some(),
+        height: entry.height,
+        block_hash: None,
+        block_time: None,
+        position: None,
     };
-    if status.height.is_none() {
-        status.height = entry.height;
-    }
     electrum_add_status_update(config, tx_update, checkpoint_blocks, status)
 }
 
@@ -1538,3 +1599,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wallet_sync_budget_tests.rs"]
+mod wallet_sync_budget_tests;

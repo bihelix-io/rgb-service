@@ -89,7 +89,7 @@ use crate::local_wallet::{
     bitcoin_core_chain_tip, bitcoin_core_tx_status, broadcast_transaction, electrum_block_header,
     electrum_chain_tip, electrum_get_transaction, electrum_script_history,
     electrum_transaction_status, esplora_client_with_config, sync_wallet, ChainSource,
-    ElectrumConfig, EsploraConfig, LocalWallet,
+    ElectrumConfig, EsploraConfig, LocalWallet, sync_wallet_cached, sync_budget,
 };
 
 pub struct LnRgbBtcLnBackend {
@@ -114,6 +114,9 @@ pub struct LnRgbBtcLnBackend {
 }
 
 pub const LN_RGB_LIGHTNING_VERSION: &str = "0.2.2";
+#[cfg(test)]
+#[path = "withdrawal_budget_tests.rs"]
+mod withdrawal_budget_tests;
 const LDK_CHAIN_SYNC_SUCCESS_INTERVAL: Duration = Duration::from_secs(120);
 const LDK_CHAIN_SYNC_INITIAL_FAILURE_INTERVAL: Duration = Duration::from_secs(60);
 const LDK_CHAIN_SYNC_MAX_FAILURE_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -1258,13 +1261,14 @@ impl LnRgbBtcLnBackend {
     }
 
     pub fn sync_l1_utxos_json(&self) -> Result<serde_json::Value> {
-        self.retry_transient_esplora("list LN hot wallet L1 UTXOs", || {
+        let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
+        (|| {
             let mut local = self.open_l1_wallet()?;
             let esplora = self.next_esplora_url();
-            self.sync_l1_wallet_or_use_cached(&mut local, &esplora, "list LN hot wallet L1 UTXOs")?;
+            self.sync_l1_withdrawal_wallet(&mut local, &esplora)?;
             let utxos = Self::local_l1_utxos(&local);
             Ok(self.l1_utxos_response(esplora, "synced", utxos))
-        })
+        })()
     }
 
     pub fn transfer_l1_with_inputs_json(
@@ -1290,10 +1294,13 @@ impl LnRgbBtcLnBackend {
         let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_vb)
             .context("invalid LN hot wallet withdrawal fee rate")?;
 
-        self.retry_transient_esplora("LN hot wallet L1 transfer", || {
+        // Do not retry a whole transfer: a broadcast error can mean the node
+        // accepted the transaction but its reply was lost.
+        let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
+        (|| {
             let mut local = self.open_l1_wallet()?;
             let esplora = self.next_esplora_url();
-            self.sync_l1_wallet_or_use_cached(&mut local, &esplora, "LN hot wallet L1 transfer")?;
+            self.sync_l1_withdrawal_wallet(&mut local, &esplora)?;
             let available = local
                 .wallet
                 .list_unspent()
@@ -1365,7 +1372,7 @@ impl LnRgbBtcLnBackend {
             let chain_source =
                 ChainSource::from_esplora_or_default(self.config.network, Some(&esplora))?;
             ln_rgb_log_signed_btc_tx("transfer_with_inputs", &tx);
-            let txid = broadcast_transaction(self.config.network, Some(&chain_source), &tx)?;
+            let txid = self.broadcast_l1_withdrawal(&mut local, &chain_source, &tx)?;
             Ok(json!({
                 "module": "ln_rgb",
                 "operation": "transfer_with_inputs",
@@ -1389,7 +1396,7 @@ impl LnRgbBtcLnBackend {
                 "signed_psbt": signed_psbt,
                 "esplora": esplora
             }))
-        })
+        })()
     }
 
     pub fn transfer_l1_batch_with_inputs_json(
@@ -1436,14 +1443,11 @@ impl LnRgbBtcLnBackend {
             "withdrawal batch outputs must not be empty"
         );
 
-        self.retry_transient_esplora("LN hot wallet L1 batch transfer", || {
+        let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
+        (|| {
             let mut local = self.open_l1_wallet()?;
             let esplora = self.next_esplora_url();
-            self.sync_l1_wallet_or_use_cached(
-                &mut local,
-                &esplora,
-                "LN hot wallet L1 batch transfer",
-            )?;
+            self.sync_l1_withdrawal_wallet(&mut local, &esplora)?;
             let available = local
                 .wallet
                 .list_unspent()
@@ -1517,7 +1521,7 @@ impl LnRgbBtcLnBackend {
             let chain_source =
                 ChainSource::from_esplora_or_default(self.config.network, Some(&esplora))?;
             ln_rgb_log_signed_btc_tx("transfer_batch_with_inputs", &tx);
-            let txid = broadcast_transaction(self.config.network, Some(&chain_source), &tx)?;
+            let txid = self.broadcast_l1_withdrawal(&mut local, &chain_source, &tx)?;
             Ok(json!({
                 "module": "ln_rgb",
                 "operation": "transfer_batch_with_inputs",
@@ -1547,7 +1551,7 @@ impl LnRgbBtcLnBackend {
                 "signed_psbt": signed_psbt,
                 "esplora": esplora
             }))
-        })
+        })()
     }
 
     pub fn transfer_rgb_l1_json(
@@ -3493,6 +3497,52 @@ impl LnRgbBtcLnBackend {
             local.persist()?;
             Ok(signed_transaction)
         })
+    }
+
+    fn sync_l1_withdrawal_wallet(&self, local: &mut LocalWallet, source: &str) -> Result<()> {
+        let started = Instant::now();
+        tracing::info!(stage = "sync_started", "LN hot wallet withdrawal sync");
+        sync_budget::check()?;
+        let result = sync_wallet_cached(local, Some(source), Duration::from_secs(30));
+        match &result {
+            Ok(synced) => tracing::info!(stage = "sync_finished", synced,
+                elapsed_ms = started.elapsed().as_millis() as u64, "LN hot wallet withdrawal sync"),
+            Err(error) => tracing::warn!(stage = "sync_failed", error = %format!("{error:#}"),
+                elapsed_ms = started.elapsed().as_millis() as u64, "LN hot wallet withdrawal sync"),
+        }
+        // No stale-balance fallback on this payment path.
+        result?;
+        sync_budget::check()
+    }
+
+    fn broadcast_l1_withdrawal(&self, local: &mut LocalWallet, source: &ChainSource, tx: &Transaction) -> Result<Txid> {
+        sync_budget::check()?;
+        let ChainSource::Electrum(config) = source else {
+            bail!("BTC_WITHDRAWAL_ELECTRUM_REQUIRED");
+        };
+        // Persist spent inputs before sending. An ambiguous network result must
+        // not allow another local payment to reuse these inputs from the cache.
+        local.wallet.apply_unconfirmed_txs([(tx.clone(), now_secs())]);
+        local.persist()?;
+        local.invalidate_sync_cache()?;
+        sync_budget::check()?;
+        let started = Instant::now();
+        tracing::info!(stage = "broadcast_started", txid = %tx.compute_txid(), "LN hot wallet withdrawal");
+        let result = crate::local_wallet::electrum_rpc(
+                config, "blockchain.transaction.broadcast", json!([bytes_to_hex(&serialize(tx))]),
+            ).and_then(|reply| {
+                ensure!(reply.as_str() == Some(tx.compute_txid().to_string().as_str()),
+                    "Electrum broadcast returned an unexpected txid; outcome unknown");
+                Ok(tx.compute_txid())
+            });
+        match &result {
+            Ok(txid) => tracing::info!(stage = "broadcast_returned", %txid,
+                elapsed_ms = started.elapsed().as_millis() as u64, "LN hot wallet withdrawal"),
+            Err(error) => tracing::warn!(stage = "broadcast_outcome_unknown", txid = %tx.compute_txid(),
+                error = %format!("{error:#}"), elapsed_ms = started.elapsed().as_millis() as u64,
+                "LN hot wallet withdrawal; no automatic retry or refund"),
+        }
+        result
     }
 
     fn sync_l1_wallet_or_use_cached(
