@@ -100,7 +100,8 @@ fn mock_broadcast(mode: &str) {
     });
     let started = Instant::now();
     let _scope = sync_budget::WalletOperationBudget::enter(if mode == "timeout" { Duration::from_millis(80) } else { Duration::from_secs(2) });
-    let result = f.backend.broadcast_l1_withdrawal(&mut local, &source, &tx);
+    let result = withdrawal_attempt::run(|attempt| f.backend.broadcast_l1_withdrawal_tracked(&mut local, &source, &tx, attempt));
+    if let Err(error) = &result { assert_eq!(withdrawal_attempt::failure(error)["broadcast_state"], "outcome_unknown"); }
     assert!(started.elapsed() < Duration::from_secs(3));
     if mode == "success" { assert_eq!(result.unwrap(), txid); } else { assert!(result.is_err()); }
     // Unknown outcomes remain in the wallet and are not silently refunded or
@@ -117,3 +118,21 @@ fn disconnected_broadcast_does_not_retry_or_fallback() { mock_broadcast("disconn
 fn timed_out_broadcast_does_not_retry_or_fallback() { mock_broadcast("timeout"); }
 #[test]
 fn mismatched_reply_is_not_a_success() { mock_broadcast("wrong_txid"); }
+
+#[test]
+fn invalid_batch_is_proven_terminated_without_broadcast() {
+    let f=Fixture::new();
+    let error=f.backend.transfer_l1_batch_with_inputs_json("",2,"").unwrap_err();
+    assert_eq!(withdrawal_attempt::failure(&error)["broadcast_state"],"not_attempted");
+}
+
+#[test]
+fn withdrawal_lock_timeout_is_proven_terminated() {
+    let f=Fixture::new();
+    let mut holder=f.backend.open_l1_wallet().unwrap();
+    let address=holder.wallet.reveal_next_address(KeychainKind::External).address.to_string();
+    let _budget=sync_budget::WalletOperationBudget::enter(Duration::from_millis(40));
+    let error=f.backend.transfer_l1_with_inputs_json(&address,1000,2,"1111111111111111111111111111111111111111111111111111111111111111:0").unwrap_err();
+    assert_eq!(withdrawal_attempt::failure(&error)["broadcast_state"],"not_attempted");
+    assert_eq!(withdrawal_attempt::failure(&error)["task_terminated"],true);
+}

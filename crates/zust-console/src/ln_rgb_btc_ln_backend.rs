@@ -113,6 +113,9 @@ pub struct LnRgbBtcLnBackend {
     esplora_cursor: AtomicUsize,
 }
 
+#[path = "withdrawal_attempt.rs"]
+pub(crate) mod withdrawal_attempt;
+
 pub const LN_RGB_LIGHTNING_VERSION: &str = "0.2.2";
 #[cfg(test)]
 #[path = "withdrawal_budget_tests.rs"]
@@ -1278,6 +1281,7 @@ impl LnRgbBtcLnBackend {
         fee_rate_sat_vb: u64,
         input_outpoints: &str,
     ) -> Result<serde_json::Value> {
+        withdrawal_attempt::run(|attempt| {
         ensure!(amount_sats > 0, "amount_sats must be greater than zero");
         let recipient = recipient.trim();
         ensure!(!recipient.is_empty(), "recipient address must not be empty");
@@ -1371,8 +1375,7 @@ impl LnRgbBtcLnBackend {
             let fee_sats = selected_sats.saturating_sub(output_sats);
             let chain_source =
                 ChainSource::from_esplora_or_default(self.config.network, Some(&esplora))?;
-            ln_rgb_log_signed_btc_tx("transfer_with_inputs", &tx);
-            let txid = self.broadcast_l1_withdrawal(&mut local, &chain_source, &tx)?;
+            let txid = self.broadcast_l1_withdrawal_tracked(&mut local, &chain_source, &tx, attempt)?;
             Ok(json!({
                 "module": "ln_rgb",
                 "operation": "transfer_with_inputs",
@@ -1397,6 +1400,7 @@ impl LnRgbBtcLnBackend {
                 "esplora": esplora
             }))
         })()
+        })
     }
 
     pub fn transfer_l1_batch_with_inputs_json(
@@ -1405,6 +1409,7 @@ impl LnRgbBtcLnBackend {
         fee_rate_sat_vb: u64,
         input_outpoints: &str,
     ) -> Result<serde_json::Value> {
+        withdrawal_attempt::run(|attempt| {
         let requested = input_outpoints.trim();
         ensure!(
             !requested.is_empty(),
@@ -1520,8 +1525,7 @@ impl LnRgbBtcLnBackend {
             let fee_sats = selected_sats.saturating_sub(output_sats);
             let chain_source =
                 ChainSource::from_esplora_or_default(self.config.network, Some(&esplora))?;
-            ln_rgb_log_signed_btc_tx("transfer_batch_with_inputs", &tx);
-            let txid = self.broadcast_l1_withdrawal(&mut local, &chain_source, &tx)?;
+            let txid = self.broadcast_l1_withdrawal_tracked(&mut local, &chain_source, &tx, attempt)?;
             Ok(json!({
                 "module": "ln_rgb",
                 "operation": "transfer_batch_with_inputs",
@@ -1552,6 +1556,7 @@ impl LnRgbBtcLnBackend {
                 "esplora": esplora
             }))
         })()
+        })
     }
 
     pub fn transfer_rgb_l1_json(
@@ -3515,11 +3520,20 @@ impl LnRgbBtcLnBackend {
         sync_budget::check()
     }
 
+    #[cfg(test)]
     fn broadcast_l1_withdrawal(&self, local: &mut LocalWallet, source: &ChainSource, tx: &Transaction) -> Result<Txid> {
+        self.broadcast_l1_withdrawal_tracked(local, source, tx, &mut withdrawal_attempt::Attempt::default())
+    }
+
+    fn broadcast_l1_withdrawal_tracked(&self, local: &mut LocalWallet, source: &ChainSource, tx: &Transaction, attempt: &mut withdrawal_attempt::Attempt) -> Result<Txid> {
         sync_budget::check()?;
         let ChainSource::Electrum(config) = source else {
             bail!("BTC_WITHDRAWAL_ELECTRUM_REQUIRED");
         };
+        // From this point the signed transaction may be durable or visible to
+        // another actor. Even a failure before the TCP write is NOT refundable.
+        attempt.before_signed_transaction_escape();
+        ln_rgb_log_signed_btc_tx("withdrawal", tx);
         // Persist spent inputs before sending. An ambiguous network result must
         // not allow another local payment to reuse these inputs from the cache.
         local.wallet.apply_unconfirmed_txs([(tx.clone(), now_secs())]);

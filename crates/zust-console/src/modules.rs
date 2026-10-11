@@ -5630,16 +5630,18 @@ extern "C" fn ln_rgb_transfer_with_inputs(
 ) -> *const Dynamic {
     let recipient = unsafe { &*recipient };
     let input_outpoints = unsafe { &*input_outpoints };
-    native_result(|| {
+    native_withdrawal_result(|| {
+        let node = crate::ln_rgb_btc_ln_backend::withdrawal_attempt::run(|_| {
         ensure!(recipient.is_str(), "recipient must be string");
         ensure!(input_outpoints.is_str(), "input_outpoints must be string");
-        let node = running_ln_node()?;
-        Ok(ok(node.transfer_l1_with_inputs_json(
+            running_ln_node()
+        })?;
+        node.transfer_l1_with_inputs_json(
             recipient.as_str(),
             amount_sats,
             fee_rate_sat_vb,
             input_outpoints.as_str(),
-        )?))
+        )
     })
 }
 
@@ -5650,15 +5652,17 @@ extern "C" fn ln_rgb_transfer_batch_with_inputs(
 ) -> *const Dynamic {
     let outputs = unsafe { &*outputs };
     let input_outpoints = unsafe { &*input_outpoints };
-    native_result(|| {
+    native_withdrawal_result(|| {
+        let node = crate::ln_rgb_btc_ln_backend::withdrawal_attempt::run(|_| {
         ensure!(outputs.is_str(), "outputs must be string");
         ensure!(input_outpoints.is_str(), "input_outpoints must be string");
-        let node = running_ln_node()?;
-        Ok(ok(node.transfer_l1_batch_with_inputs_json(
+            running_ln_node()
+        })?;
+        node.transfer_l1_batch_with_inputs_json(
             outputs.as_str(),
             fee_rate_sat_vb,
             input_outpoints.as_str(),
-        )?))
+        )
     })
 }
 
@@ -8127,6 +8131,14 @@ fn native_dynamic_result(
             "ok": false,
             "error": format!("{err:#}")
         }))),
+    }
+}
+
+fn native_withdrawal_result(f: impl FnOnce() -> Result<Value>) -> *const Dynamic {
+    match f() {
+        Ok(value) => vm::alloc_dynamic(ok(value)),
+        Err(error) => vm::alloc_dynamic(json_to_dynamic(
+            &crate::ln_rgb_btc_ln_backend::withdrawal_attempt::failure(&error))),
     }
 }
 
