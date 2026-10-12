@@ -3145,6 +3145,8 @@ impl LnRgbBtcLnBackend {
     }
 
     fn open_l1_wallet(&self) -> Result<LocalWallet> {
+        let started = Instant::now();
+        tracing::info!(stage = "wallet_open_started", remaining_ms = ?sync_budget::remaining_ms(), "LN hot wallet load");
         let mnemonic = self
             .config
             .entropy_mnemonic
@@ -3152,7 +3154,11 @@ impl LnRgbBtcLnBackend {
             .context("ln-rgb funding requires mnemonic from zs config")?;
         let mnemonic = BdkMnemonic::parse_in_normalized(BdkLanguage::English, mnemonic)
             .context("invalid ln-rgb mnemonic from runtime config")?;
-        LocalWallet::open_with_mnemonic(&self.config.l1_data_dir, self.config.network, &mnemonic)
+        let result = LocalWallet::open_with_mnemonic(&self.config.l1_data_dir, self.config.network, &mnemonic);
+        tracing::info!(stage = "wallet_open_finished", ok = result.is_ok(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            remaining_ms = ?sync_budget::remaining_ms(), "LN hot wallet load");
+        result
     }
 
     fn try_open_l1_wallet(&self) -> Result<Option<LocalWallet>> {

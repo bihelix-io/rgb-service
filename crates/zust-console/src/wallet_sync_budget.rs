@@ -46,6 +46,11 @@ pub(crate) fn check() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remaining_ms() -> Option<u64> {
+    ACTIVE.with(|slot| slot.borrow().as_ref().map(|state|
+        state.deadline.saturating_duration_since(Instant::now()).as_millis() as u64))
+}
+
 fn header_key(endpoint: &str, method: &str, params: &Value) -> Option<String> {
     matches!(method, "blockchain.headers.subscribe" | "blockchain.block.header")
         .then(|| format!("{endpoint}|{method}|{params}"))

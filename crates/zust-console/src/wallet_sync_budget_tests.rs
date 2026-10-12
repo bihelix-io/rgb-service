@@ -108,6 +108,7 @@ fn slow_sync_returns_without_cache_marker_or_late_work() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(!dir.join(BDK_SYNC_CACHE_FILE).exists());
     server.join().unwrap();
+    // A timed-out subscription must not start history or unsubscribe work.
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     drop(local);
     drop(wallet(&dir));
@@ -170,6 +171,8 @@ fn history_sync_deduplicates_transactions_and_headers_without_verbose_rpc() {
             let method = request["method"].as_str().unwrap();
             recorded.lock().unwrap().push(method.to_owned());
             let result = match method {
+                "blockchain.scripthash.subscribe" => json!(sha256::Hash::hash(format!("{txid}:1:").as_bytes()).to_string()),
+                "blockchain.scripthash.unsubscribe" => json!(true),
                 "blockchain.scripthash.get_history" => json!([{"tx_hash":txid.to_string(), "height":1}]),
                 "blockchain.transaction.get" => { assert!(request["params"].as_array().unwrap().len() == 1); json!(raw_tx) },
                 "blockchain.block.header" => json!(header_hex),

@@ -39,6 +39,8 @@ use serde_json::{json, Value};
 
 #[path = "wallet_sync_budget.rs"]
 pub(crate) mod sync_budget;
+#[path = "wallet_electrum_sync.rs"]
+mod incremental_electrum;
 
 fn bounded_wallet_write_lock(lock: &'static RwLock<()>) -> Result<RwLockWriteGuard<'static, ()>> {
     let started = std::time::Instant::now();
@@ -535,73 +537,7 @@ fn sync_wallet_esplora(local: &mut LocalWallet, esplora: &EsploraConfig) -> Resu
 }
 
 fn sync_wallet_electrum(local: &mut LocalWallet, electrum: &ElectrumConfig) -> Result<()> {
-    let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
-    sync_budget::check()?;
-    let mut request = local.wallet.start_sync_with_revealed_spks().build();
-    let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
-    let mut checkpoint_blocks = Vec::new();
-    let mut processed = HashMap::new();
-
-    while let Some(item) = request.next_spk_with_expected_txids() {
-        sync_budget::check()?;
-        let history = match electrum_script_history(electrum, &item.spk) {
-            Ok(history) => history,
-            Err(err) if is_electrum_history_limit_error(&err) => {
-                electrum_script_unspent_history(electrum, &item.spk).with_context(|| {
-                    format!(
-                        "Electrum listunspent fallback failed after history limit: {err:#}"
-                    )
-                })?
-            }
-            Err(err) => return Err(err),
-        };
-        let mut seen = std::collections::HashSet::new();
-        for entry in history {
-            sync_budget::check()?;
-            seen.insert(entry.txid);
-            if let Some(height) = processed.insert(entry.txid, entry.height) {
-                if height != entry.height { bail!("Electrum history changed during wallet sync"); }
-                continue;
-            }
-            electrum_add_tx_update(electrum, &mut tx_update, &mut checkpoint_blocks, entry)?;
-        }
-        for txid in item.expected_txids {
-            if !seen.contains(&txid) {
-                tx_update.evicted_ats.insert((txid, request.start_time()));
-            }
-        }
-    }
-
-    while let Some(txid) = request.next_txid() {
-        sync_budget::check()?;
-        if processed.contains_key(&txid) { continue; }
-        if let Some(status) = electrum_transaction_status(electrum, txid)? {
-            electrum_add_status_update(electrum, &mut tx_update, &mut checkpoint_blocks, status)?;
-        }
-    }
-
-    while let Some(outpoint) = request.next_outpoint() {
-        sync_budget::check()?;
-        if let Some(status) = electrum_transaction_status(electrum, outpoint.txid)? {
-            if let Some(txout) = status.tx.output.get(outpoint.vout as usize) {
-                tx_update.txouts.insert(outpoint, txout.clone());
-            }
-            electrum_add_status_update(electrum, &mut tx_update, &mut checkpoint_blocks, status)?;
-        }
-    }
-
-    checkpoint_blocks.push(electrum_chain_tip(electrum)?);
-    let checkpoint = extend_latest_checkpoint(local.wallet.latest_checkpoint(), checkpoint_blocks)?;
-    sync_budget::check()?;
-    local
-        .wallet
-        .apply_update(Update {
-            tx_update,
-            chain: Some(checkpoint),
-            ..Default::default()
-        })
-        .context("failed to apply Electrum wallet update")?;
-    Ok(())
+    incremental_electrum::sync(local, electrum)
 }
 
 pub fn sync_wallet_cached(
@@ -806,7 +742,10 @@ pub fn electrum_rpc(config: &ElectrumConfig, method: &str, params: Value) -> Res
         params.clone(),
         Duration::from_secs(5),
         sync_budget::rpc_deadline(Duration::from_secs(35)),
-    )?;
+    ).or_else(|error| {
+        sync_budget::check().with_context(|| format!("{error:#}"))?;
+        Err(error)
+    })?;
     sync_budget::check()?;
     sync_budget::remember_header(&config.url, method, &params, &result);
     Ok(result)

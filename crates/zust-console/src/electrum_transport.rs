@@ -188,12 +188,79 @@ fn pipeline_inner(
     let endpoint = endpoint(source)?;
     let methods = calls.iter().map(|(_, method, _)| method.as_str())
         .collect::<HashSet<_>>().into_iter().collect::<Vec<_>>().join(",");
+    let started = Instant::now();
+    let rpc_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(rpc_id, %endpoint, %methods, call_count = calls.len(),
+        budget_ms = deadline.saturating_duration_since(started).as_millis() as u64,
+        "Electrum RPC batch started");
     let run = || -> Result<Responses> {
         let mut caller_ids = HashSet::new();
         for (id, _, _) in calls {
             ensure!(caller_ids.insert(*id), "duplicate Electrum pipeline caller id");
         }
         let mut lease = checkout(&endpoint, connect_timeout, deadline)?;
+        tracing::debug!(rpc_id, %endpoint, checkout_ms = started.elapsed().as_millis() as u64,
+            "Electrum RPC connection acquired");
+        exchange(&mut lease, calls, deadline, allow_partial, &endpoint, &methods)
+    };
+    let result = run().with_context(|| format!("Electrum RPC endpoint={endpoint} methods={methods}"));
+    match &result {
+        Ok(_) => tracing::debug!(rpc_id, %endpoint, %methods,
+            elapsed_ms = started.elapsed().as_millis() as u64, "Electrum RPC batch finished"),
+        Err(error) => tracing::warn!(rpc_id, %endpoint, %methods, call_count = calls.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            deadline_exhausted = Instant::now() >= deadline, error = %format!("{error:#}"),
+            "Electrum RPC batch failed"),
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "electrum_transport_tests.rs"]
+mod tests;
+
+// Hold one exclusive socket across dependent read-only phases. A failed phase
+// discards it, even if the caller handles the error. No request is replayed.
+pub(crate) struct ReadSession {
+    lease: Lease,
+    endpoint: String,
+    failed: bool,
+}
+impl ReadSession {
+    pub(crate) fn pipeline(&mut self, calls: &[(u64, String, Value)], deadline: Instant) -> Result<Responses> {
+        ensure!(!self.failed, "Electrum read session already failed");
+        for (_, method, _) in calls {
+            ensure!(matches!(method.as_str(), "blockchain.scripthash.subscribe"
+                | "blockchain.scripthash.unsubscribe" | "blockchain.scripthash.get_history"
+                | "blockchain.scripthash.listunspent"), "unsupported Electrum read session method");
+        }
+        let mut ids = HashSet::new();
+        for (id, _, _) in calls { ensure!(ids.insert(*id), "duplicate Electrum pipeline caller id"); }
+        let methods = calls.iter().map(|(_, method, _)| method.as_str()).collect::<Vec<_>>().join(",");
+        let result = exchange(&mut self.lease, calls, deadline, false, &self.endpoint, &methods)
+            .with_context(|| format!("Electrum read session endpoint={} methods={methods}", self.endpoint));
+        self.lease.reusable = false;
+        self.failed |= result.is_err();
+        result
+    }
+}
+
+pub(crate) fn with_read_session<T>(
+    source: &str, connect_timeout: Duration, deadline: Instant,
+    operation: impl FnOnce(&mut ReadSession) -> Result<T>,
+) -> Result<T> {
+    let endpoint = endpoint(source)?;
+    let lease = checkout(&endpoint, connect_timeout, deadline)?;
+    let mut session = ReadSession { lease, endpoint, failed: false };
+    let result = operation(&mut session);
+    session.lease.reusable = result.is_ok() && !session.failed;
+    result
+}
+
+fn exchange(
+    lease: &mut Lease, calls: &[(u64, String, Value)], deadline: Instant,
+    allow_partial: bool, endpoint: &str, methods: &str,
+) -> Result<Responses> {
         let reader = lease.connection.as_mut().context("Electrum connection missing")?;
         let mut pending = HashMap::new();
         for (caller_id, method, params) in calls {
@@ -253,10 +320,4 @@ fn pipeline_inner(
         // Only fully drained, correctly correlated responses permit reuse.
         lease.reusable = true;
         Ok(responses)
-    };
-    run().with_context(|| format!("Electrum RPC endpoint={endpoint} methods={methods}"))
 }
-
-#[cfg(test)]
-#[path = "electrum_transport_tests.rs"]
-mod tests;
