@@ -12,13 +12,27 @@ const MAX_TX_KEYS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Entry { txid: Txid, height: i64 }
-struct Snapshot { status: String, entries: Arc<Vec<Entry>> }
+struct Snapshot { status: String, entries: Arc<Vec<Entry>>, used: Instant }
+struct CachedTransaction { tx: Arc<Transaction>, bytes: usize, used: Instant }
+#[derive(Default)]
+struct CacheCounters {
+    history_hits: u64,
+    history_misses: u64,
+    status_changes: u64,
+    history_evictions: u64,
+    history_oversized: u64,
+    tx_hits: u64,
+    tx_misses: u64,
+    tx_evictions: u64,
+    tx_oversized: u64,
+}
 #[derive(Default)]
 struct Cache {
     histories: HashMap<(String, String), Snapshot>,
     history_entries: usize,
-    transactions: HashMap<Txid, Arc<Transaction>>,
+    transactions: HashMap<Txid, CachedTransaction>,
     tx_bytes: usize,
+    counters: CacheCounters,
 }
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
@@ -27,29 +41,102 @@ fn cache() -> std::sync::MutexGuard<'static, Cache> {
 }
 
 impl Cache {
+    fn history(&mut self, key: &(String, String), status: &str) -> Option<Arc<Vec<Entry>>> {
+        if let Some(old) = self.histories.get_mut(key) {
+            if old.status == status {
+                old.used = Instant::now();
+                self.counters.history_hits += 1;
+                return Some(Arc::clone(&old.entries));
+            }
+            self.counters.status_changes += 1;
+            self.remove_history(key);
+        }
+        self.counters.history_misses += 1;
+        None
+    }
+
+    fn remove_history(&mut self, key: &(String, String)) {
+        if let Some(old) = self.histories.remove(key) { self.history_entries -= old.entries.len(); }
+    }
+
     fn remember_history(&mut self, key: (String, String), status: String, entries: Arc<Vec<Entry>>) {
-        if let Some(old) = self.histories.remove(&key) { self.history_entries -= old.entries.len(); }
-        if entries.len() > MAX_HISTORY_ENTRIES { return; }
-        if self.histories.len() >= MAX_HISTORY_KEYS || self.history_entries + entries.len() > MAX_HISTORY_ENTRIES {
-            self.histories.clear();
-            self.history_entries = 0;
+        self.remove_history(&key);
+        if entries.len() > MAX_HISTORY_ENTRIES {
+            self.counters.history_oversized += 1;
+            return;
+        }
+        while self.histories.len() >= MAX_HISTORY_KEYS || self.history_entries + entries.len() > MAX_HISTORY_ENTRIES {
+            let oldest = self.histories.iter().min_by_key(|(_, value)| value.used)
+                .map(|(key, _)| key.clone()).expect("nonempty bounded history cache");
+            self.remove_history(&oldest);
+            self.counters.history_evictions += 1;
         }
         self.history_entries += entries.len();
-        self.histories.insert(key, Snapshot { status, entries });
+        self.histories.insert(key, Snapshot { status, entries, used: Instant::now() });
+    }
+
+    fn transaction(&mut self, id: &Txid) -> Option<Arc<Transaction>> {
+        if let Some(old) = self.transactions.get_mut(id) {
+            old.used = Instant::now();
+            self.counters.tx_hits += 1;
+            Some(Arc::clone(&old.tx))
+        } else {
+            self.counters.tx_misses += 1;
+            None
+        }
     }
 
     fn remember_transaction(&mut self, tx: Arc<Transaction>) {
         let id = tx.compute_txid();
-        if self.transactions.contains_key(&id) { return; }
+        if let Some(old) = self.transactions.get_mut(&id) {
+            old.used = Instant::now();
+            return;
+        }
         let size = encode::serialize(tx.as_ref()).len();
-        if size > MAX_TX_BYTES { return; }
-        if self.transactions.len() >= MAX_TX_KEYS || self.tx_bytes + size > MAX_TX_BYTES {
-            self.transactions.clear();
-            self.tx_bytes = 0;
+        if size > MAX_TX_BYTES {
+            self.counters.tx_oversized += 1;
+            return;
+        }
+        while self.transactions.len() >= MAX_TX_KEYS || self.tx_bytes + size > MAX_TX_BYTES {
+            let oldest = *self.transactions.iter().min_by_key(|(_, value)| value.used)
+                .map(|(key, _)| key).expect("nonempty bounded transaction cache");
+            self.tx_bytes -= self.transactions.remove(&oldest).unwrap().bytes;
+            self.counters.tx_evictions += 1;
         }
         self.tx_bytes += size;
-        self.transactions.insert(id, tx);
+        self.transactions.insert(id, CachedTransaction { tx, bytes: size, used: Instant::now() });
     }
+
+    fn report(&self, phase: &str, completed: bool, started: Instant) {
+        tracing::info!(stage = "cache_stats", phase, completed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            history_keys = self.histories.len(), history_entries = self.history_entries,
+            max_history_keys = MAX_HISTORY_KEYS, max_history_entries = MAX_HISTORY_ENTRIES,
+            tx_keys = self.transactions.len(), tx_bytes = self.tx_bytes,
+            history_hits_total = self.counters.history_hits,
+            history_misses_total = self.counters.history_misses,
+            status_changes_total = self.counters.status_changes,
+            history_evictions_total = self.counters.history_evictions,
+            history_oversized_total = self.counters.history_oversized,
+            tx_hits_total = self.counters.tx_hits, tx_misses_total = self.counters.tx_misses,
+            tx_evictions_total = self.counters.tx_evictions, tx_oversized_total = self.counters.tx_oversized,
+            "Electrum wallet cache process totals");
+    }
+}
+
+// Emit statistics on errors/deadlines too, not just on successful wallet updates.
+struct CacheReport { started: Instant, completed: bool }
+impl Drop for CacheReport {
+    fn drop(&mut self) { cache().report("sync_end", self.completed, self.started); }
+}
+
+// A sequential scan larger than an LRU cache would otherwise evict its cached
+// tail before reaching it on every round. Check retained entries first, but put
+// results back in the original order so expected-txid eviction stays correct.
+fn ordered_script_indices(endpoint: &str, hashes: &[String], cache: &Cache) -> Vec<usize> {
+    let mut indices = (0..hashes.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|i| !cache.histories.contains_key(&(endpoint.to_owned(), hashes[*i].clone())));
+    indices
 }
 
 fn stage(name: &str, started: Instant, items: usize) {
@@ -144,16 +231,20 @@ fn parse_unspent_history(value: &Value) -> Result<Arc<Vec<Entry>>> {
 
 fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<History>> {
     let started = Instant::now();
-    let mut results = Vec::with_capacity(scripts.len());
+    let mut results: Vec<Option<History>> = (0..scripts.len()).map(|_| None).collect();
     let mut reused = 0usize;
-    for scripts in scripts.chunks(BATCH) {
-        let hashes = scripts.iter().map(electrum_script_hash_hex).collect::<Vec<_>>();
+    let all_hashes = scripts.iter().map(electrum_script_hash_hex).collect::<Vec<_>>();
+    let indices = ordered_script_indices(&config.url, &all_hashes, &cache());
+    for indices in indices.chunks(BATCH) {
+        let batch_started = Instant::now();
+        let reused_before = reused;
+        let hashes = indices.iter().map(|i| all_hashes[*i].clone()).collect::<Vec<_>>();
         let group = crate::electrum_transport::with_read_session(&config.url, Duration::from_secs(5),
             sync_budget::rpc_deadline(Duration::from_secs(35)), |session| {
             let subscribe = hashes.iter().map(|hash|
                 ("blockchain.scripthash.subscribe".to_owned(), json!([hash]))).collect::<Vec<_>>();
             let statuses = session_batch(session, &subscribe)?;
-            let mut group: Vec<Option<History>> = (0..scripts.len()).map(|_| None).collect();
+            let mut group: Vec<Option<History>> = (0..indices.len()).map(|_| None).collect();
             let mut missing = Vec::new();
             let mut fallback = Vec::new();
             for (i, response) in statuses.into_iter().enumerate() {
@@ -165,6 +256,7 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
                     Err(error) => bail!("Electrum subscribe failed: {error}"),
                 };
                 if value.is_null() {
+                    cache().remove_history(&(config.url.clone(), hashes[i].clone()));
                     group[i] = Some(History { entries: Arc::new(Vec::new()), complete: true });
                     continue;
                 }
@@ -172,8 +264,7 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
                 anyhow::ensure!(status.len() == 64 && status.bytes().all(|b| b.is_ascii_hexdigit()),
                     "invalid Electrum subscription digest");
                 let key = (config.url.clone(), hashes[i].clone());
-                let cached = cache().histories.get(&key).filter(|old| old.status == status)
-                    .map(|old| Arc::clone(&old.entries));
+                let cached = cache().history(&key, status);
                 if let Some(entries) = cached {
                     reused += 1;
                     group[i] = Some(History { entries, complete: true });
@@ -203,10 +294,7 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
                     let value = response.map_err(|error| anyhow!("Electrum listunspent fallback failed: {error}"))?;
                     group[i] = Some(History { entries: parse_unspent_history(&value)?, complete: false });
                     // Do not label an unspent-only snapshot as complete history.
-                    let mut cache = cache();
-                    if let Some(old) = cache.histories.remove(&(config.url.clone(), hashes[i].clone())) {
-                        cache.history_entries -= old.entries.len();
-                    }
+                    cache().remove_history(&(config.url.clone(), hashes[i].clone()));
                 }
             }
             let unsubscribe = hashes.iter().map(|hash|
@@ -217,12 +305,17 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
             }
             group.into_iter().map(|entries| entries.context("missing script history")).collect::<Result<Vec<_>>>()
         })?;
-        results.extend(group);
+        for (index, history) in indices.iter().zip(group) { results[*index] = Some(history); }
+        tracing::info!(stage = "history_batch_finished", scripts = indices.len(),
+            cache_hits = reused - reused_before,
+            elapsed_ms = batch_started.elapsed().as_millis() as u64,
+            remaining_ms = ?sync_budget::remaining_ms(), "Electrum wallet incremental sync");
+        cache().report("history_batch_end", false, started);
     }
     tracing::info!(stage = "history_finished", scripts = scripts.len(), reused,
         elapsed_ms = started.elapsed().as_millis() as u64, remaining_ms = ?sync_budget::remaining_ms(),
         "Electrum wallet incremental sync");
-    Ok(results)
+    results.into_iter().map(|history| history.context("missing ordered script history")).collect()
 }
 
 fn decode_transaction(value: &Value, expected: Txid) -> Result<Arc<Transaction>> {
@@ -233,6 +326,8 @@ fn decode_transaction(value: &Value, expected: Txid) -> Result<Arc<Transaction>>
 }
 
 pub(super) fn sync(local: &mut LocalWallet, config: &ElectrumConfig) -> Result<()> {
+    let mut report = CacheReport { started: Instant::now(), completed: false };
+    cache().report("sync_start", false, report.started);
     let _budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(120));
     sync_budget::check()?;
     let mut request = local.wallet.start_sync_with_revealed_spks().build();
@@ -263,7 +358,7 @@ pub(super) fn sync(local: &mut LocalWallet, config: &ElectrumConfig) -> Result<(
     let mut transactions = HashMap::new();
     let mut missing = Vec::new();
     for id in heights.keys() {
-        if let Some(tx) = local.wallet.tx_graph().get_tx(*id).or_else(|| cache().transactions.get(id).cloned()) {
+        if let Some(tx) = local.wallet.tx_graph().get_tx(*id).or_else(|| cache().transaction(id)) {
             transactions.insert(*id, tx);
         } else { missing.push(*id); }
     }
@@ -336,6 +431,7 @@ pub(super) fn sync(local: &mut LocalWallet, config: &ElectrumConfig) -> Result<(
     local.wallet.apply_update(Update { tx_update: update, chain: Some(checkpoint), ..Default::default() })
         .context("failed to apply incremental Electrum update")?;
     stage("apply_finished", started, heights.len());
+    report.completed = true;
     Ok(())
 }
 

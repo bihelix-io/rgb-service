@@ -229,3 +229,121 @@ fn malformed_history_limit_fallback_fails_without_applying_or_broadcasting() {
     assert!(fixture.local.as_ref().unwrap().wallet.tx_graph().get_tx(id).is_none());
     assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
 }
+
+fn history_entries(count: usize) -> Arc<Vec<Entry>> {
+    Arc::new(vec![Entry { txid: Txid::from_str(&"77".repeat(32)).unwrap(), height: 1 }; count])
+}
+
+#[test]
+fn history_capacity_evicts_one_lru_entry_and_preserves_recent_hits() {
+    let mut cache = Cache::default();
+    let key = |i: usize| ("endpoint".to_owned(), i.to_string());
+    for i in 0..MAX_HISTORY_KEYS {
+        cache.remember_history(key(i), "one".into(), history_entries(1));
+    }
+    assert!(cache.history(&key(0), "one").is_some());
+    cache.remember_history(key(MAX_HISTORY_KEYS), "one".into(), history_entries(1));
+    assert_eq!(cache.histories.len(), MAX_HISTORY_KEYS);
+    assert_eq!(cache.history_entries, MAX_HISTORY_KEYS);
+    assert!(cache.histories.contains_key(&key(0)));
+    assert!(!cache.histories.contains_key(&key(1)));
+    assert_eq!(cache.counters.history_evictions, 1);
+    assert_eq!(cache.counters.history_hits, 1);
+    assert!(cache.history(&key(0), "changed").is_none());
+    assert!(!cache.histories.contains_key(&key(0)));
+    assert_eq!(cache.history_entries, MAX_HISTORY_KEYS - 1);
+    assert_eq!(cache.counters.status_changes, 1);
+    assert_eq!(cache.counters.history_misses, 1);
+}
+
+#[test]
+fn history_entry_budget_replacement_and_oversized_admission_are_bounded() {
+    let mut cache = Cache::default();
+    let key = |s: &str| ("endpoint".to_owned(), s.to_owned());
+    cache.remember_history(key("a"), "one".into(), history_entries(20_000));
+    cache.remember_history(key("b"), "one".into(), history_entries(20_000));
+    cache.remember_history(key("c"), "one".into(), history_entries(20_000));
+    assert!(!cache.histories.contains_key(&key("a")));
+    assert_eq!(cache.histories.len(), 2);
+    assert_eq!(cache.history_entries, 40_000);
+    assert_eq!(cache.counters.history_evictions, 1);
+    cache.remember_history(key("b"), "two".into(), history_entries(1));
+    assert_eq!(cache.history_entries, 20_001);
+    cache.remember_history(key("huge"), "one".into(), history_entries(MAX_HISTORY_ENTRIES + 1));
+    assert_eq!(cache.history_entries, 20_001);
+    assert_eq!(cache.histories.len(), 2);
+    assert_eq!(cache.counters.history_oversized, 1);
+    // A changed oversized value must not leave the previous digest usable.
+    cache.remember_history(key("b"), "three".into(), history_entries(MAX_HISTORY_ENTRIES + 1));
+    assert!(cache.history(&key("b"), "two").is_none());
+    assert_eq!(cache.history_entries, 20_000);
+}
+
+#[test]
+fn transaction_cache_evicts_only_needed_entries_and_accounts_bytes() {
+    let fixture = Fixture::new();
+    let previous = OutPoint { txid: Txid::from_str(&"88".repeat(32)).unwrap(), vout: 0 };
+    let mut cache = Cache::default();
+    let txs = (0..=MAX_TX_KEYS).map(|i| Arc::new(fixture.tx(i as u64 + 1, previous))).collect::<Vec<_>>();
+    for tx in &txs[..MAX_TX_KEYS] { cache.remember_transaction(tx.clone()); }
+    assert!(cache.transaction(&txs[0].compute_txid()).is_some());
+    cache.remember_transaction(txs[MAX_TX_KEYS].clone());
+    assert_eq!(cache.transactions.len(), MAX_TX_KEYS);
+    assert!(cache.transactions.contains_key(&txs[0].compute_txid()));
+    assert!(!cache.transactions.contains_key(&txs[1].compute_txid()));
+    assert_eq!(cache.counters.tx_evictions, 1);
+    assert_eq!(cache.tx_bytes, cache.transactions.values().map(|v| v.bytes).sum::<usize>());
+    let mut large = fixture.tx(900_001, previous);
+    large.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; MAX_TX_BYTES / 2]);
+    cache.remember_transaction(Arc::new(large.clone()));
+    large.output[0].value = Amount::from_sat(900_002);
+    let latest = large.compute_txid();
+    cache.remember_transaction(Arc::new(large.clone()));
+    assert!(cache.transactions.contains_key(&latest));
+    assert!(cache.tx_bytes <= MAX_TX_BYTES);
+    assert_eq!(cache.tx_bytes, cache.transactions.values().map(|v| v.bytes).sum::<usize>());
+    let bytes = cache.tx_bytes;
+    large.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; MAX_TX_BYTES + 1]);
+    cache.remember_transaction(Arc::new(large));
+    assert_eq!(cache.tx_bytes, bytes);
+    assert_eq!(cache.counters.tx_oversized, 1);
+}
+
+#[test]
+fn oversized_sequential_scan_reuses_retained_histories_across_three_rounds() {
+    let fixture = Fixture::new();
+    let tx = fixture.tx(810_001, OutPoint { txid: Txid::from_str(&"99".repeat(32)).unwrap(), vout: 0 });
+    let node = Node::new(vec![(tx, 1)]);
+    let scripts = (0..MAX_HISTORY_KEYS + 32)
+        .map(|i| ScriptBuf::from_bytes((i as u32).to_le_bytes().to_vec())).collect::<Vec<_>>();
+    for round in 0..3 {
+        let before = node.count("blockchain.scripthash.get_history");
+        let results = histories(&node.config, &scripts).unwrap();
+        assert_eq!(results.len(), scripts.len());
+        assert!(results.iter().all(|h| h.complete && h.entries.len() == 1));
+        let downloads = node.count("blockchain.scripthash.get_history") - before;
+        assert_eq!(downloads, if round == 0 { scripts.len() } else { 32 });
+        assert!(cache().histories.len() <= MAX_HISTORY_KEYS);
+    }
+    // Status changes still invalidate every retained history; no stale balance.
+    node.txs.lock().unwrap()[0].1 = 2;
+    let before = node.count("blockchain.scripthash.get_history");
+    let results = histories(&node.config, &scripts).unwrap();
+    assert_eq!(node.count("blockchain.scripthash.get_history") - before, scripts.len());
+    assert!(results.iter().all(|h| h.entries[0].height == 2));
+    assert_eq!(node.count("blockchain.scripthash.subscribe"), node.count("blockchain.scripthash.unsubscribe"));
+    assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
+}
+
+#[test]
+fn cached_first_order_is_a_stable_permutation_not_a_changed_result_mapping() {
+    let mut cache = Cache::default();
+    let hashes = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+    cache.remember_history(("endpoint".into(), "c".into()), "one".into(), history_entries(1));
+    cache.remember_history(("other".into(), "a".into()), "one".into(), history_entries(1));
+    let indices = ordered_script_indices("endpoint", &hashes, &cache);
+    assert_eq!(indices, vec![2, 0, 1, 3]);
+    let mut restored = vec![String::new(); hashes.len()];
+    for i in indices { restored[i] = hashes[i].clone(); }
+    assert_eq!(restored, hashes);
+}
