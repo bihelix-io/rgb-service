@@ -5,7 +5,12 @@ use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 
 const BATCH: usize = 16;
-const MAX_HISTORY_KEYS: usize = 256;
+// Separate small transaction batches (potentially large responses) from bounded
+// history subscriptions and fixed-size 80-byte headers. Keep a finite working
+// set large enough for the production wallet without lifting the entry budget.
+const HISTORY_BATCH: usize = 64;
+const HEADER_BATCH: usize = 64;
+const MAX_HISTORY_KEYS: usize = 4096;
 const MAX_HISTORY_ENTRIES: usize = 50_000;
 const MAX_TX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TX_KEYS: usize = 1024;
@@ -235,7 +240,8 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
     let mut reused = 0usize;
     let all_hashes = scripts.iter().map(electrum_script_hash_hex).collect::<Vec<_>>();
     let indices = ordered_script_indices(&config.url, &all_hashes, &cache());
-    for indices in indices.chunks(BATCH) {
+    let total_batches = indices.len().div_ceil(HISTORY_BATCH);
+    for (batch_index, indices) in indices.chunks(HISTORY_BATCH).enumerate() {
         let batch_started = Instant::now();
         let reused_before = reused;
         let hashes = indices.iter().map(|i| all_hashes[*i].clone()).collect::<Vec<_>>();
@@ -270,17 +276,19 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
                     group[i] = Some(History { entries, complete: true });
                 } else { missing.push((i, key, status.to_owned())); }
             }
-            if !missing.is_empty() {
+            // History and unspent responses can be large. Keep their original
+            // small batch bound even when subscription status batches are wider.
+            for missing in missing.chunks(BATCH) {
                 let calls = missing.iter().map(|(_, (_, hash), _)|
                     ("blockchain.scripthash.get_history".to_owned(), json!([hash]))).collect::<Vec<_>>();
-                for ((i, key, status), response) in missing.into_iter().zip(session_batch(session, &calls)?) {
+                for ((i, key, status), response) in missing.iter().zip(session_batch(session, &calls)?) {
                     match response {
                         Ok(value) => {
                             let entries = parse_history(&value, &status)?;
-                            cache().remember_history(key, status, Arc::clone(&entries));
-                            group[i] = Some(History { entries, complete: true });
+                            cache().remember_history(key.clone(), status.clone(), Arc::clone(&entries));
+                            group[*i] = Some(History { entries, complete: true });
                         }
-                        Err(error) if is_electrum_history_limit_error(&anyhow!(error.clone())) => fallback.push(i),
+                        Err(error) if is_electrum_history_limit_error(&anyhow!(error.clone())) => fallback.push(*i),
                         Err(error) => bail!("Electrum history failed: {error}"),
                     }
                 }
@@ -288,13 +296,15 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
             if !fallback.is_empty() {
                 tracing::warn!(stage = "history_limit_listunspent", scripts = fallback.len(),
                     "Electrum history exceeds server limit; unspent-only result is not complete history");
+                for fallback in fallback.chunks(BATCH) {
                 let calls = fallback.iter().map(|i|
                     ("blockchain.scripthash.listunspent".to_owned(), json!([hashes[*i]]))).collect::<Vec<_>>();
-                for (i, response) in fallback.into_iter().zip(session_batch(session, &calls)?) {
+                for (i, response) in fallback.iter().zip(session_batch(session, &calls)?) {
                     let value = response.map_err(|error| anyhow!("Electrum listunspent fallback failed: {error}"))?;
-                    group[i] = Some(History { entries: parse_unspent_history(&value)?, complete: false });
+                    group[*i] = Some(History { entries: parse_unspent_history(&value)?, complete: false });
                     // Do not label an unspent-only snapshot as complete history.
-                    cache().remove_history(&(config.url.clone(), hashes[i].clone()));
+                    cache().remove_history(&(config.url.clone(), hashes[*i].clone()));
+                }
                 }
             }
             let unsubscribe = hashes.iter().map(|hash|
@@ -307,6 +317,7 @@ fn histories(config: &ElectrumConfig, scripts: &[ScriptBuf]) -> Result<Vec<Histo
         })?;
         for (index, history) in indices.iter().zip(group) { results[*index] = Some(history); }
         tracing::info!(stage = "history_batch_finished", scripts = indices.len(),
+            batch_index = batch_index + 1, total_batches,
             cache_hits = reused - reused_before,
             elapsed_ms = batch_started.elapsed().as_millis() as u64,
             remaining_ms = ?sync_budget::remaining_ms(), "Electrum wallet incremental sync");
@@ -323,6 +334,37 @@ fn decode_transaction(value: &Value, expected: Txid) -> Result<Arc<Transaction>>
     let tx: Transaction = encode::deserialize(&hex_to_bytes(raw)?)?;
     anyhow::ensure!(tx.compute_txid() == expected, "Electrum transaction txid mismatch");
     Ok(Arc::new(tx))
+}
+
+fn confirmation_headers(config: &ElectrumConfig, heights: &[u32]) -> Result<HashMap<u32, Header>> {
+    let started = Instant::now();
+    let heights = heights.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let total_batches = heights.len().div_ceil(HEADER_BATCH);
+    let mut headers = HashMap::new();
+    tracing::info!(stage = "headers_start", items = heights.len(), total_batches,
+        batch_size = HEADER_BATCH, remaining_ms = ?sync_budget::remaining_ms(),
+        "Electrum wallet incremental sync");
+    // Re-fetch every confirmation height, including unchanged histories: an
+    // unchanged history digest does not prove that its block hash is unchanged.
+    for (index, heights) in heights.chunks(HEADER_BATCH).enumerate() {
+        let batch_started = Instant::now();
+        let calls = heights.iter().map(|height|
+            ("blockchain.block.header".to_owned(), json!([height]))).collect::<Vec<_>>();
+        let result = batch(config, &calls).and_then(|values| {
+            heights.iter().zip(values).map(|(height, value)| {
+                let header = decode_header_hex(value.as_str().context("invalid Electrum block header")?)?;
+                Ok((*height, header))
+            }).collect::<Result<Vec<_>>>()
+        });
+        tracing::info!(stage = "headers_batch_finished", batch_index = index + 1, total_batches,
+            calls = heights.len(), first_height = heights.first(), last_height = heights.last(),
+            ok = result.is_ok(), elapsed_ms = batch_started.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            remaining_ms = ?sync_budget::remaining_ms(), "Electrum wallet incremental sync");
+        headers.extend(result?);
+    }
+    stage("headers_finished", started, headers.len());
+    Ok(headers)
 }
 
 pub(super) fn sync(local: &mut LocalWallet, config: &ElectrumConfig) -> Result<()> {
@@ -376,23 +418,15 @@ pub(super) fn sync(local: &mut LocalWallet, config: &ElectrumConfig) -> Result<(
         reused = transactions.len() - missing.len(), elapsed_ms = started.elapsed().as_millis() as u64,
         remaining_ms = ?sync_budget::remaining_ms(), "Electrum wallet incremental sync");
 
-    let started = Instant::now();
     let confirmed_heights = heights.values().copied().filter(|height| *height > 0)
         .map(|height| height as u32).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-    stage("headers_start", started, confirmed_heights.len());
-    let mut headers = HashMap::new();
+    let headers = confirmation_headers(config, &confirmed_heights)?;
     let mut checkpoints = Vec::new();
     // Confirmation heights/hashes are always revalidated, including for cached
     // raw transactions and unchanged histories. Never cache away a chain reorg.
-    for heights in confirmed_heights.chunks(BATCH) {
-        let calls = heights.iter().map(|height| ("blockchain.block.header".to_owned(), json!([height]))).collect::<Vec<_>>();
-        for (height, value) in heights.iter().zip(batch(config, &calls)?) {
-            let header = decode_header_hex(value.as_str().context("invalid Electrum block header")?)?;
-            checkpoints.push(BlockId { height: *height, hash: header.block_hash() });
-            headers.insert(*height, header);
-        }
+    for (height, header) in &headers {
+        checkpoints.push(BlockId { height: *height, hash: header.block_hash() });
     }
-    stage("headers_finished", started, headers.len());
     for (id, height) in &heights {
         let tx = transactions.get(id).context("missing validated transaction")?;
         update.txs.push(Arc::clone(tx));

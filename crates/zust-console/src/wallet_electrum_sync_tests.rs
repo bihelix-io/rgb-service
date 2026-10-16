@@ -10,6 +10,8 @@ struct Node {
     calls: Arc<Mutex<Vec<String>>>,
     fail: Arc<AtomicBool>,
     limit: Arc<AtomicUsize>,
+    header_time: Arc<AtomicUsize>,
+    header_delay_ms: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -23,6 +25,10 @@ impl Node {
         let fail = Arc::new(AtomicBool::new(false));
         let limit = Arc::new(AtomicUsize::new(0));
         let limited = limit.clone();
+        let header_time = Arc::new(AtomicUsize::new(0));
+        let header_override = header_time.clone();
+        let header_delay_ms = Arc::new(AtomicUsize::new(0));
+        let header_delay = header_delay_ms.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let (data, recorded, failing, stopping) = (txs.clone(), calls.clone(), fail.clone(), stop.clone());
         let join = std::thread::spawn(move || {
@@ -35,6 +41,7 @@ impl Node {
                     Err(e) => panic!("accept: {e}"),
                 };
                 stream.set_nonblocking(false).unwrap();
+                stream.set_nodelay(true).unwrap();
                 stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
                 let mut reader = BufReader::new(stream);
                 let mut subscribed = HashSet::new();
@@ -49,6 +56,9 @@ impl Node {
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let method = request["method"].as_str().unwrap();
                     recorded.lock().unwrap().push(method.to_string());
+                    if method == "blockchain.block.header" {
+                        std::thread::sleep(Duration::from_millis(header_delay.load(Ordering::Relaxed) as u64));
+                    }
                     let hash = request["params"][0].as_str().unwrap_or_default().to_owned();
                     if method == "blockchain.scripthash.subscribe" { subscribed.insert(hash.clone()); }
                     if method == "blockchain.scripthash.get_history" {
@@ -57,7 +67,10 @@ impl Node {
                     if method == "blockchain.scripthash.unsubscribe" { subscribed.remove(&hash); }
                     let txs = data.lock().unwrap();
 
-                    let header = bytes_to_hex(&encode::serialize(&bdk_wallet::bitcoin::blockdata::constants::genesis_block(Network::Regtest).header));
+                    let mut header = bdk_wallet::bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+                    let override_time = header_override.load(Ordering::Relaxed);
+                    if override_time != 0 { header.time = override_time as u32; }
+                    let header = bytes_to_hex(&encode::serialize(&header));
                     let result = match method {
                         "blockchain.scripthash.subscribe" => if txs.is_empty() { Value::Null } else {
                             json!(sha256::Hash::hash(txs.iter().map(|(tx, h)| format!("{}:{h}:", tx.compute_txid())).collect::<String>().as_bytes()).to_string())
@@ -88,7 +101,7 @@ impl Node {
                 }
             }
         });
-        Self { config, txs, calls, fail, limit, stop, join: Some(join) }
+        Self { config, txs, calls, fail, limit, header_time, header_delay_ms, stop, join: Some(join) }
     }
     fn count(&self, method: &str) -> usize {
         self.calls.lock().unwrap().iter().filter(|m| m.as_str() == method).count()
@@ -346,4 +359,63 @@ fn cached_first_order_is_a_stable_permutation_not_a_changed_result_mapping() {
     let mut restored = vec![String::new(); hashes.len()];
     for i in indices { restored[i] = hashes[i].clone(); }
     assert_eq!(restored, hashes);
+}
+
+#[test]
+fn production_script_working_set_is_retained_and_status_changes_are_refetched() {
+    let fixture = Fixture::new();
+    let tx = fixture.tx(820_001, OutPoint { txid: Txid::from_str(&"ab".repeat(32)).unwrap(), vout: 0 });
+    let node = Node::new(vec![(tx, 1)]);
+    let scripts = (0..1783u32).map(|i| ScriptBuf::from_bytes(i.to_le_bytes().to_vec())).collect::<Vec<_>>();
+    for round in 0..3 {
+        let before = node.count("blockchain.scripthash.get_history");
+        let result = histories(&node.config, &scripts).unwrap();
+        assert_eq!(result.len(), 1783);
+        assert_eq!(node.count("blockchain.scripthash.get_history") - before, if round == 0 { 1783 } else { 0 });
+        assert!(result.iter().all(|h| h.complete && h.entries[0].height == 1));
+    }
+    node.txs.lock().unwrap()[0].1 = 2;
+    let before = node.count("blockchain.scripthash.get_history");
+    assert!(histories(&node.config, &scripts).unwrap().iter().all(|h| h.entries[0].height == 2));
+    assert_eq!(node.count("blockchain.scripthash.get_history") - before, 1783);
+    assert_eq!(node.count("blockchain.scripthash.subscribe"), node.count("blockchain.scripthash.unsubscribe"));
+    assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
+}
+
+#[test]
+fn production_headers_are_bounded_batched_deduplicated_and_revalidated() {
+    let node = Node::new(vec![]);
+    let mut heights = (1..=1937).collect::<Vec<u32>>();
+    heights.extend([1, 42, 1937]);
+    assert_eq!(1937usize.div_ceil(HEADER_BATCH), 31);
+    let first = confirmation_headers(&node.config, &heights).unwrap();
+    assert_eq!(first.len(), 1937);
+    assert_eq!(node.count("blockchain.block.header"), 1937);
+    // Same height and history may belong to a replacement block after a reorg.
+    node.header_time.store(1_700_000_000, Ordering::Relaxed);
+    let second = confirmation_headers(&node.config, &heights).unwrap();
+    assert_eq!(node.count("blockchain.block.header"), 3874);
+    assert_ne!(first[&42].block_hash(), second[&42].block_hash());
+    assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
+}
+
+#[test]
+fn header_deadline_never_applies_partial_wallet_or_broadcasts() {
+    let mut fixture = Fixture::new();
+    let tx = fixture.tx(830_001, OutPoint { txid: Txid::from_str(&"ac".repeat(32)).unwrap(), vout: 0 });
+    let id = tx.compute_txid();
+    let node = Node::new(vec![(tx, 1)]);
+    node.header_delay_ms.store(1200, Ordering::Relaxed);
+    let budget = sync_budget::WalletOperationBudget::enter(Duration::from_secs(1));
+    assert!(fixture.run(&node).is_err());
+    assert_eq!(node.count("blockchain.transaction.get"), 1);
+    assert_eq!(node.count("blockchain.block.header"), 1);
+    assert!(fixture.local.as_ref().unwrap().wallet.tx_graph().get_tx(id).is_none());
+    assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
+    drop(budget);
+    node.header_delay_ms.store(0, Ordering::Relaxed);
+    fixture.run(&node).unwrap();
+    assert!(fixture.local.as_ref().unwrap().wallet.tx_graph().get_tx(id).is_some());
+    assert_eq!(node.count("blockchain.block.header"), 2);
+    assert_eq!(node.count("blockchain.transaction.broadcast"), 0);
 }
