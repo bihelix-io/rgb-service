@@ -33,7 +33,7 @@ use bdk_wallet::{
     file_store, ChangeSet, KeychainKind, PersistedWallet, TxOrdering, Wallet, WalletPersister,
 };
 use fjall::{KeyspaceCreateOptions, PersistMode, SingleWriterTxDatabase, SingleWriterTxKeyspace};
-use rgb_service_api::{RgbAssetInfo, RgbServiceError, TrackedUtxo};
+use rgb_service_api::{ListAssetsResponse, RgbAssetInfo, RgbServiceError, TrackedUtxo};
 use rgb_service_local::{
     is_electrum_url, list_rgb20_assets_for_utxos, normalize_electrum_url, prepare_rgb20_psbt,
     select_rgb20_inputs, shared_rgb_store_account_id, Rgb20PsbtAssignment, Rgb20TrackedUtxo,
@@ -62,6 +62,9 @@ pub(crate) fn router(service: Arc<LocalDaemonService>, config: LegacyConfig) -> 
         .route("/asset/internal/issue", post(issue_asset))
         .route("/estimate/gas", get(estimate_gas))
         .route("/get_fee", get(get_mempool_info))
+        .route("/api/asset_list", post(api_asset_list))
+        .route("/api/get_asset_balance", post(api_get_asset_balance))
+        .route("/api/get_fee", get(api_get_fee))
         .route("/stake/address", get(generate_stake_address))
         .route("/stake/split", post(stake_split))
         .route("/redeem/list", get(redeem_list))
@@ -1194,6 +1197,351 @@ async fn query_asset(
 }
 
 #[derive(Serialize)]
+struct LegacyV1Response<T> {
+    code: i8,
+    msg: String,
+    data: Option<T>,
+}
+
+impl<T> LegacyV1Response<T> {
+    fn success(data: T) -> Self {
+        Self {
+            code: 0,
+            msg: "success".to_string(),
+            data: Some(data),
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            code: -1,
+            msg: message.into(),
+            data: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyV1AssetListReq {
+    pk: Option<String>,
+    address: String,
+    #[allow(dead_code)]
+    page_size: Option<u64>,
+    #[allow(dead_code)]
+    page_no: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LegacyV1BalanceReq {
+    pk: Option<String>,
+    address: String,
+    asset_id: String,
+}
+
+#[derive(Serialize)]
+struct LegacyV1AssetList {
+    assets: Vec<LegacyV1AssetByUtxo>,
+}
+
+#[derive(Serialize)]
+struct LegacyV1AssetByUtxo {
+    asset: Option<LegacyV1Asset>,
+    utxos: Option<Vec<LegacyV1Utxo>>,
+}
+
+#[derive(Serialize)]
+struct LegacyV1Asset {
+    asset_id: String,
+    asset_iface: String,
+    ticker: String,
+    name: String,
+    details: Option<String>,
+    precision: u8,
+    issued_supply: u64,
+    issued_supply_str: String,
+    timestamp: i64,
+    added_at: i64,
+    txid: String,
+    vout: u32,
+    balance: LegacyV1Balance,
+    balance_str: LegacyV1BalanceStr,
+    media: Option<String>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct LegacyV1Balance {
+    settled: u64,
+    future: u64,
+    spendable: u64,
+}
+
+#[derive(Serialize)]
+struct LegacyV1BalanceStr {
+    settled: String,
+    future: String,
+    spendable: String,
+}
+
+impl From<LegacyV1Balance> for LegacyV1BalanceStr {
+    fn from(balance: LegacyV1Balance) -> Self {
+        Self {
+            settled: balance.settled.to_string(),
+            future: balance.future.to_string(),
+            spendable: balance.spendable.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LegacyV1Outpoint {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Serialize)]
+struct LegacyV1Utxo {
+    outpoint: LegacyV1Outpoint,
+    btc_amount: u64,
+    colorable: bool,
+    exists: bool,
+    spent: bool,
+}
+
+struct LegacyV1AssetAggregate {
+    asset: RgbAssetInfo,
+    balance: LegacyV1Balance,
+    outpoints: BTreeSet<String>,
+}
+
+fn legacy_v1_account_ids(
+    state: &LegacyState,
+    pk: Option<&str>,
+    address: &str,
+) -> Result<Vec<String>, LegacyHttpError> {
+    Address::from_str(address).map_err(|_| {
+        RgbServiceError::InvalidRequest(format!("address:{address},invalid address"))
+    })?;
+
+    if let Some(desc) = pk {
+        let descriptor = ExtendedDescriptor::from_str(desc).map_err(|err| {
+            RgbServiceError::InvalidRequest(format!("pk and address is not match {err:?}"))
+        })?;
+        let wallet = Wallet::create_single(descriptor)
+            .network(state.service.network()?)
+            .create_wallet_no_persist()
+            .map_err(|err| {
+                RgbServiceError::InvalidRequest(format!("pk and address is not match {err:?}"))
+            })?;
+        let derived_address = wallet
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .to_string();
+        if derived_address != address {
+            return Err(RgbServiceError::InvalidRequest(format!(
+                "pk and address is not match. from publickey:{derived_address},got address:{address}"
+            ))
+            .into());
+        }
+        return legacy_desc_account_ids(state, desc);
+    }
+
+    legacy_account_ids_for_address(&state.service, state.config.reveal_address_count, address)
+        .map_err(Into::into)
+}
+
+fn legacy_v1_asset_aggregates(
+    lists: Vec<ListAssetsResponse>,
+) -> Result<BTreeMap<String, LegacyV1AssetAggregate>, RgbServiceError> {
+    let mut result = BTreeMap::<String, LegacyV1AssetAggregate>::new();
+    let mut seen = HashSet::<(String, String, Option<String>, u64, bool)>::new();
+
+    for list in lists {
+        let metadata = list
+            .assets
+            .into_iter()
+            .map(|asset| (asset.contract_id.clone(), asset))
+            .collect::<HashMap<_, _>>();
+        for (outpoint, allocations) in list.utxo_assets {
+            for allocation in allocations {
+                let confirmed = allocation.confirmed.unwrap_or(true);
+                if !seen.insert((
+                    outpoint.clone(),
+                    allocation.asset_id.clone(),
+                    allocation.address.clone(),
+                    allocation.amount,
+                    confirmed,
+                )) {
+                    continue;
+                }
+                let Some(asset) = metadata.get(&allocation.asset_id) else {
+                    continue;
+                };
+                let aggregate = result
+                    .entry(allocation.asset_id.clone())
+                    .or_insert_with(|| LegacyV1AssetAggregate {
+                        asset: asset.clone(),
+                        balance: LegacyV1Balance {
+                            settled: 0,
+                            future: 0,
+                            spendable: 0,
+                        },
+                        outpoints: BTreeSet::new(),
+                    });
+                aggregate.balance.future = aggregate
+                    .balance
+                    .future
+                    .checked_add(allocation.amount)
+                    .ok_or_else(|| {
+                        RgbServiceError::Backend(format!(
+                            "legacy v1 balance overflow for {}",
+                            allocation.asset_id
+                        ))
+                    })?;
+                if confirmed {
+                    aggregate.balance.settled = aggregate
+                        .balance
+                        .settled
+                        .checked_add(allocation.amount)
+                        .ok_or_else(|| {
+                            RgbServiceError::Backend(format!(
+                                "legacy v1 balance overflow for {}",
+                                allocation.asset_id
+                            ))
+                        })?;
+                    aggregate.balance.spendable = aggregate.balance.settled;
+                }
+                aggregate.outpoints.insert(outpoint.clone());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn legacy_v1_asset_list(aggregates: BTreeMap<String, LegacyV1AssetAggregate>) -> LegacyV1AssetList {
+    let assets = aggregates
+        .into_values()
+        .map(|aggregate| {
+            let (txid, vout) = legacy_v1_outpoint_parts(&aggregate.asset.issue_utxo);
+            let balance = aggregate.balance;
+            let media = legacy_v1_asset_media(&aggregate.asset);
+            let utxos = aggregate
+                .outpoints
+                .into_iter()
+                .map(|outpoint| {
+                    let (txid, vout) = legacy_v1_outpoint_parts(&outpoint);
+                    LegacyV1Utxo {
+                        outpoint: LegacyV1Outpoint { txid, vout },
+                        btc_amount: 0,
+                        colorable: true,
+                        exists: true,
+                        spent: false,
+                    }
+                })
+                .collect();
+            LegacyV1AssetByUtxo {
+                asset: Some(LegacyV1Asset {
+                    asset_id: aggregate.asset.contract_id,
+                    asset_iface: "RGB20".to_string(),
+                    ticker: aggregate.asset.ticker,
+                    name: aggregate.asset.name,
+                    details: None,
+                    precision: aggregate.asset.precision,
+                    issued_supply: aggregate.asset.supply.unwrap_or_default(),
+                    issued_supply_str: aggregate.asset.supply.unwrap_or_default().to_string(),
+                    timestamp: 0,
+                    added_at: 0,
+                    txid,
+                    vout,
+                    balance,
+                    balance_str: balance.into(),
+                    media,
+                }),
+                utxos: Some(utxos),
+            }
+        })
+        .collect();
+    LegacyV1AssetList { assets }
+}
+
+fn legacy_v1_outpoint_parts(outpoint: &str) -> (String, u32) {
+    outpoint
+        .rsplit_once(':')
+        .and_then(|(txid, vout)| vout.parse::<u32>().ok().map(|vout| (txid, vout)))
+        .map(|(txid, vout)| (txid.to_string(), vout))
+        .unwrap_or_else(|| (String::new(), 0))
+}
+
+fn legacy_v1_asset_media(asset: &RgbAssetInfo) -> Option<String> {
+    let ext = asset.ext.as_ref()?;
+    ["media", "logo_url", "logo"]
+        .into_iter()
+        .find_map(|field| ext.get(field).and_then(serde_json::Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn legacy_v1_lists(
+    state: &LegacyState,
+    account_ids: Vec<String>,
+) -> Result<Vec<ListAssetsResponse>, LegacyHttpError> {
+    account_ids
+        .into_iter()
+        .map(|account_id| {
+            state
+                .service
+                .legacy_list_assets(&account_id)
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+async fn api_asset_list(
+    State(state): State<LegacyState>,
+    Json(req): Json<LegacyV1AssetListReq>,
+) -> Json<LegacyV1Response<LegacyV1AssetList>> {
+    let result = run_legacy_blocking("legacy v1 api/asset_list", move || {
+        let account_ids = legacy_v1_account_ids(&state, req.pk.as_deref(), &req.address)?;
+        let lists = legacy_v1_lists(&state, account_ids)?;
+        Ok(legacy_v1_asset_list(legacy_v1_asset_aggregates(lists)?))
+    })
+    .await;
+
+    Json(match result {
+        Ok(data) => LegacyV1Response::success(data),
+        Err(err) => LegacyV1Response::failure(err.err.to_string()),
+    })
+}
+
+async fn api_get_asset_balance(
+    State(state): State<LegacyState>,
+    Json(req): Json<LegacyV1BalanceReq>,
+) -> Json<LegacyV1Response<LegacyV1Balance>> {
+    let result = run_legacy_blocking("legacy v1 api/get_asset_balance", move || {
+        let account_ids = legacy_v1_account_ids(&state, req.pk.as_deref(), &req.address)?;
+        let lists = legacy_v1_lists(&state, account_ids)?;
+        let balance = legacy_v1_asset_aggregates(lists)?
+            .remove(&req.asset_id)
+            .map(|aggregate| aggregate.balance)
+            .unwrap_or(LegacyV1Balance {
+                settled: 0,
+                future: 0,
+                spendable: 0,
+            });
+        Ok(balance)
+    })
+    .await;
+
+    Json(match result {
+        Ok(data) => LegacyV1Response::success(data),
+        Err(err) => LegacyV1Response::failure(err.err.to_string()),
+    })
+}
+
+async fn api_get_fee() -> Json<LegacyV1Response<serde_json::Value>> {
+    Json(LegacyV1Response::success(legacy_mempool_info()))
+}
+
+#[derive(Serialize)]
 struct LegacyFeeInfo {
     ticker: &'static str,
     contract_id: String,
@@ -1220,13 +1568,17 @@ async fn estimate_gas(
 }
 
 async fn get_mempool_info() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+    Json(legacy_mempool_info())
+}
+
+fn legacy_mempool_info() -> serde_json::Value {
+    serde_json::json!({
         "fastestFee": 1,
         "halfHourFee": 1,
         "hourFee": 1,
         "economyFee": 1,
         "minimumFee": 1
-    }))
+    })
 }
 
 // Resolve all legacy account_ids that the given descriptor can reach:
@@ -2518,8 +2870,114 @@ impl IntoResponse for LegacyHttpError {
 mod tests {
     use super::*;
     use bdk_wallet::bitcoin::{Network, PublicKey};
+    use rgb_service_api::{AllocationStatus, AssetLayer, RgbAllocation};
 
     const LEGACY_DESCRIPTOR_KEY: &str = "[a49cd98b/84'/827166'/0']xpub6Bz49QXuN7g57fzNQJA8sbQKu8ihjcaPKCwYUq3HXXn5LXNn6ejuXEUSmcHgAFAdtyBgxFyumSNivxp5gtwbN7XkUTEMh4vuLTBfW3ff82T/0/*";
+
+    fn legacy_v1_test_asset() -> RgbAssetInfo {
+        RgbAssetInfo {
+            asset_id: "rgb:test".to_string(),
+            contract_id: "rgb:test".to_string(),
+            ticker: "TST".to_string(),
+            name: "Test Asset".to_string(),
+            precision: 2,
+            supply: Some(1_000),
+            issue_utxo: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"
+                .to_string(),
+            contract_type: "RGB20".to_string(),
+            issuer_desc: String::new(),
+            created_at: String::new(),
+            ext: Some(serde_json::json!({"logo_url": "https://example.invalid/tst.png"})),
+        }
+    }
+
+    fn legacy_v1_test_allocation(outpoint: &str, amount: u64, confirmed: bool) -> RgbAllocation {
+        RgbAllocation {
+            asset_id: "rgb:test".to_string(),
+            outpoint: outpoint.to_string(),
+            amount,
+            layer: AssetLayer::L1,
+            status: AllocationStatus::Available,
+            address: Some("bc1qtest".to_string()),
+            confirmed: Some(confirmed),
+        }
+    }
+
+    #[test]
+    fn legacy_v1_response_matches_wallet_service_envelope() {
+        let success = serde_json::to_value(LegacyV1Response::success(42_u64)).unwrap();
+        assert_eq!(
+            success,
+            serde_json::json!({"code": 0, "msg": "success", "data": 42})
+        );
+
+        let failure = serde_json::to_value(LegacyV1Response::<u64>::failure("failed")).unwrap();
+        assert_eq!(
+            failure,
+            serde_json::json!({"code": -1, "msg": "failed", "data": null})
+        );
+    }
+
+    #[test]
+    fn legacy_v1_assets_deduplicate_accounts_and_keep_pending_balance() {
+        let confirmed_outpoint =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0";
+        let pending_outpoint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:2";
+        let duplicate = ListAssetsResponse {
+            assets: vec![legacy_v1_test_asset()],
+            utxo_assets: BTreeMap::from([(
+                confirmed_outpoint.to_string(),
+                vec![legacy_v1_test_allocation(confirmed_outpoint, 40, true)],
+            )]),
+        };
+        let pending = ListAssetsResponse {
+            assets: vec![legacy_v1_test_asset()],
+            utxo_assets: BTreeMap::from([
+                (
+                    confirmed_outpoint.to_string(),
+                    vec![legacy_v1_test_allocation(confirmed_outpoint, 40, true)],
+                ),
+                (
+                    pending_outpoint.to_string(),
+                    vec![legacy_v1_test_allocation(pending_outpoint, 2, false)],
+                ),
+            ]),
+        };
+
+        let aggregates = legacy_v1_asset_aggregates(vec![duplicate, pending]).unwrap();
+        let aggregate = aggregates.get("rgb:test").unwrap();
+        assert_eq!(aggregate.balance.settled, 40);
+        assert_eq!(aggregate.balance.future, 42);
+        assert_eq!(aggregate.balance.spendable, 40);
+        assert_eq!(aggregate.outpoints.len(), 2);
+
+        let response =
+            serde_json::to_value(LegacyV1Response::success(legacy_v1_asset_list(aggregates)))
+                .unwrap();
+        assert_eq!(
+            response["data"]["assets"][0]["asset"]["asset_id"],
+            "rgb:test"
+        );
+        assert_eq!(
+            response["data"]["assets"][0]["asset"]["issued_supply"],
+            1_000
+        );
+        assert_eq!(
+            response["data"]["assets"][0]["asset"]["balance"]["settled"],
+            40
+        );
+        assert_eq!(
+            response["data"]["assets"][0]["asset"]["balance"]["future"],
+            42
+        );
+        assert_eq!(
+            response["data"]["assets"][0]["utxos"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn unprepared_rgb_input_guard_allows_pure_btc_and_rejects_rgb() {

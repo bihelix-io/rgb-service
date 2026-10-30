@@ -321,7 +321,20 @@ POST /redeem/callback
 POST /transfer/psbt
 POST /transfer/callback
 POST /transfer/cancel
+
+# wallet-service-v1 read compatibility used by the deployed MyAssets frontend
+POST /api/asset_list
+POST /api/get_asset_balance
+GET  /api/get_fee
 ```
+
+The three `/api/*` routes preserve wallet-service-v1's HTTP 200 `RespVO`
+envelope (`code`, `msg`, and `data`). Asset list and balance responses are
+projected from the daemon's current RGB allocations; they do not read the old
+wallet-service SQL database. When `pk` is supplied, the daemon verifies that
+descriptor index 0 derives the requested address before returning wallet data.
+These read-only routes may be exposed through the MyAssets gateway while the
+remaining legacy routes stay restricted to trusted callers.
 
 The legacy `/transfer/psbt` route opens a watch-only descriptor wallet, syncs
 with Esplora, builds the BTC PSBT with BDK, selects required RGB UTXOs from the
