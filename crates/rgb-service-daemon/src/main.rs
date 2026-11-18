@@ -86,6 +86,8 @@ const WALLET_V2_BDK_MAGIC_RGB: &[u8] = b"RgbWallet";
 #[allow(dead_code)]
 const WALLET_V2_BDK_MAGICS: [&[u8]; 2] = [WALLET_V2_BDK_MAGIC_LOCAL, WALLET_V2_BDK_MAGIC_RGB];
 const ELECTRUM_TIMEOUT_SECS: u8 = 10;
+const ELECTRUM_UTXO_BATCH_SIZE: usize = 64;
+const CHAIN_UTXO_SLOW_LOG_MS: u128 = 1_000;
 
 #[derive(Debug, Deserialize)]
 struct DaemonConfig {
@@ -2350,14 +2352,36 @@ impl LocalDaemonService {
         account_id: &str,
         utxos: Vec<Rgb20TrackedUtxo>,
     ) -> rgb_service_api::Result<Vec<Rgb20TrackedUtxo>> {
+        let confirmed_outpoints = utxos
+            .iter()
+            .filter(|utxo| utxo.confirmed)
+            .map(|utxo| utxo.outpoint)
+            .collect::<Vec<_>>();
+        let chain_started = Instant::now();
+        let (chain_source, unspent) = match self.chain_source() {
+            ChainSource::Esplora(config) => (
+                "esplora",
+                self.esplora_unspent_outpoints(&config.url, &confirmed_outpoints),
+            ),
+            ChainSource::Electrum(config) => (
+                "electrum",
+                self.electrum_unspent_outpoints(&config.url, &confirmed_outpoints),
+            ),
+        };
+        let chain_latency_ms = chain_started.elapsed().as_millis();
+        if chain_latency_ms >= CHAIN_UTXO_SLOW_LOG_MS {
+            self.logger.warn(format!(
+                "slow rgb utxo chain lookup account_id={account_id} source={chain_source} \
+                 confirmed_outpoints={} latency_ms={chain_latency_ms}",
+                confirmed_outpoints.len()
+            ));
+        }
+        let unspent = unspent?;
+
         let mut kept = Vec::with_capacity(utxos.len());
         let mut spent = BTreeSet::new();
         for utxo in utxos {
-            if !utxo.confirmed {
-                kept.push(utxo);
-                continue;
-            }
-            if self.chain_outpoint_unspent(utxo.outpoint)? {
+            if !utxo.confirmed || unspent.contains(&utxo.outpoint) {
                 kept.push(utxo);
             } else {
                 spent.insert(utxo.outpoint.to_string());
@@ -2374,50 +2398,99 @@ impl LocalDaemonService {
         Ok(kept)
     }
 
-    fn chain_outpoint_unspent(&self, outpoint: OutPoint) -> rgb_service_api::Result<bool> {
-        match self.chain_source() {
-            ChainSource::Esplora(config) => self.esplora_outpoint_unspent(&config.url, outpoint),
-            ChainSource::Electrum(config) => self.electrum_outpoint_unspent(&config.url, outpoint),
-        }
-    }
-
-    fn esplora_outpoint_unspent(
+    fn esplora_unspent_outpoints(
         &self,
         url: &str,
-        outpoint: OutPoint,
-    ) -> rgb_service_api::Result<bool> {
+        outpoints: &[OutPoint],
+    ) -> rgb_service_api::Result<BTreeSet<OutPoint>> {
         let client = esplora_client::Builder::new(url)
             .timeout(30)
             .build_blocking();
-        let status = client
-            .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
-            .map_err(|err| RgbServiceError::Backend(format!("esplora outspend failed: {err}")))?;
-        Ok(status.is_some_and(|status| !status.spent))
+        let mut unspent = BTreeSet::new();
+        for outpoint in outpoints {
+            let status = client
+                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                .map_err(|err| {
+                    RgbServiceError::Backend(format!("esplora outspend failed: {err}"))
+                })?;
+            if status.is_some_and(|status| !status.spent) {
+                unspent.insert(*outpoint);
+            }
+        }
+        Ok(unspent)
     }
 
-    fn electrum_outpoint_unspent(
+    fn electrum_unspent_outpoints(
         &self,
         url: &str,
-        outpoint: OutPoint,
-    ) -> rgb_service_api::Result<bool> {
+        outpoints: &[OutPoint],
+    ) -> rgb_service_api::Result<BTreeSet<OutPoint>> {
+        if outpoints.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
         let client = self.electrum_with_retry("electrum client", || {
             let config = electrum_client::ConfigBuilder::new()
                 .timeout(Some(ELECTRUM_TIMEOUT_SECS))
                 .build();
             electrum_client::Client::from_config(&normalize_electrum_url(url), config)
         })?;
-        let funding_tx = self.electrum_with_retry("electrum tx fetch", || {
-            client.transaction_get(&outpoint.txid)
-        })?;
-        let Some(output) = funding_tx.output.get(outpoint.vout as usize) else {
-            return Ok(false);
-        };
-        let unspent = self.electrum_with_retry("electrum script listunspent", || {
-            client.script_list_unspent(output.script_pubkey.as_script())
-        })?;
-        Ok(unspent
+        let txids = outpoints
             .iter()
-            .any(|entry| entry.tx_hash == outpoint.txid && entry.tx_pos == outpoint.vout as usize))
+            .map(|outpoint| outpoint.txid)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut funding_txs = BTreeMap::<Txid, Transaction>::new();
+        for chunk in txids.chunks(ELECTRUM_UTXO_BATCH_SIZE) {
+            let transactions = self.electrum_with_retry("electrum batch tx fetch", || {
+                client.batch_transaction_get(chunk.iter())
+            })?;
+            if transactions.len() != chunk.len() {
+                return Err(RgbServiceError::Backend(format!(
+                    "electrum batch tx fetch returned {} transactions for {} txids",
+                    transactions.len(),
+                    chunk.len()
+                )));
+            }
+            funding_txs.extend(chunk.iter().copied().zip(transactions));
+        }
+
+        let candidates = outpoints
+            .iter()
+            .filter_map(|outpoint| {
+                funding_txs
+                    .get(&outpoint.txid)
+                    .and_then(|tx| tx.output.get(outpoint.vout as usize))
+                    .map(|output| (*outpoint, output.script_pubkey.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut unspent = BTreeSet::new();
+        for chunk in candidates.chunks(ELECTRUM_UTXO_BATCH_SIZE) {
+            let scripts = chunk
+                .iter()
+                .map(|(_, script)| script.as_script())
+                .collect::<Vec<_>>();
+            let responses = self
+                .electrum_with_retry("electrum batch script listunspent", || {
+                    client.batch_script_list_unspent(scripts.clone())
+                })?;
+            if responses.len() != chunk.len() {
+                return Err(RgbServiceError::Backend(format!(
+                    "electrum batch script listunspent returned {} results for {} scripts",
+                    responses.len(),
+                    chunk.len()
+                )));
+            }
+            for ((outpoint, _), entries) in chunk.iter().zip(responses) {
+                if entries.iter().any(|entry| {
+                    entry.tx_hash == outpoint.txid && entry.tx_pos == outpoint.vout as usize
+                }) {
+                    unspent.insert(*outpoint);
+                }
+            }
+        }
+        Ok(unspent)
     }
 
     fn remove_account_utxos(
@@ -4928,6 +5001,9 @@ fn hex_decode(value: &str) -> rgb_service_api::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener as StdTcpListener;
+
     use axum::http::{header, Method};
     use axum::routing::put;
     use bitcoin::secp256k1::SecretKey;
@@ -4993,6 +5069,136 @@ query_fee = 1
         assert_eq!(config.daemon_rna.issue_fee, 1000);
         assert_eq!(config.daemon_rna.transfer_fee, 100);
         assert_eq!(config.daemon_rna.query_fee, 1);
+    }
+
+    #[tokio::test]
+    async fn electrum_unspent_lookup_batches_transactions_and_scripts() {
+        let data_dir = env::temp_dir().join(format!(
+            "rgb-service-daemon-electrum-batch-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = LocalDaemonService::new(DaemonConfig {
+            service: ServiceConfig {
+                external_rgb: Default::default(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                network: "mainnet".to_string(),
+                data_dir: data_dir.clone(),
+                esplora_url: "https://example.invalid".to_string(),
+                recovery_scan_interval_secs: None,
+            },
+            daemon_rna: DaemonRnaConfig {
+                issue_fee: 1000,
+                transfer_fee: 100,
+                query_fee: 1,
+            },
+            legacy: LegacyConfig::default(),
+        })
+        .await
+        .unwrap();
+
+        let transactions = [1_000_u64, 2_000_u64].map(|value| Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(value),
+                script_pubkey: ScriptBuf::from_bytes(vec![if value == 1_000 {
+                    0x51
+                } else {
+                    0x52
+                }]),
+            }],
+        });
+        let outpoints = transactions
+            .iter()
+            .map(|tx| OutPoint::new(tx.compute_txid(), 0))
+            .collect::<Vec<_>>();
+        let tx_hex = transactions
+            .iter()
+            .map(|tx| {
+                let encoded = serialize(tx)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                (tx.compute_txid().to_string(), encoded)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let electrum_addr = listener.local_addr().unwrap();
+        let first_outpoint = outpoints[0];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut transaction_requests = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "blockchain.transaction.get");
+                transaction_requests.push(request);
+            }
+            for request in transaction_requests {
+                let txid = request["params"][0].as_str().unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": tx_hex.get(txid).unwrap(),
+                    })
+                )
+                .unwrap();
+            }
+            stream.flush().unwrap();
+
+            let mut script_requests = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "blockchain.scripthash.listunspent");
+                script_requests.push(request);
+            }
+            for (index, request) in script_requests.into_iter().enumerate() {
+                let result = if index == 0 {
+                    json!([{
+                        "height": 1,
+                        "tx_hash": first_outpoint.txid,
+                        "tx_pos": first_outpoint.vout,
+                        "value": 1_000,
+                    }])
+                } else {
+                    json!([])
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result,
+                    })
+                )
+                .unwrap();
+            }
+            stream.flush().unwrap();
+        });
+
+        let unspent = service
+            .electrum_unspent_outpoints(&format!("electrum://{electrum_addr}"), &outpoints)
+            .unwrap();
+        assert_eq!(unspent, BTreeSet::from([outpoints[0]]));
+        server.join().unwrap();
+
+        drop(service);
+        fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[test]
